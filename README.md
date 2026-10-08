@@ -14,7 +14,7 @@ loom-evm 的检测命中是精确的 `(函数, 帧, 证据表达式)` 三元组�
 
 ## 判决（三值，fail-closed）
 
-- **confirmed** — 见证复现，`poc.json` 可一键重放
+- **confirmed** — 见证复现，产出 Foundry PoC 工程（`forge test` 绿灯即终判）
 - **unreachable** — 预算耗尽未到达该帧（FP 候选，降级不消灭）
 - **inconclusive** — 燃料/步数截断，如实报告，绝不硬判
 
