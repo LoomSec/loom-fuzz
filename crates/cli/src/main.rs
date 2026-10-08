@@ -88,7 +88,8 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         out: PathBuf,
         /// confirmed 的 hit 顺手生成 L2 exploit 工程（pocgen）并跑
-        /// forge test（--emit-poc <dir>）
+        /// forge test（--emit-poc <dir>）；L2 无法机械组装的 hit 如实
+        /// 标注"诚实降级"并继续（不中断 run）
         #[arg(long)]
         emit_poc: Option<PathBuf>,
         /// on-demand fork：JSON-RPC URL（env BLOCKMACHINE_RPC_URL 兜底，
@@ -451,11 +452,22 @@ fn cmd_run(
                 let code_text = std::fs::read_to_string(code_path)
                     .map_err(|e| format!("无法读取 code: {e}"))?;
                 let exploit_dir = dir.join(format!("exploit-{}-{}", hit.selector, hit.step));
-                let (path, summary) =
-                    loom_fuzz_pocgen::generate_exploit(&poc, code_text.trim(), &exploit_dir, false)
-                        .map_err(|e| format!("L2 exploit 生成/forge 失败: {e}"))?;
-                println!("forge test 绿灯: {}", path.display());
-                println!("{summary}");
+                // L2 诚实降级（issue #28）：头形可解析但无通用价值影响
+                // 组装路径的命中（如 anySwapOut 伪动态头）如实标注并继续
+                // ——L1 confirmed 与 poc 落盘不受影响，与 run 的"退出码
+                // 恒 0、降级不过滤"语义一致。
+                match loom_fuzz_pocgen::generate_exploit(
+                    &poc,
+                    code_text.trim(),
+                    &exploit_dir,
+                    false,
+                ) {
+                    Ok((path, summary)) => {
+                        println!("forge test 绿灯: {}", path.display());
+                        println!("{summary}");
+                    }
+                    Err(e) => println!("L2 诚实降级: {e}"),
+                }
             }
         } else {
             println!("{}: {} — {}", hit.selector, report.verdict, report.reason);

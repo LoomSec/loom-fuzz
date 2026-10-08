@@ -132,16 +132,24 @@ fuzz_report.json（loom-fuzz-report@1：per-hit 判决 + 覆盖 + corpus 规模
   │  L2（issue #10/#20）：confirmed 的 poc.json 进 exploit 影响层——
   ▼
 Foundry 工程（crates/pocgen 机械合成，forge test 绿灯 = 终判）
-  │  资产模型：MockERC20（工程自带）全额 mint/布置给受害者持仓
-  │  有害动作（机械通用选择，#20 推广）：arbitrary_call 臂 3 =
-  │    transferFrom(router, attacker, BALANCE)；approval_drain 族 =
-  │    poc.json 定罪呼出（poc.call）input 形状匹配 ERC20
-  │    transferFrom/transfer（keccak 选择子现算）→ victim 资产 =
-  │    呼出目标 etch MockERC20 + 余额/allowance keccak 槽布置 +
-  │    verbatim 重放 + 缴获断言；形状不匹配 = NoGenericAction
-  │    诚实降级（不硬套个案）
-  │  双断言：L1 require(ok)（转发成功）+ L2 require(balanceOf(缴获)
-  │    == 金额)（缴获严格等于全额）
+  │  资产模型：MockERC20（工程自带，含路由面探针词汇 underlying /
+  │    permit / transferWithPermit / depositVault / burn）全额
+  │    mint/布置给路由器持仓；定罪呼出是 underlying() 探针 =
+  │    pegged 双 mock（入口代币 + 价值底层，issue #28）
+  │  有害动作（机械通用选择，#20 推广，#28 广义头形）：arbitrary_call
+  │    = 广义 ABI 头解析（定长槽 + 至多一个动态尾偏移槽；尾偏移
+  │    解释需臂 3 转发证据）→ 目标槽经 poc.call 目标交叉定位 =
+  │    VICTIM_ASSET，零词按 debit/recipient/amount 角色序注入 /
+  │    动态头的尾偏移槽 = transferFrom(router, attacker, BALANCE)
+  │    请求字节；approval_drain 族 = poc.json 定罪呼出（poc.call）
+  │    input 形状匹配 ERC20 transferFrom/transfer（keccak 选择子
+  │    现算）→ victim 资产 = 呼出目标 etch MockERC20 + 余额/
+  │    allowance keccak 槽布置 + verbatim 重放 + 缴获断言；形状不
+  │    匹配 / 无可机械组装路径 = typed error 诚实降级（不硬套个案；
+  │    run --emit-poc 遇降级如实标注并继续）
+  │  双断言：L1 require(ok)（路由器调用成功）+ L2 require(
+  │    balanceOf(ROUTER) == 0)（每个受害资产的路由器持仓严格归零
+  │    ——终点断言，缴获路径因 router 逻辑而异）
   │  ｜非 confirmed 不进 L2（typed error 诚实降级）
   ▼
 forge test 绿灯（`loom-fuzz exploit <poc.json> --code … [--fork]`

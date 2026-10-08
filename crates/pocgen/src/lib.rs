@@ -9,7 +9,7 @@
 //! - **L2**（本 crate）：把 primitive 组装成盗窃——选有害动作、布置
 //!   受害者资产、断言缴获。机械合成，不手写个案 calldata。
 //!
-//! # 合成三要素（arbitrary_call 臂 3 的 L2 形状）
+//! # 合成三要素（arbitrary_call 的 L2 形状）
 //!
 //! 1. **资产模型**：生成的 Foundry 工程自带自写 `MockERC20.sol`
 //!    （最小 ERC20，solc 0.8.19 兼容；槽布局钉死：balanceOf = slot
@@ -25,13 +25,17 @@
 //!    [`HarmfulAction`] + [`select_action`]，M0 只实现 ERC20 drain 臂。
 //! 3. **PoC 测试体**：`vm.etch(router, <运行时字节码>)` + poc.json
 //!    prestate（registry 槽）`vm.store` + `vm.prank(attacker)` +
-//!    calldata 机械合成——解析 witness calldata 的头形（臂 3 router
-//!    形：槽 0 = 目标地址（address-clean 校验），末槽 = 尾指针
-//!    （值 = 头宽，校验）），service 槽替换为 VICTIM_ASSET、request
-//!    槽替换为 `abi.encodeCall(IERC20.transferFrom, …)`。调用序列 =
-//!    一次 forwardRequest。收尾断言：① L1 `assertTrue(ok)`（转发
-//!    成功）② L2 `assertEq(token.balanceOf(attacker), BALANCE)`（余额
-//!    严格等于转入全额——终点断言）。
+//!    calldata 机械合成——广义头形解析（issue #28：定长槽 + 至多一
+//!    个动态尾偏移槽；逐槽尝试尾偏移解释，末槽==n·32 不再是前提）
+//!    后槽替换：目标槽（与 poc.json 定罪呼出目标交叉定位）=
+//!    VICTIM_ASSET；动态头形的尾偏移槽 =
+//!    `abi.encodeCall(IERC20.transferFrom, …)`；定长头形的零词按
+//!    debit/recipient/amount 角色序注入（ERC20 标准形——与
+//!    select_action 同类的 ABI 形状知识）。调用序列 = 一次头形合成
+//!    调用。收尾断言：① L1 `require(ok)`（路由器调用成功）② L2
+//!    `require(balanceOf(ROUTER) == 0)`（每个受害资产的路由器持仓
+//!    严格归零——终点断言；缴获路径因 router 逻辑而异，统一锚在
+//!    路由器持仓）。
 //!
 //! # fork 模式（BlockMachine）
 //!
