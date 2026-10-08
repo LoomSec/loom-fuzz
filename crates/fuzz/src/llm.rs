@@ -175,23 +175,27 @@ impl LlmProposer {
 
     /// 解析模型输出：宽松扫描 JSON 数组——剥 markdown 围栏后，从
     /// 每个 '[' 位置尝试解析（reasoning 模型会在 JSON 前写长推理，
-    /// 首个 '[' 不一定是数组起点）。
+    /// 首个 '[' 不一定是数组起点）。用流式反序列化取每个 '[' 起的
+    /// 第一个完整 JSON 值：推理文本里数组后常跟散文，整段切片
+    /// `start..rfind(']')` 会把多个括号 span 交叉拼错（实测
+    /// deepseek-flash 的 reasoning_content 即如此），流式解析不受
+    /// 尾部散文影响。
     fn parse_candidates(&self, text: &str) -> Result<Vec<Input>, String> {
         let cleaned = text.replace("```json", "").replace("```", "");
         let mut last_err = "响应无 JSON 数组".to_string();
         let starts: Vec<usize> = cleaned.match_indices('[').map(|(i, _)| i).take(8).collect();
         let mut arr: Option<serde_json::Value> = None;
         for start in starts {
-            if let Some(end) = cleaned[start..].rfind(']') {
-                let end = start + end;
-                match serde_json::from_str::<serde_json::Value>(&cleaned[start..=end]) {
-                    Ok(v) if v.is_array() => {
-                        arr = Some(v);
-                        break;
-                    }
-                    Ok(_) => last_err = "首个 JSON 值非数组".to_string(),
-                    Err(e) => last_err = format!("JSON 解析失败: {e}"),
+            let mut stream = serde_json::Deserializer::from_str(&cleaned[start..])
+                .into_iter::<serde_json::Value>();
+            match stream.next() {
+                Some(Ok(v)) if v.is_array() => {
+                    arr = Some(v);
+                    break;
                 }
+                Some(Ok(_)) => last_err = "首个 JSON 值非数组".to_string(),
+                Some(Err(e)) => last_err = format!("JSON 解析失败: {e}"),
+                None => last_err = "响应无 JSON 数组".to_string(),
             }
         }
         let arr = arr.ok_or(last_err)?;
@@ -252,7 +256,10 @@ impl LlmProposer {
             "model": self.cfg.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
-            "max_tokens": 8192,
+            // reasoning 模型（deepseek-v4-flash 实测）会把预算烧在
+            // 推理上，8192 不够写完答案（finish 不到数组）；32K 实测
+            // 服务端接受且够用。
+            "max_tokens": 32768,
         })
         .to_string();
         let result = self
@@ -459,6 +466,30 @@ mod tests {
         assert!(log[0].error.as_deref().unwrap().contains("500"));
         let notes = p.take_assumptions();
         assert!(notes.iter().any(|a| a.contains("LLM 调用失败")));
+    }
+
+    #[test]
+    fn llm_reasoning_content_array_with_trailing_prose_parses() {
+        // deepseek-flash 实测形态：content 空、答案混在
+        // reasoning_content 的推理散文里，JSON 数组后还有文字——
+        // 流式解析应只取第一个完整数组（旧的首'['+尾']' 切片会被
+        // 散文里的括号交叉拼错）。
+        let reasoning = "We need answer only JSON array. Reasoning about the guard \
+                         operands suggests trying the dictionary word. Final answer: \
+                         [{\"selector\":\"0x2e2d2984\",\"words\":[\"0x0000000000000000000000000000000000000000000000000000000000000042\"]}] \
+                         (list of candidates above, slots are 32-byte words.)";
+        let resp = serde_json::json!({
+            "choices": [{"message": {"content": "", "reasoning_content": reasoning}}]
+        })
+        .to_string();
+        let ok = Arc::new(move |_u: &str, _k: &str, _b: &str| Ok(resp.clone()));
+        let mut p = mk_proposer(ok);
+        let cands = p.propose(&feedback(), budget());
+        assert_eq!(cands[0].selector, 0x2e2d2984);
+        assert_eq!(U256::from_be_bytes(cands[0].head[0]), U256::from(0x42u64));
+        let log = p.take_interactions();
+        assert_eq!(log.len(), 1);
+        assert!(log[0].ok, "应解析成功: {:?}", log[0].error);
     }
 
     #[test]
