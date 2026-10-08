@@ -109,6 +109,18 @@ HitSet
   ▼
 fuzz_report.json（loom-fuzz-report@1：per-hit 判决 + 覆盖 + corpus 规模
   + seed 编译全量假设 + guided vs baseline 数据；空命中集也照落）
+  │  L2（issue #10）：confirmed 的 poc.json 进 exploit 影响层——
+  ▼
+Foundry 工程（crates/pocgen 机械合成，forge test 绿灯 = 终判）
+  │  资产模型：MockERC20（工程自带）全额 mint 给路由器（受害者持仓）
+  │  有害动作：ERC20 drain = transferFrom(router, attacker, BALANCE)，
+  │    allowance[router][router] 槽 vm.store 机械布置（标准槽公式）
+  │  双断言：L1 require(ok)（转发成功）+ L2 require(balanceOf(attacker)
+  │    == BALANCE)（缴获严格等于全额）
+  │  ｜非 confirmed 不进 L2（typed error 诚实降级）
+  ▼
+forge test 绿灯（`loom-fuzz exploit <poc.json> --code … [--fork]`
+  或 `run --emit-poc <dir>`；fork 模式 = BlockMachine，见工程 README）
 ```
 
 ## CLI（crates/cli 的 bin）
@@ -119,6 +131,8 @@ loom-fuzz run --shard x.lst --code bytecode.hex [--prestate slots.json]   [--pac
   [--seed N] [--max-runs N] [--gas-per-tx N] [--dict-word 0x..]... [--out dir]
 # 重放 poc.json：重建会话重跑判决；exit 0 = verdict 与记录一致
 loom-fuzz replay poc-….json --code bytecode.hex [--prestate slots.json]
+# L2 exploit 影响层：confirmed poc.json → Foundry 工程 + forge test
+loom-fuzz exploit poc-….json --code bytecode.hex --out exploit/ [--fork]
 ```
 
 - prestate / dict-word：shard 无 registry/白名单事实段的 M0 补法——
@@ -129,6 +143,19 @@ loom-fuzz replay poc-….json --code bytecode.hex [--prestate slots.json]
 - 判决 exit 语义：`run` 恒 0（判决如实落盘）；输入/装载错误 fail-closed
   退出 2 并指明缺什么；`replay` 0 = 一致、1 = 不一致。
 
+## L1 / L2 两层模型（issue #10）
+
+- **L1 = 到场 + 控制呼出**（M0 已完，oracle）：到达 target pc 且
+  trace 上的呼出满足证据谓词（arbitrary_call 臂 3 = 任意目标 +
+  任意 calldata，msg.sender = 路由器）。产出 poc.json。
+- **L2 = 把 primitive 组装成盗窃**（pocgen）：选有害动作、布置
+  受害者资产、断言缴获。机械合成——calldata 由
+  `abi.encodeWithSelector` / `abi.encodeCall` 在 Solidity 侧表达，
+  合成器只注入参数（字节码 / prestate / BALANCE / 地址），不逐字节
+  手写。**forge test 绿灯 = 终判**；红灯 fail-closed 报错。
+- 有害动作集合按族扩展（`HarmfulAction` enum + 选择函数挂点），
+  M0 只实现 ERC20 drain 臂。
+
 ## Crate 规划
 
 | crate | 职责 | 状态 |
@@ -138,7 +165,8 @@ loom-fuzz replay poc-….json --code bytecode.hex [--prestate slots.json]
 | `crates/seed` | guard 事实 → 种子 Input（支配 guard 结构化反解：selector 头 / guard 常量 / 边界值 ±1 / caller / 存储槽标 free） | M0.3 已就绪 |
 | `crates/fuzz` | revm 执行 + --target 制导 + 变异器 + witness 记录 | M0.4 已就绪（#5） |
 | `crates/oracle` | 证据表达式族检查器 + 三值判决 + poc/report 落盘 | M0.5 已就绪（#7） |
-| `crates/cli` | 入口：模式 A/B 装载 + 管线串联 | M0.3 双模式装载器已就绪（PR #3） |
+| `crates/pocgen` | L2 exploit 合成：primitive → 价值影响 Foundry PoC（forge 绿灯 = 终判） | M0.6 已就绪（#10） |
+| `crates/cli` | 入口：模式 A/B 装载 + 管线串联 + run/replay/exploit 子命令 | M0.3 双模式装载器已就绪（PR #3） |
 
 ## 边界纪律
 

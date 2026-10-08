@@ -80,6 +80,24 @@ enum Cmd {
         /// 产物目录（fuzz_report.json / poc-*.json）
         #[arg(long, default_value = ".")]
         out: PathBuf,
+        /// confirmed 的 hit 顺手生成 L2 exploit 工程（pocgen）并跑
+        /// forge test（--emit-poc <dir>）
+        #[arg(long)]
+        emit_poc: Option<PathBuf>,
+    },
+    /// L2 exploit 影响层：poc.json → Foundry 工程 + forge test（绿灯 = 终判）
+    Exploit {
+        /// confirmed 的 poc.json
+        poc: PathBuf,
+        /// 运行时字节码 hex 文件
+        #[arg(long)]
+        code: PathBuf,
+        /// 工程输出目录
+        #[arg(long)]
+        out: PathBuf,
+        /// 生成 fork 模式工程（BlockMachine：run.sh + fork profile）
+        #[arg(long)]
+        fork: bool,
     },
     /// 重放 poc.json：重建会话重跑判决，打印 verdict JSON
     Replay {
@@ -119,6 +137,7 @@ fn run() -> Result<ExitCode, String> {
             gas_per_tx,
             dict_word,
             out,
+            emit_poc,
         } => cmd_run(
             &shard,
             &code,
@@ -131,7 +150,14 @@ fn run() -> Result<ExitCode, String> {
             gas_per_tx,
             &dict_word,
             &out,
+            emit_poc.as_deref(),
         ),
+        Cmd::Exploit {
+            poc,
+            code,
+            out,
+            fork,
+        } => cmd_exploit(&poc, &code, &out, fork),
         Cmd::Replay {
             poc,
             code,
@@ -167,6 +193,7 @@ fn cmd_run(
     gas_per_tx: u64,
     dict_words: &[String],
     out_dir: &Path,
+    emit_poc: Option<&Path>,
 ) -> Result<ExitCode, String> {
     // 装载（模式 A 需 pack+loom-bin 成对；只给一个 = fail-closed）。
     let hitset = match (pack, loom_bin) {
@@ -281,6 +308,16 @@ fn cmd_run(
                 "confirmed: {} ({} runs) → {filename}",
                 hit.selector, session.best_runs
             );
+            if let Some(dir) = emit_poc {
+                let code_text = std::fs::read_to_string(code_path)
+                    .map_err(|e| format!("无法读取 code: {e}"))?;
+                let exploit_dir = dir.join(format!("exploit-{}-{}", hit.selector, hit.step));
+                let (path, summary) =
+                    loom_fuzz_pocgen::generate_exploit(&poc, code_text.trim(), &exploit_dir, false)
+                        .map_err(|e| format!("L2 exploit 生成/forge 失败: {e}"))?;
+                println!("forge test 绿灯: {}", path.display());
+                println!("{summary}");
+            }
         } else {
             println!("{}: {} — {}", hit.selector, report.verdict, report.reason);
         }
@@ -378,6 +415,24 @@ impl HitView for CliHitView<'_> {
     fn evidence(&self) -> &str {
         &self.0.evidence
     }
+}
+
+fn cmd_exploit(
+    poc_path: &Path,
+    code_path: &Path,
+    out_dir: &Path,
+    fork: bool,
+) -> Result<ExitCode, String> {
+    let text = std::fs::read_to_string(poc_path)
+        .map_err(|e| format!("无法读取 poc {}: {e}", poc_path.display()))?;
+    let poc: Poc = serde_json::from_str(&text).map_err(|e| format!("poc JSON 解析失败: {e}"))?;
+    let code_text = std::fs::read_to_string(code_path)
+        .map_err(|e| format!("无法读取 code {}: {e}", code_path.display()))?;
+    let (path, summary) = loom_fuzz_pocgen::generate_exploit(&poc, code_text.trim(), out_dir, fork)
+        .map_err(|e| format!("L2 exploit 生成/forge 失败: {e}"))?;
+    println!("forge test 绿灯: {}", path.display());
+    println!("{summary}");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_replay(

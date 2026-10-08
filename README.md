@@ -4,7 +4,15 @@ Witness fuzzing for EVM bytecode, guided end-to-end by [loom-evm](https://github
 
 loom-evm 的检测命中是精确的 `(函数, 帧, 证据表达式)` 三元组。loom-fuzz 把三元组的每一列编译成闭环的一个角色——种子、目标、判决——回答唯一重要的问题：**这条命中真实可达吗，能不能直接生成可 `forge test` 的 exploit PoC？**
 
-**产出物 = Solidity PoC 代码**：检测出问题，就生成一份 Foundry 测试工程（`test/PoC.t.sol` + `foundry.toml`，`vm.etch`/`vm.prank`/`vm.store` 布置见证，收尾为价值影响断言），`forge test` 绿灯即终判——和手写 PoC 同一形态，但是机械生成的。
+**产出物 = Solidity PoC 代码**：检测出问题，就生成一份 Foundry 测试工程（`test/PoC.t.sol` + `foundry.toml` + 工程自带 `MockERC20`/`IERC20`/`Vm`，零外部依赖），`vm.etch`/`vm.prank`/`vm.store` 布置见证，收尾为价值影响断言（`balanceOf(attacker) == 转入全额`）。**`forge test` 绿灯即终判**——和手写 PoC 同一形态，但是机械合成的（calldata 由 `abi.encodeCall` 表达，不逐字节手写）。
+
+```sh
+loom-fuzz exploit out/poc-….json --code bytecode.hex --out exploit/   # L2 影响层
+# fork 模式（BlockMachine）：--fork 生成 run.sh + fork profile
+#   BLOCKMACHINE_RPC_URL / BLOCKMACHINE_API_KEY 环境变量约定：
+#   key 为空 = 直接无 key 连接；非空 = Bearer 头经 anvil 代理附加
+#   （forge test 无 header 旗，anvil --fork-header 是 foundry 族内惯用通路）。
+```
 
 | 命中列 | 在闭环中的角色 |
 |---|---|
@@ -46,6 +54,7 @@ loom-evm 反编译产出的静态事实直接编译成 fuzz 的输入空间：
 - **M0.3**：`crates/cli` 双模式装载器（PR #3）+ `crates/seed` 支配 guard 反解种子编译器（#4，golden 样本 `fixtures/guard-boundary/`）
 - **M0.4**：`crates/fuzz` revm 单合约定向执行器——CFG PC 距离制导 + witness 记录（#5；revm 42 / CANCUN，确定性 xorshift64* 进化环 + 纯随机基线对照）
 - **M0.5**：`crates/oracle` arbitrary_call 族 oracle + 三值判决 + `loom-fuzz` CLI 管线（run/replay，poc.json 一键重放 verdict 逐字节一致，#7）
+- **M0.6**：`crates/pocgen` exploit 影响层——L1 witness → L2 价值影响 Foundry PoC，forge test 绿灯 = 终判（#10，fork 模式 = BlockMachine）
 
 ```sh
 loom-fuzz run --shard hit.lst --code bytecode.hex --prestate slots.json --out out/

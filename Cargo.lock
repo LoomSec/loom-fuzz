@@ -1765,6 +1765,7 @@ dependencies = [
  "clap",
  "loom-fuzz-fuzz",
  "loom-fuzz-oracle",
+ "loom-fuzz-pocgen",
  "loom-fuzz-seed",
  "loom-fuzz-shard",
  "loom-fuzz-xlayer",
@@ -1799,6 +1800,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
+]
+
+[[package]]
+name = "loom-fuzz-pocgen"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "loom-fuzz-cli",
+ "loom-fuzz-fuzz",
+ "loom-fuzz-oracle",
+ "loom-fuzz-seed",
+ "loom-fuzz-shard",
+ "loom-fuzz-xlayer",
+ "serde_json",
 ]
 
 [[package]]
