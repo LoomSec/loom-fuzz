@@ -107,8 +107,6 @@ mod cfg;
 mod evm;
 mod exec;
 mod fork;
-#[cfg(feature = "llm")]
-pub mod llm;
 mod mutate;
 mod mutators;
 pub mod propose;
@@ -122,5 +120,5 @@ pub use exec::{
 };
 pub use fork::{pin_block, responder_runtime, responder_runtime_sender, ForkConfig, ForkDb};
 pub use loom_fuzz_seed::{HitView, Input, Tail, Target, ValueDictionary};
-pub use propose::{DictionaryProposer, LlmInteraction};
+pub use propose::DictionaryProposer;
 pub use rng::Rng;

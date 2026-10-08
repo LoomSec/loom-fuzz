@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 alloy-primitives = { version = "1.6.1", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-loom-fuzz-fuzz = { version = "0.1.0", path = "../fuzz", features = ["llm"] }
+loom-fuzz-fuzz = { version = "0.1.0", path = "../fuzz" }
 loom-fuzz-oracle = { version = "0.1.0", path = "../oracle" }
 loom-fuzz-pocgen = { version = "0.1.0", path = "../pocgen" }
 loom-fuzz-seed = { version = "0.1.0", path = "../seed" }

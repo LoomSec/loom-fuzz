@@ -56,7 +56,7 @@ loom-evm 反编译产出的静态事实直接编译成 fuzz 的输入空间：
 - **M0.5**：`crates/oracle` arbitrary_call 族 oracle + 三值判决 + `loom-fuzz` CLI 管线（run/replay，poc.json 一键重放 verdict 逐字节一致，#7）
 - **M0.6**：`crates/pocgen` exploit 影响层——L1 witness → L2 价值影响 Foundry PoC，forge test 绿灯 = 终判（#10，fork 模式 = BlockMachine）
 - **M0.7**：on-demand fork 执行——revm AlloyDB 远程状态（pin block）+ CacheDB overlay（--deploy 攻击合约），anvil 同款叠层（#21）
-- **M0.8**：分层搜索——全槽字典基座 + 多槽协同变异 + 可插拔 LLM 提案器（revert 归因进反馈，判决独立；#25）
+- **M0.8**：分层搜索——全槽字典基座 + 多槽协同变异（dictionary 为唯一搜索路线，#29 决策移除外部模型提案器）；revert 归因（loom 静态事实）辅助进化，判决独立（#25/#29）
 - **M0.9**：approval_drain 族（issue #20）——deputy_call（有 caller 守卫但目标可控 = confused deputy）/ drain_forward（input 含输入派生词且不与 caller 绑定）的装载（模式 A 双 pack 并集 / 模式 B 内置推导逐条对齐 loom packs）+ 族 oracle（deputy 复用臂 1 求值 / drain 宽松 memmem）+ L2 通用 ERC20 形状动作选择（不匹配如实报"无通用动作"）。签入 fixtures/real-world/（vvisr RewardsHypervisor / anyswap V4Router）。
 
 ```sh

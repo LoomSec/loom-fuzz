@@ -1,26 +1,15 @@
-//! 可插拔提案器（issue #25 分层搜索）：DictionaryProposer（默认，
-//! 既有基座 + 协同变异的封装）与 LlmProposer（feature `llm`，
-//! LLM 候选 + fail-closed 回退字典）。**判决独立**：judge/oracle
-//! 不感知提案器；LLM 只影响搜索路径不影响判决；replay 无 LLM
-//! 参与，verdict 一致。
+//! 提案器（issue #25 分层搜索，#29 决策简化）：DictionaryProposer
+//! 是唯一实现——既有字典基座 + 多槽协同变异的封装，反馈窗/精英/
+//! 池刷新结构由它承载。**判决独立**：judge/oracle 不感知提案器；
+//! replay 不经搜索层，verdict 一致。
 
 use alloy_primitives::U256;
-use loom_fuzz_seed::{Input, ValueDictionary};
+use loom_fuzz_seed::Input;
 
 use crate::mutators::{mutate, MutCtx};
 use crate::rng::Rng;
 
 use super::exec::{ProposalBudget, Proposer, ProposerCtx, RunFeedback};
-
-/// 一次 LLM 交互（prompt/响应全量落盘，fuzz_report llm_interactions
-/// 节）。独立于 feature 门控（报告结构常需）。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LlmInteraction {
-    pub prompt: String,
-    pub response: String,
-    pub ok: bool,
-    pub error: Option<String>,
-}
 
 /// 反馈窗口（每代喂给提案器的最近 N 条 run 反馈）。
 pub const FEEDBACK_WINDOW: usize = 32;
@@ -106,26 +95,6 @@ fn input_key(input: &Input) -> Vec<u8> {
         loom_fuzz_seed::Tail::Free => key.push(2),
     }
     key
-}
-
-/// 构造助手：从词列表组 head（LLM 候选解析用；≥1 词时尾部弃
-/// 标点语义——LLM 只产定长词序列，动态尾仍归字典路径）。
-pub fn words_to_input(selector: u32, caller: [u8; 20], words: &[U256]) -> Input {
-    Input {
-        selector,
-        caller,
-        value: U256::ZERO,
-        head: words.iter().map(|w| w.to_be_bytes::<32>()).collect(),
-        tail: loom_fuzz_seed::Tail::Empty,
-    }
-}
-
-/// 从值字典的词上限（prompt 上下文防爆炸）。
-pub const LLM_DICT_PREVIEW: usize = 24;
-
-#[allow(dead_code)]
-fn _dict_preview(dict: &ValueDictionary) -> Vec<U256> {
-    dict.words.iter().take(LLM_DICT_PREVIEW).copied().collect()
 }
 
 #[cfg(test)]

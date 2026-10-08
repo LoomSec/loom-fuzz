@@ -122,14 +122,13 @@ HitSet
   ▼
 fuzz_report.json（loom-fuzz-report@1：per-hit 判决 + 覆盖 + corpus 规模
   + seed 编译全量假设 + guided vs baseline 数据；空命中集也照落）
-  │  分层搜索（issue #25）：进化环由可插拔 Proposer 驱动——
-  │    DictionaryProposer（默认：反馈前一半父代 × 五算子+多槽协同
-  │    变异，k∈{2,3} 槽同轮覆写）/ LlmProposer（--proposer llm，
-  │    OpenAI 兼容 chat/completions；prompt/响应落 fuzz_report，
-  │    失败 fail-closed 回退字典）。revert 归因（loom 特色）：
-  │    执行器记录最近经过的支配 guard（pc + xlayer 渲染 cond），
-  │    随 RunFeedback 喂提案器。**判决独立**：judge/oracle 不感知
-  │    提案器；replay 无 LLM，verdict 一致。
+  │  分层搜索（issue #25/#29）：进化环由反馈驱动——DictionaryProposer
+  │    为唯一搜索路线（#29 决策移除外部模型提案器）：反馈窗 = corpus
+  │    精英（全史 fitness 最优，保选择压力）+ 最近窗口，父代 ×
+  │    五算子+多槽协同变异（k∈{2,3} 槽同轮覆写）。revert 归因
+  │    （loom 特色）：执行器记录最近经过的支配 guard（pc +
+  │    xlayer 渲染 cond），随 RunFeedback 喂提案器。**判决独立**：
+  │    judge/oracle 不感知提案器；replay 不经搜索层，verdict 一致。
   │  L2（issue #10/#20）：confirmed 的 poc.json 进 exploit 影响层——
   ▼
 Foundry 工程（crates/pocgen 机械合成，forge test 绿灯 = 终判）
@@ -160,7 +159,6 @@ loom-fuzz replay poc-….json --code bytecode.hex [--prestate slots.json]
 # on-demand fork 执行（env BLOCKMACHINE_RPC_URL/_API_KEY；key 空 = keyless）
 loom-fuzz run … --fork-url <url> --fork-block latest --contract-addr 0x… \
   --deploy 0x…:responder-sender   # 或 <hex runtime> / responder
-  [--proposer dictionary|llm]     # 提案器（llm 需 env LLM_API_*）
 # L2 exploit 影响层：confirmed poc.json → Foundry 工程 + forge test
 loom-fuzz exploit poc-….json --code bytecode.hex --out exploit/ [--fork]
 ```
