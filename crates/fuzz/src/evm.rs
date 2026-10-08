@@ -246,7 +246,25 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
         .expect("Legacy 无签名域校验，TxEnv 构造不失败");
 
     let mut evm = ctx.build_mainnet_with_inspector(WitnessInspector::new(step_cap));
-    let result = evm.inspect_tx(tx).expect("CacheDB 内存库，执行不失败");
+    let result = match evm.inspect_tx(tx) {
+        Ok(result) => result,
+        // 交易验证失败（如 gas limit 低于 intrinsic gas——预算配置
+        // 过紧）：如实记截断（inconclusive 数据源），不 panic。
+        Err(_e) => {
+            return RunResult {
+                trace: WitnessTrace {
+                    visited_pcs: Vec::new(),
+                    calls: Vec::new(),
+                    outcome: OutcomeKind::Invalid,
+                    gas_used: cfg.gas_per_tx,
+                    truncated: true,
+                },
+                visited_pcs: Vec::new(),
+                cmp_observed: Vec::new(),
+                storage_observed: Vec::new(),
+            };
+        }
+    };
 
     let inspector = evm.inspector;
     let (outcome, gas_used, truncated_by_gas) = map_result(&result.result);

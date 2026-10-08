@@ -18,9 +18,10 @@
 use loom_fuzz_fuzz::{RecordedCall, SessionReport, WitnessTrace};
 use serde::{Deserialize, Serialize};
 
+use alloy_primitives::U256;
 use loom_fuzz_seed::Input;
 
-use crate::family::{check_arbitrary_call, CallCheck};
+use crate::family::{check_arbitrary_call, CallCheck, CheckInput};
 use crate::hit::Hit;
 
 /// 三值判决。
@@ -50,8 +51,12 @@ pub struct Witness {
     pub trace: WitnessTrace,
     /// 命中的目标帧 pc。
     pub pc: u32,
-    /// oracle 定罪的那次 call（arbitrary_call 臂 3 的例证）。
+    /// oracle 定罪的那次 call（arbitrary_call 臂 1/臂 3 的例证）。
     pub evidence_call: RecordedCall,
+    /// 臂 1 求值结果（hex 字）：evidence 表达式在 witness calldata 上
+    /// 的具体值（臂 3 定罪 / 求值 ⊥ 时为 None）。poc.json 内嵌，
+    /// replay 无 shard 时作求值承诺重放臂 1 判定。
+    pub evidence_value: Option<String>,
 }
 
 /// 单条命中的判决报告。
@@ -67,6 +72,12 @@ pub struct HitReport {
     pub reason: String,
 }
 
+/// 判决入口（无表达式视图 / 求值承诺的便捷形：臂 3 memcmp 或
+/// fail-closed）。
+pub fn judge(hit: &Hit, session: &SessionReport, tx_calldata: &[u8]) -> HitReport {
+    judge_with(hit, session, tx_calldata, &JudgeInput::default())
+}
+
 /// 检测族标识（M0：按 loom 谓词名分发；本仓库装载产物只有
 /// arbitrary_call 一族的推导，其余形态 future）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,10 +87,25 @@ pub enum Family {
     Unknown,
 }
 
+/// 判决现场的可选输入：xlayer 表达式视图（臂 1 求值 / mode A 形状
+/// 启发用）+ replay 的求值承诺。缺省两无 = 旧行为（臂 3 memcmp 或
+/// expr 缺失时的 fail-closed）。
+#[derive(Default)]
+pub struct JudgeInput<'a> {
+    pub view: Option<&'a dyn crate::eval::EvalViewDyn>,
+    pub expected_evidence: Option<U256>,
+}
+
 /// 判决入口：`tx_calldata` = 触发该会话的最佳输入的原始交易
 /// calldata（selector + head + tail 拼接，与 revm TxEnv.data 逐
-/// 字节一致）。
-pub fn judge(hit: &Hit, session: &SessionReport, tx_calldata: &[u8]) -> HitReport {
+/// 字节一致）。`input` 为表达式视图 / replay 求值承诺（见
+/// [`JudgeInput`]）。
+pub fn judge_with(
+    hit: &Hit,
+    session: &SessionReport,
+    tx_calldata: &[u8],
+    ctx: &JudgeInput<'_>,
+) -> HitReport {
     // 到场那次 run 被截断（燃料/步数）：见证不完整——优先判
     // inconclusive，不跑族 oracle（trace 里的 call 可能根本没来得及
     // 派发）。
@@ -131,8 +157,17 @@ pub fn judge(hit: &Hit, session: &SessionReport, tx_calldata: &[u8]) -> HitRepor
             reason: "到场但无 best_input（契约外形态，如实报）".to_string(),
         };
     };
-    match check_arbitrary_call(hit, &trace.calls, tx_calldata) {
-        CallCheck::Convicted(evidence_call) => {
+    let check = check_arbitrary_call(
+        hit,
+        &trace.calls,
+        tx_calldata,
+        &CheckInput {
+            view: ctx.view,
+            expected_evidence: ctx.expected_evidence,
+        },
+    );
+    match check {
+        CallCheck::ConvictedArm3(evidence_call) => {
             let pc = hit
                 .target_pcs
                 .iter()
@@ -148,8 +183,44 @@ pub fn judge(hit: &Hit, session: &SessionReport, tx_calldata: &[u8]) -> HitRepor
                     trace,
                     pc,
                     evidence_call,
+                    evidence_value: None,
                 }),
                 reason: "到场且臂 3 证据成立：call input 是原始 calldata 的子串".to_string(),
+            }
+        }
+        CallCheck::ConvictedArm1(evidence_call) => {
+            let pc = hit
+                .target_pcs
+                .iter()
+                .copied()
+                .find(|pc| trace.visited_pcs.contains(pc))
+                .or(evidence_call.pc)
+                .unwrap_or(0);
+            // 臂 1：求值结果留证（view 在场即重算；replay 用内嵌承诺）。
+            let evidence_value = {
+                let expr = hit.evidence_expr;
+                match (ctx.view, expr) {
+                    (Some(view), Some(e)) => crate::eval::eval_word(
+                        view,
+                        e,
+                        &crate::eval::EvalEnv::new(tx_calldata.to_vec(), default_this()),
+                    ),
+                    _ => ctx.expected_evidence,
+                }
+            }
+            .map(crate::poc::u256_hex);
+            HitReport {
+                verdict: Verdict::Confirmed,
+                hit: hit.clone(),
+                witness: Some(Witness {
+                    input,
+                    trace,
+                    pc,
+                    evidence_call,
+                    evidence_value,
+                }),
+                reason: "到场且臂 1 证据成立：call.target == cast160(evidence)（目标可控）"
+                    .to_string(),
             }
         }
         CallCheck::Rejected(reason) => HitReport {
@@ -159,6 +230,16 @@ pub fn judge(hit: &Hit, session: &SessionReport, tx_calldata: &[u8]) -> HitRepor
             reason: format!("到场但证据谓词不成立：{reason}"),
         },
     }
+}
+
+/// 与执行器/pocgen 同一约定：固定路由器地址（loom-fuzz 管线的
+/// CONTRACT_ADDRESS）。
+fn default_this() -> U256 {
+    U256::from_be_bytes({
+        let mut w = [0u8; 32];
+        w[19] = 0x22;
+        w
+    })
 }
 
 /// 族分发（M0：全部按 arbitrary_call 处理——装载器的检测推导只有
@@ -213,6 +294,8 @@ mod tests {
             step: 19,
             target_pcs: vec![384],
             evidence: String::new(),
+            evidence_expr: None,
+            arm: None,
             dominating_guards: Vec::new(),
         }
     }

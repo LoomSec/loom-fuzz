@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use loom_fuzz_shard::{Definition, Entry, ExprNode, Function, Scope, Shard};
 
-mod word;
+pub mod word;
 pub use word::Word;
 
 // ---------------------------------------------------------------------------

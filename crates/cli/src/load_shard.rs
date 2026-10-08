@@ -66,6 +66,8 @@ pub fn load_from_shard(shard_path: &Path, code_hex: &Path) -> Result<HitSet, Loa
                 selector,
                 step: h.step,
                 evidence: render_node(&view, h.evidence),
+                evidence_expr: Some(h.evidence),
+                arm: Some(h.arm),
             }
         })
         .collect();
@@ -73,11 +75,15 @@ pub fn load_from_shard(shard_path: &Path, code_hex: &Path) -> Result<HitSet, Loa
 }
 
 /// 装配期行：函数已解析为下标，证据已渲染为文本（两种模式在此汇合）。
+/// 结构化表达式 id + 检测臂仅模式 B 有（模式 A 的 loom JSON 只给
+/// 渲染文本，留 None——oracle 按形状启发 / fail-closed 兜底）。
 pub(crate) struct Row {
     pub fn_idx: usize,
     pub selector: u32,
     pub step: u32,
     pub evidence: String,
+    pub evidence_expr: Option<u32>,
+    pub arm: Option<loom_fuzz_oracle::CallArm>,
 }
 
 /// 两种装载模式共享的装配：行（函数 + 步序 + 证据）→ 命中集。
@@ -112,6 +118,8 @@ pub(crate) fn assemble(
             step: row.step,
             target_pcs: vec![*pc],
             evidence: row.evidence,
+            evidence_expr: row.evidence_expr,
+            arm: row.arm,
             dominating_guards: dominating,
         });
     }

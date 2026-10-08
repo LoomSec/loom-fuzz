@@ -121,6 +121,8 @@ mod tests {
                 step: 19,
                 target_pcs: pcs.to_vec(),
                 evidence: String::new(),
+                evidence_expr: None,
+                arm: None,
                 dominating_guards: Vec::new(),
             },
             witness: None,
@@ -132,6 +134,7 @@ mod tests {
     fn coverage_unions_and_percent() {
         let mut a = report(&[1, 2]);
         a.witness = Some(crate::verdict::Witness {
+            evidence_value: None,
             input: loom_fuzz_fuzz::Input {
                 selector: 0,
                 caller: [0; 20],

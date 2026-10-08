@@ -32,12 +32,14 @@ use crate::hitset::GuardFact;
 use crate::render::{render_node, View};
 
 /// 一条原始命中：函数下标 + 效果步序 + 证据 operand 的表达式 id
-/// （渲染在装载装配期做，两种模式共用同一装配路径）。
+/// （渲染在装载装配期做，两种模式共用同一装配路径）+ 检测臂。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawHit {
     pub fn_idx: usize,
     pub step: u32,
     pub evidence: u32,
+    /// 检测臂（臂 1 目标可控 / 臂 3 裸转发）——oracle 按臂定罪。
+    pub arm: loom_fuzz_oracle::CallArm,
 }
 
 const SENDER_OPS: [&str; 2] = ["msg.sender", "tx.origin"];
@@ -344,7 +346,7 @@ pub fn detect_arbitrary_call(shard: &Shard, view: &Xlayer<'_>) -> Vec<RawHit> {
                 continue; // calls_x 要求 target operand 存在
             };
             let checked = caller_checked_at(shard, view, entries, *i, *si);
-            let mut hit = false;
+            let mut hit = None;
             // 臂 3（裸转发）：非静态 call + input 含原始 calldata 切片。
             if let (Some(call_kind), Some(input)) = (operand("call_kind"), operand("input")) {
                 if op_of(view, call_kind).as_deref() != Some("staticcall")
@@ -352,24 +354,27 @@ pub fn detect_arbitrary_call(shard: &Shard, view: &Xlayer<'_>) -> Vec<RawHit> {
                         .iter()
                         .any(|&n| is_op(view, n, &RAW_FORWARD_OPS))
                 {
-                    hit = true;
+                    hit = Some(loom_fuzz_oracle::CallArm::Arm3);
                 }
             }
             // 臂 1（目标可控）：target 子树含 inputmark、未被白名单、
             // 无 caller 检查。loom 语义：∃ inputmark x 使 not
             // whitelisted(f, x)——某个子式被白名单不抑制其它子式的命中。
-            if !hit {
+            if hit.is_none() {
                 let arm1 = subtree(view, target)
                     .iter()
                     .filter(|&&n| is_inputmark(view, n))
                     .any(|&n| !whitelisted(view, &guard_conds, n));
-                hit = arm1;
+                if arm1 {
+                    hit = Some(loom_fuzz_oracle::CallArm::Arm1);
+                }
             }
-            if hit && !checked && seen.insert((fn_idx, *i)) {
+            if let Some(arm) = hit.filter(|_| !checked && seen.insert((fn_idx, *i))) {
                 hits.push(RawHit {
                     fn_idx,
                     step: *i,
                     evidence: target,
+                    arm,
                 });
             }
         }
