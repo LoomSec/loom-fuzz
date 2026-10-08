@@ -366,9 +366,7 @@ impl Shard {
     /// selector（4 字节选择子，如 0xe27fbed3）→ 函数。无 selector 的
     /// fallback/receive 不在此索引内。
     pub fn function_by_selector(&self, selector: u32) -> Option<&Function> {
-        self.functions
-            .iter()
-            .find(|f| f.selector == Some(selector))
+        self.functions.iter().find(|f| f.selector == Some(selector))
     }
 
     pub fn definitions(&self) -> &[Definition] {
@@ -534,11 +532,7 @@ mod reader {
         Ok(entries)
     }
 
-    fn segment_body(
-        bytes: &[u8],
-        dir: &[DirectoryEntry],
-        kind: u32,
-    ) -> Result<Vec<u8>, Error> {
+    fn segment_body(bytes: &[u8], dir: &[DirectoryEntry], kind: u32) -> Result<Vec<u8>, Error> {
         let entry = dir
             .iter()
             .find(|e| e.kind == kind)
@@ -617,11 +611,7 @@ mod reader {
 
     /// 读一条事实流条目；`step` 是调用方的步序计数器（只给
     /// Guard/Effect/Outcome 递增）。
-    fn parse_entry(
-        r: &mut Cursor,
-        strings: &[String],
-        step: &mut u32,
-    ) -> Result<Entry, Error> {
+    fn parse_entry(r: &mut Cursor, strings: &[String], step: &mut u32) -> Result<Entry, Error> {
         let str_at = |r: &mut Cursor| -> Result<String, Error> {
             let id = r.varint()?;
             strings

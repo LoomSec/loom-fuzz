@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use alloy_primitives::U256;
 use loom_fuzz_seed::Input;
 
-use crate::family::{check_arbitrary_call, CallCheck, CheckInput};
+use crate::family::{
+    check_arbitrary_call, check_deputy_call, check_drain_forward, CallCheck, CheckInput,
+};
 use crate::hit::Hit;
 
 /// 三值判决。
@@ -78,14 +80,9 @@ pub fn judge(hit: &Hit, session: &SessionReport, tx_calldata: &[u8]) -> HitRepor
     judge_with(hit, session, tx_calldata, &JudgeInput::default())
 }
 
-/// 检测族标识（M0：按 loom 谓词名分发；本仓库装载产物只有
-/// arbitrary_call 一族的推导，其余形态 future）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Family {
-    ArbitraryCall,
-    /// 族未知 / 未实现：fail-closed 不判 confirmed。
-    Unknown,
-}
+/// 检测族标识 = [`HitFamily`]（装载产物的谓词维度；#20 起三族，
+/// 族检查器见 family.rs）。
+pub use crate::hit::HitFamily as Family;
 
 /// 判决现场的可选输入：xlayer 表达式视图（臂 1 求值 / mode A 形状
 /// 启发用）+ replay 的求值承诺。缺省两无 = 旧行为（臂 3 memcmp 或
@@ -138,16 +135,8 @@ pub fn judge_with(
         };
     }
 
-    // 到场：跑族 oracle。
+    // 到场：按族跑族检查器（family.rs）。
     let family = family_of(hit);
-    if family != Family::ArbitraryCall {
-        return HitReport {
-            verdict: Verdict::Inconclusive,
-            hit: hit.clone(),
-            witness: None,
-            reason: "到场但族检查器未实现（fail-closed：不判 confirmed）".to_string(),
-        };
-    }
     let trace = session.trace.clone();
     let Some(input) = session.best_input.clone() else {
         return HitReport {
@@ -157,15 +146,25 @@ pub fn judge_with(
             reason: "到场但无 best_input（契约外形态，如实报）".to_string(),
         };
     };
-    let check = check_arbitrary_call(
-        hit,
-        &trace.calls,
-        tx_calldata,
-        &CheckInput {
-            view: ctx.view,
-            expected_evidence: ctx.expected_evidence,
-        },
-    );
+    let check_input = CheckInput {
+        view: ctx.view,
+        expected_evidence: ctx.expected_evidence,
+    };
+    // 各族的"证据成立"判语文本（定罪时落 reason）。
+    let (check, reason_ok) = match family {
+        Family::ArbitraryCall => (
+            check_arbitrary_call(hit, &trace.calls, tx_calldata, &check_input),
+            String::new(), // 两臂各用自己的判语（历史行为不变）
+        ),
+        Family::ApprovalDrainDeputy => (
+            check_deputy_call(hit, &trace.calls, tx_calldata, &check_input),
+            "到场且 deputy_call 证据成立：call.target == cast160(evidence)（confused deputy：有 caller 守卫但目标仍由调用者控制）".to_string(),
+        ),
+        Family::ApprovalDrainForward => (
+            check_drain_forward(hit, &trace.calls, tx_calldata),
+            "到场且 drain_forward 证据成立：call input 含 calldata 派生切片（宽松 memmem：子串或 32B 头词覆盖）且整体不与 caller 绑定".to_string(),
+        ),
+    };
     match check {
         CallCheck::ConvictedArm3(evidence_call) => {
             let pc = hit
@@ -196,7 +195,8 @@ pub fn judge_with(
                 .find(|pc| trace.visited_pcs.contains(pc))
                 .or(evidence_call.pc)
                 .unwrap_or(0);
-            // 臂 1：求值结果留证（view 在场即重算；replay 用内嵌承诺）。
+            // 臂 1 / deputy_call：求值结果留证（view 在场即重算；replay
+            // 用内嵌承诺）。
             let evidence_value = {
                 let expr = hit.evidence_expr;
                 match (ctx.view, expr) {
@@ -219,8 +219,32 @@ pub fn judge_with(
                     evidence_call,
                     evidence_value,
                 }),
-                reason: "到场且臂 1 证据成立：call.target == cast160(evidence)（目标可控）"
-                    .to_string(),
+                reason: if reason_ok.is_empty() {
+                    "到场且臂 1 证据成立：call.target == cast160(evidence)（目标可控）".to_string()
+                } else {
+                    reason_ok
+                },
+            }
+        }
+        CallCheck::ConvictedDrain(evidence_call) => {
+            let pc = hit
+                .target_pcs
+                .iter()
+                .copied()
+                .find(|pc| trace.visited_pcs.contains(pc))
+                .or(evidence_call.pc)
+                .unwrap_or(0);
+            HitReport {
+                verdict: Verdict::Confirmed,
+                hit: hit.clone(),
+                witness: Some(Witness {
+                    input,
+                    trace,
+                    pc,
+                    evidence_call,
+                    evidence_value: None,
+                }),
+                reason: reason_ok,
             }
         }
         CallCheck::Rejected(reason) => HitReport {
@@ -242,10 +266,9 @@ fn default_this() -> U256 {
     })
 }
 
-/// 族分发（M0：全部按 arbitrary_call 处理——装载器的检测推导只有
-/// 这一族；谓词名维度随 #9 多族推广再启用）。
-pub fn family_of(_hit: &Hit) -> Family {
-    Family::ArbitraryCall
+/// 族分发：按命中谓词走对应族检查器（family.rs）。
+pub fn family_of(hit: &Hit) -> Family {
+    hit.family
 }
 
 #[cfg(test)]
@@ -291,6 +314,7 @@ mod tests {
 
     fn hit() -> Hit {
         Hit {
+            family: Default::default(),
             selector: 0x90ce82d4,
             step: 19,
             target_pcs: vec![384],

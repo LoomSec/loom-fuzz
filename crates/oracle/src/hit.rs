@@ -30,6 +30,31 @@ impl std::fmt::Display for CallArm {
     }
 }
 
+/// 检测族（issue #20 多族推广）：loom 检测 pack 的谓词维度。不同
+/// pack 各自查询、行集并列——同一 call 效果可同时是多个族的命中。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HitFamily {
+    /// arbitrary_call pack（`vuln_arbitrary` 谓词）。
+    #[default]
+    ArbitraryCall,
+    /// approval_drain pack 的 deputy_call：有 caller 守卫但目标仍可控
+    /// （confused deputy）。
+    ApprovalDrainDeputy,
+    /// approval_drain pack 的 drain_forward：呼出 input 含输入派生词
+    /// 且整体不与 caller 绑定。
+    ApprovalDrainForward,
+}
+
+impl std::fmt::Display for HitFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HitFamily::ArbitraryCall => write!(f, "arbitrary_call"),
+            HitFamily::ApprovalDrainDeputy => write!(f, "approval_drain_deputy"),
+            HitFamily::ApprovalDrainForward => write!(f, "approval_drain_forward"),
+        }
+    }
+}
+
 /// 一条检测命中的支配 guard 事实：`cond` 是守卫条件的规范化渲染
 /// （loom 同款 S 表达式文本），`polarity` 是条件的真假支，`pc` 是
 /// 产生该守卫的单字节码方程原点。
@@ -46,6 +71,9 @@ pub struct Hit {
     /// 函数 selector；无函数上下文（fallback/receive 等）为
     /// [`SELECTOR_SENTINEL`] 哨兵。
     pub selector: u32,
+    /// 检测族（谓词维度；#20 前恒 arbitrary_call，serde 缺省回填）。
+    #[serde(default)]
+    pub family: HitFamily,
     /// 命中效果的 loom 检测步序（效果步，装载行第二列）。
     pub step: u32,
     /// 命中效果的原点 pc 集合（xlayer 展开后 step → pc）。

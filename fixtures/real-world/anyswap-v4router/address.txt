@@ -1,0 +1,7 @@
+# Anyswap V4 Router 运行时字节码 + loom shard（issue #20 样本集）。
+# 链上地址：未随样本记录（/tmp/real-cases 提供物无地址元数据；shard
+# 头不含 provenance 段）——本目录不臆造地址。
+chain: ethereum mainnet（来源标注；字节码为 Multichain/Anyswap V4 Router
+  系生产形态）
+provenance: issue #20 样本集（BlockMachine rpc-eth 系基础设施拉取，
+  2026-10-08 经 /tmp/real-cases 提供）；地址待考时不引用未验证值。

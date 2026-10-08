@@ -1,8 +1,8 @@
 //! 族 oracle：到目标帧后在具体 trace 上求值证据表达式（按族定制
-//! 检查器，docs/architecture.md 管线⑤）。M0 只实现 arbitrary_call
-//! 族（臂 3 裸转发 memcmp 判定）；其他族 future——判决入口按族
-//! 分发，未知族如实报 inconclusive-able 的 "未实现"（fail-closed
-//! 不硬判 confirmed）。
+//! 检查器，docs/architecture.md 管线⑤）。M0 实现三族：
+//! arbitrary_call（臂 3 裸转发 memcmp + 臂 1 目标求值）、
+//! approval_drain 的 deputy_call（同臂 1 求值）与 drain_forward
+//! （宽松 memmem）；新族在判决入口按族分发扩展。
 
 use loom_fuzz_fuzz::RecordedCall;
 
@@ -15,16 +15,22 @@ pub enum CallCheck {
     /// 臂 3 定罪：call input 是原始 calldata 的子串（裸转发）。
     ConvictedArm3(RecordedCall),
     /// 臂 1 定罪：call.target == cast160(evidence)（目标可控）。
+    /// deputy_call 族定罪复用本变体（同臂 1 求值定罪）。
     ConvictedArm1(RecordedCall),
+    /// drain_forward 定罪：call input 含 calldata 派生切片
+    /// （宽松 memmem，判定见 `drain_forward_check`）。
+    ConvictedDrain(RecordedCall),
     /// 未成立：`reason` 如实说明（到场但证据谓词不成立）。
     Rejected(String),
 }
 
 impl CallCheck {
-    /// 定罪的那次 call（两臂同形时按判决方取）。
+    /// 定罪的那次 call（各臂同形时按判决方取）。
     pub fn call(&self) -> Option<&RecordedCall> {
         match self {
-            CallCheck::ConvictedArm3(c) | CallCheck::ConvictedArm1(c) => Some(c),
+            CallCheck::ConvictedArm3(c)
+            | CallCheck::ConvictedArm1(c)
+            | CallCheck::ConvictedDrain(c) => Some(c),
             CallCheck::Rejected(_) => None,
         }
     }
@@ -173,6 +179,87 @@ fn default_this() -> alloy_primitives::U256 {
     })
 }
 
+/// approval_drain 族 deputy_call 检查器：同臂 1 目标求值定罪
+/// （复用 #19 求值器）——confused deputy 的 witness 具体形态 =
+/// call.target（低 160）== 证据表达式在 witness calldata 上的求值
+/// 结果（低 160）。view / 求值承诺两路同臂 1。
+pub fn check_deputy_call(
+    hit: &Hit,
+    calls: &[RecordedCall],
+    tx_calldata: &[u8],
+    input: &CheckInput<'_>,
+) -> CallCheck {
+    let Some(min_pc) = hit.target_pcs.iter().min().copied() else {
+        return CallCheck::Rejected("命中无 target pc（契约外输入）".to_string());
+    };
+    let candidates: Vec<&RecordedCall> = calls
+        .iter()
+        .filter(|c| c.pc.is_some_and(|pc| pc >= min_pc))
+        .collect();
+    if candidates.is_empty() {
+        return CallCheck::Rejected(format!(
+            "target pc {min_pc} 之后无 CALL 族效果（trace.calls 为空或都在 pc 之前）"
+        ));
+    }
+    match arm1_check(hit, &candidates, tx_calldata, input) {
+        Some(call) => CallCheck::ConvictedArm1(call),
+        None => CallCheck::Rejected(format!(
+            "target pc {min_pc} 后 {} 条 call：deputy_call 目标求值不成立（call.target ≠ cast160(evidence)）",
+            candidates.len()
+        )),
+    }
+}
+
+/// approval_drain 族 drain_forward 检查器：**宽松 memmem**——
+/// call input（≥4B 防 trivial）满足下列任一即定罪：
+/// 1. input 是原始交易 calldata 的字节子串（同臂 3 memcpy 级）；
+/// 2. input 含 calldata 的某个完整 32B 头词（词覆盖：input 整体不
+///    是子串但由 calldata 词拼装的组装形——deputy 代传参数的常见
+///    形态，如 selector + calldata_word 槽拼接）。
+///
+/// 语义选择（文档注明）：loom 检测臂只要求"input 子树含输入派生
+/// 词"，trace 级精确反演 inputmark 对应切片需要表达式→内存区的
+/// 符号映射（M0 无）；宽松 memmem 是其 sound 近似——子串/整词覆盖
+/// 必蕴含"含输入派生内容"，反之不保证（残留 FP 由三值判决的
+/// unreachable 臂如实降级）。
+pub fn check_drain_forward(hit: &Hit, calls: &[RecordedCall], tx_calldata: &[u8]) -> CallCheck {
+    let Some(min_pc) = hit.target_pcs.iter().min().copied() else {
+        return CallCheck::Rejected("命中无 target pc（契约外输入）".to_string());
+    };
+    let candidates: Vec<&RecordedCall> = calls
+        .iter()
+        .filter(|c| c.pc.is_some_and(|pc| pc >= min_pc))
+        .collect();
+    if candidates.is_empty() {
+        return CallCheck::Rejected(format!(
+            "target pc {min_pc} 之后无 CALL 族效果（trace.calls 为空或都在 pc 之前）"
+        ));
+    }
+    let words: Vec<&[u8]> = tx_calldata
+        .get(4..)
+        .map(|rest| {
+            let n = rest.len() / 32;
+            (0..n).map(|i| &rest[i * 32..i * 32 + 32]).collect()
+        })
+        .unwrap_or_default();
+    for call in &candidates {
+        if call.input.len() < 4 {
+            continue;
+        }
+        if memmem(tx_calldata, &call.input) {
+            return CallCheck::ConvictedDrain((*call).clone());
+        }
+        // 词覆盖：任一完整 32B calldata 头词出现在 input 里。
+        if words.iter().any(|w| memmem(&call.input, w)) {
+            return CallCheck::ConvictedDrain((*call).clone());
+        }
+    }
+    CallCheck::Rejected(format!(
+        "target pc {min_pc} 后 {} 条 call：input 均非 calldata 子串且不含任何 32B 头词",
+        candidates.len()
+    ))
+}
+
 /// 形状启发（mode A 兜底）：evidence 子树含 b_calldata_slice → 臂 3。
 fn shape_arm(hit: &Hit, input: &CheckInput<'_>) -> Option<crate::CallArm> {
     let view = input.view?;
@@ -201,6 +288,7 @@ mod tests {
 
     fn hit(pcs: &[u32]) -> Hit {
         Hit {
+            family: Default::default(),
             selector: 0x90ce82d4,
             step: 19,
             target_pcs: pcs.to_vec(),
@@ -338,5 +426,112 @@ mod tests {
         assert!(!memmem(TX, b"zzzz"));
         assert!(!memmem(b"ab", b"abcd"));
         assert!(memmem(TX, b""));
+    }
+
+    // --- approval_drain 族（issue #20）---
+
+    fn deputy_hit(pcs: &[u32]) -> Hit {
+        Hit {
+            family: crate::HitFamily::ApprovalDrainDeputy,
+            ..hit(pcs)
+        }
+    }
+
+    #[test]
+    fn deputy_convicts_on_target_eval_and_rejects_mismatch() {
+        // 同臂 1 求值定罪：evidence = calldata_word(0x4)，TX 槽 0。
+        struct V;
+        impl crate::eval::EvalViewDyn for V {
+            fn owned_node(&self, id: u32) -> Option<crate::eval::OwnedNode> {
+                (id == 0).then_some(crate::eval::OwnedNode::CalldataWord(4))
+            }
+        }
+        let mut h = deputy_hit(&[384]);
+        h.evidence_expr = Some(0);
+        let mut target = [0u8; 20];
+        target.copy_from_slice(&[0x61u8; 32][..20]);
+        let mut c = call("CALL", b"zzzz".to_vec(), Some(384));
+        c.target = target;
+        let ctx = CheckInput {
+            view: Some(&V),
+            expected_evidence: None,
+        };
+        match check_deputy_call(&h, &[c.clone()], TX, &ctx) {
+            CallCheck::ConvictedArm1(got) => assert_eq!(got.target, target),
+            other => panic!("应 deputy 定罪: {other:?}"),
+        }
+        // target 不匹配 → 拒绝（到场但证据谓词不成立）。
+        let mut bad = c.clone();
+        bad.target = [0x99; 20];
+        assert!(matches!(
+            check_deputy_call(&h, &[bad], TX, &ctx),
+            CallCheck::Rejected(_)
+        ));
+        // replay 承诺路径：无视图 + expected_evidence 同值定罪。
+        let low160 = {
+            let mut w = [0u8; 32];
+            w[12..].copy_from_slice(&target);
+            alloy_primitives::U256::from_be_bytes(w)
+        };
+        let ctx_replay = CheckInput {
+            view: None,
+            expected_evidence: Some(low160),
+        };
+        assert!(matches!(
+            check_deputy_call(&h, &[c], TX, &ctx_replay),
+            CallCheck::ConvictedArm1(_)
+        ));
+    }
+
+    fn drain_hit(pcs: &[u32]) -> Hit {
+        Hit {
+            family: crate::HitFamily::ApprovalDrainForward,
+            ..hit(pcs)
+        }
+    }
+
+    #[test]
+    fn drain_convicts_on_substring_or_word_cover() {
+        // 臂 1：input 是 calldata 子串（memcpy 级）。
+        let r = check_drain_forward(
+            &drain_hit(&[384]),
+            &[call("CALL", b"abcd".to_vec(), Some(384))],
+            TX,
+        );
+        assert!(matches!(r, CallCheck::ConvictedDrain(_)));
+        // 臂 2：input 非子串但含完整 32B calldata 头词（词覆盖——组装形）。
+        // TX = selector + "aaaa…"(32B) + "bcd"。input = 0xbbbb + word0。
+        let mut input = vec![0xbb, 0xbb, 0xbb, 0xbb];
+        input.extend_from_slice(&[0x61u8; 32]);
+        let r = check_drain_forward(&drain_hit(&[384]), &[call("CALL", input, Some(384))], TX);
+        assert!(matches!(r, CallCheck::ConvictedDrain(_)));
+    }
+
+    #[test]
+    fn drain_rejects_foreign_short_and_truncated_word() {
+        // 与 calldata 无关 → 拒绝。
+        let r = check_drain_forward(
+            &drain_hit(&[384]),
+            &[call("CALL", b"zzzzzzzz".to_vec(), Some(384))],
+            TX,
+        );
+        assert!(matches!(r, CallCheck::Rejected(_)));
+        // 长度 < 4 → 拒绝（trivial 防空匹配）。
+        let r = check_drain_forward(
+            &drain_hit(&[384]),
+            &[call("CALL", b"abc".to_vec(), Some(384))],
+            TX,
+        );
+        assert!(matches!(r, CallCheck::Rejected(_)));
+        // 改造词（中段异值，非完整 32B 头词也非子串——TX 的 0x62 只
+        // 出现在词尾、前后文不匹配）→ 拒绝。
+        let mut fake_word = [0x61u8; 32];
+        fake_word[10] = 0x62;
+        let r = check_drain_forward(
+            &drain_hit(&[384]),
+            &[call("CALL", fake_word.to_vec(), Some(384))],
+            TX,
+        );
+        assert!(matches!(r, CallCheck::Rejected(_)));
     }
 }

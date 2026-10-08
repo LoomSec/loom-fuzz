@@ -98,14 +98,22 @@ HitSet
   ▼
 族 oracle + 三值判决（crates/oracle）
   │  ⑤ 到目标帧后在具体 trace 上求值证据表达式（按族定制检查器；
-  │     M0 = arbitrary_call，按检测臂定罪（Hit.arm，mode B 装载时确定）：
+  │     M0 = 三族，Hit.family 分发（#20 多族推广）：
+  │     arbitrary_call（Hit.arm，mode B 装载时确定）：
   │     臂 3 裸转发：target pc 后的 RecordedCall，kind ∈
   │     {CALL,CALLCODE,DELEGATECALL} 且 input 是原始交易 calldata
   │     的字节子串（≥4B 防 trivial 匹配）；
   │     臂 1 目标可控：call.target（低 160）== 证据表达式在 witness
   │     calldata 上的求值结果（evidence_expr + xlayer 求值器，
   │     cast160(calldata_word/b_calldata_slice) 形态 → Confirmed+Witness，
-  │     求值结果以 evidence_value 内嵌 poc.json，replay 作承诺重放））
+  │     求值结果以 evidence_value 内嵌 poc.json，replay 作承诺重放）；
+  │     approval_drain（packs/detect/approval_drain.lq，装载行集与各
+  │     谓词独立查询并列——同一 call 效果可多族命中）：
+  │     deputy_call = 有 caller 守卫但目标仍可控（confused deputy；
+  │     同臂 1 目标求值定罪）；
+  │     drain_forward = 呼出 input 含 calldata 派生切片且整体不与
+  │     caller 绑定（宽松 memmem：input 是 calldata 子串 或 含完整
+  │     32B calldata 头词——sound 近似，语义选择文档注明））
   │  ⑥ 判决真值表（fail-closed：无见证只降级不过滤）：
   │        reached && !truncated && 证据成立 → confirmed → poc.json
   │          （loom-fuzz-poc@1：tx/prestate/seed/max_runs + replay 命令串，
@@ -122,14 +130,19 @@ fuzz_report.json（loom-fuzz-report@1：per-hit 判决 + 覆盖 + corpus 规模
   │    执行器记录最近经过的支配 guard（pc + xlayer 渲染 cond），
   │    随 RunFeedback 喂提案器。**判决独立**：judge/oracle 不感知
   │    提案器；replay 无 LLM，verdict 一致。
-  │  L2（issue #10）：confirmed 的 poc.json 进 exploit 影响层——
+  │  L2（issue #10/#20）：confirmed 的 poc.json 进 exploit 影响层——
   ▼
 Foundry 工程（crates/pocgen 机械合成，forge test 绿灯 = 终判）
-  │  资产模型：MockERC20（工程自带）全额 mint 给路由器（受害者持仓）
-  │  有害动作：ERC20 drain = transferFrom(router, attacker, BALANCE)，
-  │    allowance[router][router] 槽 vm.store 机械布置（标准槽公式）
-  │  双断言：L1 require(ok)（转发成功）+ L2 require(balanceOf(attacker)
-  │    == BALANCE)（缴获严格等于全额）
+  │  资产模型：MockERC20（工程自带）全额 mint/布置给受害者持仓
+  │  有害动作（机械通用选择，#20 推广）：arbitrary_call 臂 3 =
+  │    transferFrom(router, attacker, BALANCE)；approval_drain 族 =
+  │    poc.json 定罪呼出（poc.call）input 形状匹配 ERC20
+  │    transferFrom/transfer（keccak 选择子现算）→ victim 资产 =
+  │    呼出目标 etch MockERC20 + 余额/allowance keccak 槽布置 +
+  │    verbatim 重放 + 缴获断言；形状不匹配 = NoGenericAction
+  │    诚实降级（不硬套个案）
+  │  双断言：L1 require(ok)（转发成功）+ L2 require(balanceOf(缴获)
+  │    == 金额)（缴获严格等于全额）
   │  ｜非 confirmed 不进 L2（typed error 诚实降级）
   ▼
 forge test 绿灯（`loom-fuzz exploit <poc.json> --code … [--fork]`
