@@ -193,20 +193,16 @@ pub struct ProposerCtx<'a> {
     pub storage_pool: &'a [(U256, U256)],
 }
 
-/// 可插拔提案器（issue #25 分层搜索）： DictionaryProposer =
-/// 既有基座 + 协同变异的封装；LlmProposer = LLM 候选 + 失败回退
-/// 字典（fail-closed）。**判决独立**：judge/oracle 不感知提案器，
-/// LLM 只影响搜索路径不影响判决；replay 无 LLM 参与。
+/// 反馈驱动进化的提案器抽象（issue #25 分层搜索，#29 决策：dictionary
+/// 为唯一搜索路线，本 trait 的唯一实现是 DictionaryProposer；抽象保留
+/// ——反馈窗/精英/池刷新结构由它承载，测试用 capturing 提案器钉反馈
+/// 语义）。**判决独立**：judge/oracle 不感知提案器；replay 不参与搜索
+/// 层，verdict 一致。
 pub trait Proposer {
     /// 会话每代前刷新共享池（默认 no-op；dictionary 需要）。
     fn refresh(&mut self, _ctx: &ProposerCtx<'_>) {}
     /// 给反馈与预算，产下一批候选。
     fn propose(&mut self, feedback: &[RunFeedback], budget: ProposalBudget) -> Vec<Input>;
-    /// LLM 提案器的状态排泄（交互落盘 + 失败 assumption）；非 LLM
-    /// 提案器默认空。CLI 据此填 fuzz_report.llm_interactions。
-    fn drain_llm(&mut self) -> (Vec<crate::propose::LlmInteraction>, Vec<String>) {
-        (Vec::new(), Vec::new())
-    }
 }
 
 /// 步数上限（每 run）：gas 之外的硬兜（min gas/opcode ≥ 2，
@@ -242,7 +238,7 @@ pub fn run_targeted(
 
 /// 定向执行入口（提案器可插拔版）：进化环由 `proposer` 驱动——
 /// 每代 refresh 池 → 取反馈窗 → 提案 → 评估。**判决独立**：
-/// oracle/judge 不感知提案器；replay 无 LLM 参与，verdict 一致。
+/// oracle/judge 不感知提案器；replay 不经搜索层，verdict 一致。
 pub fn run_targeted_with(
     cfg: &ExecConfig,
     target: &Target<'_>,
@@ -273,7 +269,7 @@ pub fn run_targeted_with(
             break;
         }
     }
-    // 进化环：提案器驱动（默认 DictionaryProposer；LLM 只改搜索路径）。
+    // 进化环：提案器驱动（DictionaryProposer——唯一搜索路线，#29）。
     // 连续空代（提案器不产候选）三代即停——防零候选提案器把
     // 时间预算烧光（fail-closed：无候选 = 搜索无法继续）。
     let mut empty_gens = 0u32;

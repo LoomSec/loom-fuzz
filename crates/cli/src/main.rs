@@ -108,10 +108,6 @@ enum Cmd {
         /// 合约自身状态错位）——CLI 强制。
         #[arg(long)]
         contract_addr: Option<String>,
-        /// 提案器：dictionary（默认）或 llm（env LLM_API_BASE/KEY/
-        /// MODEL；失败 fail-closed 回退字典）。
-        #[arg(long, default_value = "dictionary")]
-        proposer: String,
     },
     /// L2 exploit 影响层：poc.json → Foundry 工程 + forge test（绿灯 = 终判）
     Exploit {
@@ -170,7 +166,6 @@ fn run() -> Result<ExitCode, String> {
             fork_block,
             deploy,
             contract_addr,
-            proposer,
         } => cmd_run(
             &shard,
             &code,
@@ -188,7 +183,6 @@ fn run() -> Result<ExitCode, String> {
             &fork_block,
             &deploy,
             contract_addr.as_deref(),
-            &proposer,
         ),
         Cmd::Exploit {
             poc,
@@ -236,7 +230,6 @@ fn cmd_run(
     fork_block: &str,
     deploy_flags: &[String],
     contract_addr: Option<&str>,
-    proposer: &str,
 ) -> Result<ExitCode, String> {
     // 装载（模式 A 需 pack+loom-bin 成对；只给一个 = fail-closed）。
     let hitset = match (packs.is_empty(), loom_bin) {
@@ -324,7 +317,6 @@ fn cmd_run(
 
     // 补充字典词进每个 hit 的编译字典（registry 常量补法）。
     let mut reports: Vec<HitReport> = Vec::new();
-    let mut report_llm_interactions: Vec<loom_fuzz_fuzz::propose::LlmInteraction> = Vec::new();
     let mut hit_entries: Vec<HitEntry> = Vec::new();
     let mut assumptions: Vec<String> = Vec::new();
     let mut corpus_total = 0usize;
@@ -409,48 +401,10 @@ fn cmd_run(
                 seed_out.assumptions.push(note);
             }
         }
-        // 提案器（分层搜索，issue #25）：默认 dictionary；--proposer
-        // llm 走 LLM 候选 + 字典回退（判决独立，replay 无 LLM）。
-        let mut proposer_box: Box<dyn loom_fuzz_fuzz::Proposer> = match proposer {
-            "dictionary" => Box::new(loom_fuzz_fuzz::DictionaryProposer::new(
-                cfg.seed_rng ^ 0x00D1_C710_AA8E_5EED,
-            )),
-            "llm" => {
-                let llm_cfg = loom_fuzz_fuzz::llm::LlmConfig::from_env().ok_or_else(|| {
-                    "LLM_API_KEY 未设置（--proposer llm 需要；失败也不会静默，先 fail-closed 拒绝）"
-                        .to_string()
-                })?;
-                Box::new(loom_fuzz_fuzz::llm::LlmProposer::new(
-                    llm_cfg,
-                    hit.selector,
-                    hit.target_pcs.clone(),
-                    hit.dominating_guards
-                        .iter()
-                        .map(|g| (g.pc, g.cond.clone()))
-                        .collect(),
-                    seed_out.dict.words.iter().take(24).copied().collect(),
-                    cfg.seed_rng ^ 0x00D1_C710_AA8E_5EED,
-                ))
-            }
-            other => return Err(format!("--proposer 只支持 dictionary|llm: {other:?}")),
-        };
-        let session = loom_fuzz_fuzz::run_targeted_with(
-            &cfg,
-            &target,
-            &seeds,
-            &seed_out.dict,
-            &mut *proposer_box,
-        );
-        // LLM 交互/失败 assumption 落盘（dictionary 路线为空）。
-        {
-            let (interactions, llm_notes) = proposer_box.drain_llm();
-            report_llm_interactions.extend(interactions);
-            for a in llm_notes {
-                if !assumptions.contains(&a) {
-                    assumptions.push(a);
-                }
-            }
-        }
+        // 搜索（issue #25/#29）：DictionaryProposer 为唯一路线——字典
+        // 基座 + 多槽协同变异，反馈窗（corpus 精英 + revert 归因）驱动
+        // 进化；判决独立，replay 不经搜索层。
+        let session = loom_fuzz_fuzz::run_targeted(&cfg, &target, &seeds, &seed_out.dict);
         let calldata = loom_fuzz_oracle::calldata_of(
             session
                 .best_input
@@ -523,7 +477,6 @@ fn cmd_run(
         coverage: coverage(&reports, table.executable_pc_count()),
         corpus: corpus_total,
         assumptions,
-        llm_interactions: report_llm_interactions,
         guidance: Guidance {
             guided_best_runs_total: guided_runs_total,
             baseline_runs_to_reach: baseline,
