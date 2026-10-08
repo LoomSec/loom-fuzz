@@ -51,8 +51,33 @@ pub struct Poc {
     /// shard，用它作求值承诺重放臂 1 判定（witness 变了即不一致）。
     #[serde(default)]
     pub evidence_value: Option<String>,
+    /// on-demand fork 配置（None = Genesis；Some 时 replay 同参重建
+    /// 远程状态——pin block 确定性）。
+    #[serde(default)]
+    pub fork: Option<PocFork>,
+    /// fork 后部署的攻击合约（pocgen 据此刻蚀）。
+    #[serde(default)]
+    pub deployments: Vec<PocDeployment>,
+    /// 执行地址（fork 态 = 真实地址；缺省 = 管线固定 0x2222…22）。
+    #[serde(default)]
+    pub contract: Option<String>,
     /// 手写 replay 命令串（含本文件名）。
     pub replay: String,
+}
+
+/// fork 配置（poc.json 形态）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PocFork {
+    pub rpc_url: String,
+    pub block_number: u64,
+}
+
+/// fork 后部署（poc.json 形态）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PocDeployment {
+    /// "0x" + 40 hex
+    pub address: String,
+    pub runtime_hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +252,19 @@ pub fn build_poc(
         max_runs,
         time_budget_secs,
         evidence_value: witness.evidence_value.clone(),
+        fork: cfg.fork.as_ref().map(|f| PocFork {
+            rpc_url: f.rpc_url.clone(),
+            block_number: f.block_number,
+        }),
+        deployments: cfg
+            .deployments
+            .iter()
+            .map(|d| PocDeployment {
+                address: bytes_hex(&d.address),
+                runtime_hex: bytes_hex(&d.runtime),
+            })
+            .collect(),
+        contract: Some(bytes_hex(&cfg.address)),
         replay,
     })
 }
@@ -265,13 +303,44 @@ pub fn replay(
 
     let cfg = ExecConfig {
         code: code.to_vec(),
-        address: [0x22; 20], // 与 run 管线同一固定合约地址
+        address: match &poc.contract {
+            Some(a) => {
+                let b = hex_bytes(a)?;
+                if b.len() != 20 {
+                    return Err("poc.contract 非 20 字节".to_string());
+                }
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&b);
+                addr
+            }
+            None => [0x22; 20], // 与 run 管线同一固定合约地址
+        },
         prestate,
         seed_rng: poc.seed,
         max_runs: poc.max_runs.max(1),
         time_budget: Duration::from_secs(poc.time_budget_secs.max(60)),
         gas_per_tx: 1_000_000,
         run_baseline: false,
+        fork: poc.fork.as_ref().map(|f| loom_fuzz_fuzz::ForkConfig {
+            rpc_url: f.rpc_url.clone(),
+            block_number: f.block_number,
+        }),
+        deployments: poc
+            .deployments
+            .iter()
+            .map(|d| {
+                let b = hex_bytes(&d.address)?;
+                if b.len() != 20 {
+                    return Err("poc.deployment.address 非 20 字节".to_string());
+                }
+                let mut a = [0u8; 20];
+                a.copy_from_slice(&b);
+                Ok(loom_fuzz_fuzz::Deployment {
+                    address: a,
+                    runtime: hex_bytes(&d.runtime_hex)?,
+                })
+            })
+            .collect::<Result<_, String>>()?,
     };
     let selector = u32::from_str_radix(poc.selector.trim_start_matches("0x"), 16)
         .map_err(|e| format!("poc.selector 非法: {e}"))?;
@@ -359,6 +428,7 @@ mod tests {
             witness: Some(crate::verdict::Witness {
                 evidence_value: None,
                 trace: WitnessTrace {
+                    deployments: Vec::new(),
                     visited_pcs: vec![384],
                     calls: vec![RecordedCall {
                         kind: "CALL".to_string(),
@@ -392,6 +462,8 @@ mod tests {
             time_budget: Duration::from_secs(5),
             gas_per_tx: 100_000,
             run_baseline: false,
+            fork: None,
+            deployments: Vec::new(),
         };
         (report, cfg)
     }

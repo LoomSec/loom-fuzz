@@ -40,8 +40,8 @@ pub(crate) struct RunResult {
     pub storage_observed: Vec<(U256, U256)>,
 }
 
-type Db = CacheDB<EmptyDB>;
-type Ctx = MainnetContext<Db>;
+/// 泛型上下文：Genesis（EmptyDB）与 fork（ForkDb 包装）通用。
+type CtxFor<DB> = MainnetContext<CacheDB<DB>>;
 
 /// witness inspector：`step` 记 pc + 比较操作数 + SLOAD 键；`step_end`
 /// 收 SLOAD 值；`call`/`create` 记 CALL 族效果；步数超上限主动 OOG
@@ -88,8 +88,8 @@ fn is_cmp(op: u8) -> bool {
     )
 }
 
-impl Inspector<Ctx> for WitnessInspector {
-    fn step(&mut self, interp: &mut Interpreter, _context: &mut Ctx) {
+impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut CtxFor<DB>) {
         self.steps += 1;
         let pc = interp.bytecode.pc() as u32;
         self.last_pc = Some(pc);
@@ -118,7 +118,7 @@ impl Inspector<Ctx> for WitnessInspector {
         }
     }
 
-    fn step_end(&mut self, interp: &mut Interpreter, _context: &mut Ctx) {
+    fn step_end(&mut self, interp: &mut Interpreter, _context: &mut CtxFor<DB>) {
         if let Some(key) = self.pending_sload.take() {
             if let Ok(value) = interp.stack.peek(0) {
                 self.storage_observed.push((key, value));
@@ -128,7 +128,7 @@ impl Inspector<Ctx> for WitnessInspector {
 
     fn call(
         &mut self,
-        context: &mut Ctx,
+        context: &mut CtxFor<DB>,
         inputs: &mut CallInputs,
     ) -> Option<revm::interpreter::CallOutcome> {
         let kind = match inputs.scheme {
@@ -154,7 +154,7 @@ impl Inspector<Ctx> for WitnessInspector {
 
     fn create(
         &mut self,
-        context: &mut Ctx,
+        context: &mut CtxFor<DB>,
         inputs: &mut CreateInputs,
     ) -> Option<revm::interpreter::CreateOutcome> {
         let scheme = inputs.scheme();
@@ -198,9 +198,34 @@ impl Inspector<Ctx> for WitnessInspector {
 /// 单 run：布置世界状态 → 执行 → 收 witness。`input` 序列化为
 /// calldata（selector 4B + head 原样拼接 + tail 原样拼接；执行器
 /// 不感知 ABI，指针槽正确性是种子/变异器的责任，见 lib.rs 职责边界）。
+///
+/// fork 态（cfg.fork = Some）：世界 = CacheDB(远端 AlloyDB 读路径 +
+/// 共享缓存) 叠层——overlay（合约/prestate/deployments/caller）照旧
+/// 写 CacheDB 本地，miss 时按 pin block 远程读（on-demand，任何深度）。
 pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResult {
-    let mut db = CacheDB::new(EmptyDB::new());
+    match &cfg.fork {
+        None => execute_on(cfg, CacheDB::new(EmptyDB::new()), input, step_cap),
+        Some(fork) => {
+            let key = std::env::var("BLOCKMACHINE_API_KEY").unwrap_or_default();
+            let remote =
+                crate::fork::ForkDb::shared(fork, &key).expect("CLI 已校验 fork 连通性（契约内）");
+            execute_on(
+                cfg,
+                CacheDB::new(revm::database_interface::WrapDatabaseRef(remote)),
+                input,
+                step_cap,
+            )
+        }
+    }
+}
 
+/// 世界布置 + 执行（DB 泛型：Genesis 空库 / fork 远端）。
+fn execute_on<DB: revm::DatabaseRef>(
+    cfg: &ExecConfig,
+    mut db: CacheDB<DB>,
+    input: &Input,
+    step_cap: u64,
+) -> RunResult {
     // 合约账户（固定布置，不走 create 交易）。
     db.insert_account_info(
         Address::from(cfg.address),
@@ -216,6 +241,18 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
         db.insert_account_storage(Address::from(cfg.address), *slot, *value)
             .expect("CacheDB 插槽不落盘，不会失败");
     }
+    // fork 后部署的攻击合约（overlay 在远端状态/prestate 之上）。
+    for deploy in &cfg.deployments {
+        db.insert_account_info(
+            Address::from(deploy.address),
+            revm::state::AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code: Some(Bytecode::new_legacy(Bytes::from(deploy.runtime.clone()))),
+                ..Default::default()
+            },
+        );
+    }
     // caller 账户：大额余额（余额敏感分支读到确定值）、nonce 0。
     let caller = Address::from(input.caller);
     db.insert_account_info(
@@ -227,13 +264,14 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
         },
     );
 
-    let ctx: Ctx = Context::mainnet()
-        .with_db(db)
-        .modify_cfg_chained(|cfg_env: &mut CfgEnv| {
-            cfg_env.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
-            cfg_env.disable_nonce_check = true;
-            cfg_env.disable_balance_check = true;
-        });
+    let ctx: CtxFor<DB> =
+        Context::mainnet()
+            .with_db(db)
+            .modify_cfg_chained(|cfg_env: &mut CfgEnv| {
+                cfg_env.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
+                cfg_env.disable_nonce_check = true;
+                cfg_env.disable_balance_check = true;
+            });
 
     let calldata = calldata_of(input);
     let tx = TxEnv::builder()
@@ -258,6 +296,7 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
                     outcome: OutcomeKind::Invalid,
                     gas_used: cfg.gas_per_tx,
                     truncated: true,
+                    deployments: cfg.deployments.clone(),
                 },
                 visited_pcs: Vec::new(),
                 cmp_observed: Vec::new(),
@@ -277,6 +316,7 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
             outcome,
             gas_used,
             truncated,
+            deployments: cfg.deployments.clone(),
         },
         visited_pcs: inspector.visited.iter().copied().collect(),
         cmp_observed: inspector.cmp_observed,
@@ -368,6 +408,8 @@ mod tests {
             time_budget: std::time::Duration::from_secs(5),
             gas_per_tx: 100_000,
             run_baseline: false,
+            fork: None,
+            deployments: Vec::new(),
         };
         let input = Input {
             selector: 0xdeadbeef,
@@ -403,6 +445,8 @@ mod tests {
             time_budget: std::time::Duration::from_secs(5),
             gas_per_tx: 1_000_000,
             run_baseline: false,
+            fork: None,
+            deployments: Vec::new(),
         };
         let input = Input {
             selector: 0,

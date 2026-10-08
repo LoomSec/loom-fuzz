@@ -136,6 +136,9 @@ loom-fuzz run --shard x.lst --code bytecode.hex [--prestate slots.json]   [--pac
   [--seed N] [--max-runs N] [--gas-per-tx N] [--dict-word 0x..]... [--out dir]
 # 重放 poc.json：重建会话重跑判决；exit 0 = verdict 与记录一致
 loom-fuzz replay poc-….json --code bytecode.hex [--prestate slots.json]
+# on-demand fork 执行（env BLOCKMACHINE_RPC_URL/_API_KEY；key 空 = keyless）
+loom-fuzz run … --fork-url <url> --fork-block latest --contract-addr 0x… \
+  --deploy 0x…:responder-sender   # 或 <hex runtime> / responder
 # L2 exploit 影响层：confirmed poc.json → Foundry 工程 + forge test
 loom-fuzz exploit poc-….json --code bytecode.hex --out exploit/ [--fork]
 ```

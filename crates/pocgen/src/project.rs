@@ -6,21 +6,36 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::synth::PocgenError;
+use loom_fuzz_oracle::PocFork;
 
 /// 在工程目录跑 `forge test`，解析结果：退出码 0 = 绿灯（返回
 /// forge 输出尾行供报告）；非 0 = 红灯，typed error 带全输出。
-pub fn forge_test(project_dir: &Path) -> Result<String, PocgenError> {
-    let output = Command::new("forge")
-        .arg("test")
-        .current_dir(project_dir)
-        .output()
-        .map_err(|e| {
-            if e.kind() == ErrorKind::NotFound {
-                PocgenError::ForgeUnavailable(e)
-            } else {
-                PocgenError::Io(e)
-            }
-        })?;
+pub fn forge_test(
+    project_dir: &Path,
+    fork: bool,
+    fork_cfg: Option<&PocFork>,
+) -> Result<String, PocgenError> {
+    let mut cmd = Command::new("forge");
+    cmd.arg("test").current_dir(project_dir);
+    if fork {
+        // fork 态：链上状态由 --fork-url 提供（pin block 确定性；
+        // BlockMachine keyless 免费档直跑，bearer 路见 run.sh 的
+        // anvil 代理）。
+        let rpc = fork_cfg
+            .map(|f| f.rpc_url.clone())
+            .unwrap_or_else(|| "https://rpc-eth.blockmachine.io".to_string());
+        cmd.args(["--fork-url", &rpc]);
+        if let Some(f) = fork_cfg {
+            cmd.args(["--fork-block-number", &f.block_number.to_string()]);
+        }
+    }
+    let output = cmd.output().map_err(|e| {
+        if e.kind() == ErrorKind::NotFound {
+            PocgenError::ForgeUnavailable(e)
+        } else {
+            PocgenError::Io(e)
+        }
+    })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
