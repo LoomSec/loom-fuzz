@@ -37,7 +37,8 @@
 //! （0x40 型）由种子 / 变异器负责正确性——seed 编译器产 `Tail::Empty`
 //! 时 calldata 就是裸头；若种子 / 变异器给出 `Tail::Bytes`（如手工
 //! 构造的 ABI 编码尾），执行器照拼不误，但指针槽与尾内容的对应关系
-//! 是输入构造方的责任。M0 种子尾部恒空，指针槽语义留待 #6 精化算子。
+//! 是输入构造方的责任。M0 种子尾部恒空；动态尾由变异器的"动态尾
+//! 生成"（legacy 系列）与变长尾算子带进搜索空间（#6）。
 //!
 //! # CFG 距离表
 //!
@@ -50,16 +51,50 @@
 //! `u32::MAX`）；fitness(run) = visited pcs 的块距离最小值；visited
 //! 含任一 target pc 即命中。
 //!
+//! # 变异算子（issue #6，`mutators` 模块）
+//!
+//! 单轮变异 = 一次随机投掷定算子 + 单点应用，全部经 xorshift64*
+//! （确定性）。权重：60% 定长算子（head 槽）/ 20% 变长尾算子
+//! （tail 的 Bytes 内容）/ 20% legacy 兜底（#5 基础系列）。定长五
+//! 算子：
+//!
+//! 1. **比较操作数回灌**（cmp，25/100）：inspector step 钩子收
+//!    LT/GT/SLT/SGT/EQ 两侧操作数进比较池（BTreeSet 去重排序、
+//!    上限 256）；变异时池值整词覆写随机槽——穿 dispatcher /
+//!    require 的定向穿透。两侧都收（结果条件收需回读已弹出的
+//!    操作数，机制复杂无收益）。
+//! 2. **常量池整参覆盖**（const，25/100）：32B 槽整体覆写。常量池
+//!    = 码内 PUSH 立即数 ∪ seed 静态字典，会话构建一次。
+//! 3. **±1 边界变异**（boundary，20/100）：U256 wrapping 加减一，
+//!    与算子 2 配对跨 gt/lt 边界。
+//! 4. **存储值入池**（storage，20/100）：inspector 记 SLOAD 键值对
+//!    （step 记键 / step_end 收值，上限 128）；变异时 90% 值 / 10%
+//!    键覆写参数槽——穿"参数须等于某槽内容"类检查。
+//! 5. **数值高斯缩放**（gaussian，10/100）：±{10,25,50,100,200,
+//!    500,1000}% 固定比例集随机一档 + 符号，wrapping 截断。
+//!
+//! 变长尾算子：truncate（32B 边界截断，可截空）/ extend（追加 1-2
+//! 词）/ block-replace（32B 块整体替换）。head 槽只落定长算子与
+//! legacy-head 系列，tail 内容只落变长算子与 legacy 尾系列（分集
+//! 由结构保证，测试断言）。
+//!
+//! 与 Echidna / MEDUSA 类成熟实现的机制差异：算子思想同源（比较
+//! 回灌≈Echidna 的 dynamic dictionary、存储回灌≈MEDUSA 的 storage
+//! 感测），但全部自行实现，且 loom 的特色是**静态事实先于运行时
+//! 收集**——常量池以 loom 静态分析产物（seed 字典：guard 常量 ∪
+//! 证据常量 ∪ PUSH 立即数）为底，运行时观测池（cmp / storage）为
+//! 增量补充；池全部有上限、去重、排序，迭代序即确定序。
+//!
 //! # 制导与基线
 //!
 //! 进化环：初始种群 = seeds（空则退化为 selector + 零参），每代
-//! 按 fitness 排序保留前一半，随机变异（随机槽随机字节扰动 + 字典
-//! 整词覆盖，精化算子是 #6）产生子代；距离创新低入 corpus 并记录。
-//! 预算双上限（runs / 时间），耗尽未达 → `reached = false`，不硬判
-//! （unreachable / inconclusive 三值判决在 #7）。基线：同一
-//! [`ExecConfig`] 纯随机（selector 固定为目标的随机槽位输入，无种子
-//! 无制导，同预算）跑一遍，`baseline_runs_to_reach` 记入报告作制导
-//! 收益数据；`ExecConfig.run_baseline` 可关。
+//! 按 fitness 排序保留前一半，变异产生子代（见上）；距离创新低入
+//! corpus 并记录。预算双上限（runs / 时间），耗尽未达 →
+//! `reached = false`，不硬判（unreachable / inconclusive 三值判决
+//! 在 #7）。基线：同一 [`ExecConfig`] 纯随机（selector 固定为目标
+//! 的随机槽位输入，无种子无制导无字典，同预算）跑一遍，
+//! `baseline_runs_to_reach` 记入报告作制导收益数据；
+//! `ExecConfig.run_baseline` 可关。
 //!
 //! # 确定性
 //!
@@ -72,6 +107,7 @@ mod cfg;
 mod evm;
 mod exec;
 mod mutate;
+mod mutators;
 mod rng;
 
 pub use cfg::DistanceTable;
