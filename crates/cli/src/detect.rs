@@ -32,14 +32,16 @@ use crate::hitset::GuardFact;
 use crate::render::{render_node, View};
 
 /// 一条原始命中：函数下标 + 效果步序 + 证据 operand 的表达式 id
-/// （渲染在装载装配期做，两种模式共用同一装配路径）+ 检测臂。
+/// （渲染在装载装配期做，两种模式共用同一装配路径）+ 检测族（谓词
+/// 维度；同一 call 效果可在多个族各命中一条——loom 行集并列语义）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawHit {
     pub fn_idx: usize,
     pub step: u32,
     pub evidence: u32,
-    /// 检测臂（臂 1 目标可控 / 臂 3 裸转发）——oracle 按臂定罪。
-    pub arm: loom_fuzz_oracle::CallArm,
+    pub family: loom_fuzz_oracle::HitFamily,
+    /// arbitrary_call 族的检测臂；其它族无臂概念（None）。
+    pub arm: Option<loom_fuzz_oracle::CallArm>,
 }
 
 const SENDER_OPS: [&str; 2] = ["msg.sender", "tx.origin"];
@@ -310,15 +312,19 @@ pub fn dominating_guards(
         .collect()
 }
 
-/// 模式 A 回填：由 `(fn_idx, step)` 在展开流里定位 call 效果，给出
-/// 证据表达式 id 与检测臂——形状判定与 `detect_arbitrary_call` 同源
-///（loom query 已定罪，此处不重复 caller_checked/whitelisted 检查）。
-/// 定位不到 = 两模式步序语义分歧，fail-closed 报 `None`。
+/// 模式 A 回填：由 `(fn_idx, step)` 在展开流里定位 call 效果，按族
+/// 给出证据表达式 id（+ arbitrary_call 的检测臂）——形状判定与
+/// `detect_*` 同源（loom query 已定罪，此处不重复
+/// caller_checked/whitelisted 检查）。deputy_call 的证据 = target
+/// operand（同臂 1）；drain_forward 的证据 = input operand（L1 报告
+/// 对象；oracle 判定走宽松 memmem，不求值）。定位不到 = 两模式步序
+/// 语义分歧，fail-closed 报 `None`。
 pub fn classify_hit(
     view: &Xlayer<'_>,
     fn_idx: usize,
     step: u32,
-) -> Option<(u32, loom_fuzz_oracle::CallArm)> {
+    family: loom_fuzz_oracle::HitFamily,
+) -> Option<(u32, Option<loom_fuzz_oracle::CallArm>)> {
     let entries = view.expand(fn_idx)?;
     let entry = entries.iter().find(|e| match e {
         XEntry::Effect { kind, step: i, .. } => kind == "call" && *i == step,
@@ -328,18 +334,24 @@ pub fn classify_hit(
         return None;
     };
     let operand = |name: &str| operands.iter().find(|(n, _)| n == name).map(|(_, id)| *id);
-    let target = operand("target")?;
-    // 臂 3 优先：非静态 call 且 input 子树含原始 calldata 切片。
-    if let (Some(call_kind), Some(input)) = (operand("call_kind"), operand("input")) {
-        if op_of(view, call_kind).as_deref() != Some("staticcall")
-            && subtree(view, input)
-                .iter()
-                .any(|&n| is_op(view, n, &RAW_FORWARD_OPS))
-        {
-            return Some((target, loom_fuzz_oracle::CallArm::Arm3));
+    match family {
+        loom_fuzz_oracle::HitFamily::ArbitraryCall => {
+            let target = operand("target")?;
+            // 臂 3 优先：非静态 call 且 input 子树含原始 calldata 切片。
+            if let (Some(call_kind), Some(input)) = (operand("call_kind"), operand("input")) {
+                if op_of(view, call_kind).as_deref() != Some("staticcall")
+                    && subtree(view, input)
+                        .iter()
+                        .any(|&n| is_op(view, n, &RAW_FORWARD_OPS))
+                {
+                    return Some((target, Some(loom_fuzz_oracle::CallArm::Arm3)));
+                }
+            }
+            Some((target, Some(loom_fuzz_oracle::CallArm::Arm1)))
         }
+        loom_fuzz_oracle::HitFamily::ApprovalDrainDeputy => Some((operand("target")?, None)),
+        loom_fuzz_oracle::HitFamily::ApprovalDrainForward => Some((operand("input")?, None)),
     }
-    Some((target, loom_fuzz_oracle::CallArm::Arm1))
 }
 
 /// 内置 arbitrary_call 检测：扫描全部函数的 xlayer 展开流，产出
@@ -406,7 +418,111 @@ pub fn detect_arbitrary_call(shard: &Shard, view: &Xlayer<'_>) -> Vec<RawHit> {
                     fn_idx,
                     step: *i,
                     evidence: target,
-                    arm,
+                    family: loom_fuzz_oracle::HitFamily::ArbitraryCall,
+                    arm: Some(arm),
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// 单 call 效果的 approval_drain 判定（Shard 无关的纯形状部分——
+/// caller 守卫判定由调用方经 `caller_checked_at` 注入；单测直接钉
+/// 语义）。返回各族的证据 operand id 列表（deputy → target；
+/// drain → input），同一效果可多族命中。
+fn approval_drain_shape(
+    view: &impl View,
+    guard_conds: &[u32],
+    checked: bool,
+    target: Option<u32>,
+    input: Option<u32>,
+) -> Vec<(u32, loom_fuzz_oracle::HitFamily)> {
+    let mut out = Vec::new();
+    // deputy_call：有 caller 守卫 ∧ 目标可控（inputmark 未被
+    // 白名单）。loom 语义 ∃x：not whitelisted 不抑制其它子式。
+    if checked {
+        if let Some(target) = target {
+            let controlled = subtree(view, target)
+                .iter()
+                .filter(|&&n| is_inputmark(view, n))
+                .any(|&n| !whitelisted(view, guard_conds, n));
+            if controlled {
+                out.push((target, loom_fuzz_oracle::HitFamily::ApprovalDrainDeputy));
+            }
+        }
+    }
+    // drain_forward：input 含输入派生词且整体不提及
+    // msg.sender / tx.origin（自助形状排除臂）。
+    if let Some(input) = input {
+        let input_nodes = subtree(view, input);
+        let has_inputmark = input_nodes.iter().any(|&n| is_inputmark(view, n));
+        let mentions_sender = input_nodes.iter().any(|&n| is_op(view, n, &SENDER_OPS));
+        if has_inputmark && !mentions_sender {
+            out.push((input, loom_fuzz_oracle::HitFamily::ApprovalDrainForward));
+        }
+    }
+    out
+}
+
+/// 内置 approval_drain 检测（issue #20，语义照
+/// `packs/detect/approval_drain.lq` + `packs/generic/guards/caller.lq`
+/// 逐条对齐）：
+///
+/// - **deputy_call** = `calls_x(f,i,t)` ∧ `subterm(t,x)` ∧ `inputmark(x)`
+///   ∧ `not whitelisted(f,x)` ∧ **`caller_checked_at(f,i)`**——有 caller
+///   守卫但目标仍可控 = confused deputy（与 arbitrary_call 臂 1 互补：
+///   臂 1 要求无 caller 守卫）。
+/// - **drain_forward** = `calls_x(f,i,_)` ∧ `xeffect_arg(f,i,"input",b)`
+///   ∧ `subterm(b,x)` ∧ `inputmark(x)` ∧ **`not input_mentions_sender(b)`**
+///   ——input 含输入派生词且整体不与 caller 绑定（自助形状排除臂）。
+///   `input_mentions_sender` = `match(b, ... "msg.sender"|"tx.origin")`
+///   深子式存在。
+///
+/// 两族间、与 arbitrary_call 间行集并列（同一 call 效果可多族命中，
+/// 每族每 (fn,step) 至多一条——loom 各谓词独立查询的去重语义）。
+pub fn detect_approval_drain(shard: &Shard, view: &Xlayer<'_>) -> Vec<RawHit> {
+    let mut hits = Vec::new();
+    for fn_idx in 0..shard.functions().len() {
+        let Some(entries) = view.expand(fn_idx) else {
+            continue;
+        };
+        let guard_conds: Vec<u32> = entries
+            .iter()
+            .filter_map(|e| match e {
+                XEntry::Guard { cond, .. } => Some(*cond),
+                _ => None,
+            })
+            .collect();
+        for entry in entries {
+            let XEntry::Effect {
+                kind,
+                operands,
+                step: i,
+                scope: si,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            if kind != "call" {
+                continue;
+            }
+            let operand = |name: &str| operands.iter().find(|(n, _)| n == name).map(|(_, id)| *id);
+            let checked = caller_checked_at(shard, view, entries, *i, *si);
+            for (evidence, family) in approval_drain_shape(
+                view,
+                &guard_conds,
+                checked,
+                operand("target"),
+                operand("input"),
+            ) {
+                hits.push(RawHit {
+                    fn_idx,
+                    step: *i,
+                    evidence,
+                    family,
+                    arm: None,
                 });
             }
         }
@@ -487,5 +603,70 @@ mod tests {
         assert!(is_inputmark(&view, 0));
         assert!(!is_op(&view, 0, &RAW_FORWARD_OPS));
         assert!(is_op(&view, 1, &RAW_FORWARD_OPS));
+    }
+
+    // approval_drain_shape 语义边界（issue #20）：
+    // 视图：0 msg.sender；1 this；2 ==(msg.sender, this)（caller_test
+    // 守卫 cond）；3 calldata_word(0x24)；4 cast160(3)（可控 target）；
+    // 5 ==(4, 0)（白名单守卫：可控词比对可信身份）；6 Const；
+    // 7 concat(3, 6)（input：含输入派生词）；8 concat(3, 0)（input：
+    // 含输入派生词但提及 sender）。
+    fn shape_view() -> MapView {
+        MapView(vec![
+            RNode::Named("msg.sender".into(), vec![]), // 0
+            RNode::Named("this".into(), vec![]),       // 1
+            RNode::Named("==".into(), vec![0, 1]),     // 2（caller 守卫）
+            RNode::CalldataWord(0x24),                 // 3
+            RNode::Named("cast160".into(), vec![3]),   // 4
+            RNode::Named("==".into(), vec![4, 0]),     // 5（白名单守卫）
+            RNode::Const(word(0x40)),                  // 6
+            RNode::Named("concat".into(), vec![3, 6]), // 7
+            RNode::Named("concat".into(), vec![3, 0]), // 8
+        ])
+    }
+
+    #[test]
+    fn deputy_hits_with_caller_guard_and_controlled_target() {
+        let view = shape_view();
+        // caller 守卫在场（checked=true）+ target 可控未白名单 → deputy。
+        let hits = approval_drain_shape(&view, &[2], true, Some(4), None);
+        assert_eq!(
+            hits,
+            vec![(4, loom_fuzz_oracle::HitFamily::ApprovalDrainDeputy)]
+        );
+    }
+
+    #[test]
+    fn deputy_absent_without_caller_guard_or_when_whitelisted() {
+        let view = shape_view();
+        // 无 caller 守卫（checked=false）：不是 deputy（那是
+        // arbitrary_call 臂 1 的地盘——两臂互补）。
+        assert!(approval_drain_shape(&view, &[2], false, Some(4), None).is_empty());
+        // target 被白名单守卫覆盖（==(cast160(word), msg.sender)）→ 排除。
+        assert!(approval_drain_shape(&view, &[2, 5], true, Some(4), None).is_empty());
+        // target 无 inputmark（纯常量目标）→ 不可控，不命中。
+        let const_view = MapView(vec![RNode::Const(word(0))]);
+        assert!(approval_drain_shape(&const_view, &[], true, Some(0), None).is_empty());
+    }
+
+    #[test]
+    fn drain_hits_only_when_inputmark_and_no_sender_binding() {
+        let view = shape_view();
+        // input 含输入派生词且不提及 sender → drain_forward。
+        let hits = approval_drain_shape(&view, &[], false, None, Some(7));
+        assert_eq!(
+            hits,
+            vec![(7, loom_fuzz_oracle::HitFamily::ApprovalDrainForward)]
+        );
+    }
+
+    #[test]
+    fn drain_excludes_sender_bound_and_pure_const_input() {
+        let view = shape_view();
+        // input 子树提及 msg.sender（自助形状，与 caller 绑定）→ 排除臂。
+        assert!(approval_drain_shape(&view, &[], false, None, Some(8)).is_empty());
+        // input 无输入派生词（纯常量）→ 不含可控内容，不命中。
+        let const_view = MapView(vec![RNode::Const(word(0))]);
+        assert!(approval_drain_shape(&const_view, &[], false, None, Some(0)).is_empty());
     }
 }

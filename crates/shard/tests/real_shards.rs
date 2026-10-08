@@ -9,8 +9,7 @@ use loom_fuzz_shard::{Entry, ExprNode, Shard};
 use std::path::Path;
 
 const TRV_ROUTER: &str = "/tmp/trv_router.lst";
-const AAVE_POOL: &str =
-    "/tmp/3e5e08d8844ae2cd651ebb2a7fb9b17957e955a905701a2e5df0debbfff407a5.lst";
+const AAVE_POOL: &str = "/tmp/3e5e08d8844ae2cd651ebb2a7fb9b17957e955a905701a2e5df0debbfff407a5.lst";
 
 /// fixture 是 loom-evm 写出的真实分片（真实合约分析产物，不进仓库）。
 /// 缺失时优雅跳过——外部贡献者没有这两个 /tmp 文件，不应看到红测试。
@@ -59,7 +58,8 @@ fn trv_forward_request_reaches_effects() {
         })
         .collect();
     assert!(
-        own.iter().any(|(kind, pc, _)| kind == "input_read" && *pc > 0),
+        own.iter()
+            .any(|(kind, pc, _)| kind == "input_read" && *pc > 0),
         "forwardRequest 自身的 effect（input_read）必须有非空 pc: {own:?}"
     );
 
@@ -87,11 +87,7 @@ fn trv_guards_present() {
     let Some(shard) = open_fixture(TRV_ROUTER) else {
         return;
     };
-    let guard_count: usize = shard
-        .functions()
-        .iter()
-        .map(|f| f.guards().count())
-        .sum();
+    let guard_count: usize = shard.functions().iter().map(|f| f.guards().count()).sum();
     assert!(guard_count > 0, "shard 必须有 guard 条目");
 }
 

@@ -10,6 +10,7 @@ repository.workspace = true
 alloy-primitives = { version = "1.6.1", features = ["serde"] }
 loom-fuzz-oracle = { version = "0.1.0", path = "../oracle" }
 serde_json = "1"
+sha3 = "0.11"
 
 [dev-dependencies]
 loom-fuzz-cli = { version = "0.1.0", path = "../cli" }

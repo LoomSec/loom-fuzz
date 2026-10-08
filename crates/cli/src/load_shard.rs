@@ -1,13 +1,14 @@
 //! 模式 B（纯文件）装载器：只有 `bytecode.hex` + `.lst` 两份文件，
-//! shard 读取 + xlayer 展开 + 内置 arbitrary_call 检测，产出 `HitSet`。
-//! 与模式 A 共用装配路径（`assemble`），保证两模式逐字段相等。
+//! shard 读取 + xlayer 展开 + 内置检测（arbitrary_call +
+//! approval_drain，issue #20 多族），产出 `HitSet`。与模式 A 共用
+//! 装配路径（`assemble`），保证两模式逐字段相等。
 
 use std::path::Path;
 
 use loom_fuzz_shard::Shard;
 use loom_fuzz_xlayer::Xlayer;
 
-use crate::detect::{detect_arbitrary_call, dominating_guards};
+use crate::detect::{detect_approval_drain, detect_arbitrary_call, dominating_guards};
 use crate::hitset::{Hit, HitSet, LoadError, SELECTOR_SENTINEL};
 use crate::render::render_node;
 
@@ -49,12 +50,17 @@ pub(crate) fn open_shard(path: &Path) -> Result<Shard, LoadError> {
     Shard::from_bytes(&bytes).map_err(LoadError::from)
 }
 
-/// 模式 B：`.lst` + `bytecode.hex` → `HitSet`。检测推导完全自包含。
+/// 模式 B：`.lst` + `bytecode.hex` → `HitSet`。检测推导完全自包含
+/// （arbitrary_call + approval_drain 两 pack 的逐条对齐翻译；各族
+/// 行集并列，同一 call 效果可多族命中——loom 语义）。
 pub fn load_from_shard(shard_path: &Path, code_hex: &Path) -> Result<HitSet, LoadError> {
     let code = read_code_hex(code_hex)?;
     let shard = open_shard(shard_path)?;
     let view = Xlayer::new(&shard);
-    let raw = detect_arbitrary_call(&shard, &view);
+    let raw: Vec<_> = detect_arbitrary_call(&shard, &view)
+        .into_iter()
+        .chain(detect_approval_drain(&shard, &view))
+        .collect();
     let rows = raw
         .iter()
         .map(|h| {
@@ -65,9 +71,10 @@ pub fn load_from_shard(shard_path: &Path, code_hex: &Path) -> Result<HitSet, Loa
                 fn_idx: h.fn_idx,
                 selector,
                 step: h.step,
+                family: h.family,
                 evidence: render_node(&view, h.evidence),
                 evidence_expr: Some(h.evidence),
-                arm: Some(h.arm),
+                arm: h.arm,
             }
         })
         .collect();
@@ -81,6 +88,7 @@ pub(crate) struct Row {
     pub fn_idx: usize,
     pub selector: u32,
     pub step: u32,
+    pub family: loom_fuzz_oracle::HitFamily,
     pub evidence: String,
     pub evidence_expr: Option<u32>,
     pub arm: Option<loom_fuzz_oracle::CallArm>,
@@ -115,6 +123,7 @@ pub(crate) fn assemble(
         let dominating = dominating_guards(shard, view, entries, row.step, *scope);
         hits.push(Hit {
             selector: row.selector,
+            family: row.family,
             step: row.step,
             target_pcs: vec![*pc],
             evidence: row.evidence,

@@ -13,4 +13,5 @@ loom-fuzz-xlayer = { version = "0.1.0", path = "../xlayer" }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+loom-fuzz-oracle = { version = "0.1.0", path = "../oracle" }
 loom-fuzz-cli = { version = "0.1.0", path = "../cli" }

@@ -52,9 +52,10 @@ enum Cmd {
         /// 运行时字节码 hex 文件
         #[arg(long)]
         code: PathBuf,
-        /// 检测 pack（给 --loom-bin 走模式 A；只给一个是 fail-closed 报错）
-        #[arg(long)]
-        pack: Option<PathBuf>,
+        /// 检测 pack（给 --loom-bin 走模式 A；可多次——
+        /// arbitrary_call.lq / approval_drain.lq 并集查询，#20）。
+        #[arg(long = "pack")]
+        pack: Vec<PathBuf>,
         /// loom 二进制路径（模式 A）
         #[arg(long)]
         loom_bin: Option<PathBuf>,
@@ -173,7 +174,7 @@ fn run() -> Result<ExitCode, String> {
         } => cmd_run(
             &shard,
             &code,
-            pack.as_deref(),
+            &pack,
             loom_bin.as_deref(),
             prestate.as_deref(),
             seed,
@@ -221,7 +222,7 @@ fn read_prestate(path: Option<&Path>) -> Result<BTreeMap<U256, U256>, String> {
 fn cmd_run(
     shard_path: &Path,
     code_path: &Path,
-    pack: Option<&Path>,
+    packs: &[PathBuf],
     loom_bin: Option<&Path>,
     prestate_path: Option<&Path>,
     seed: u64,
@@ -238,17 +239,17 @@ fn cmd_run(
     proposer: &str,
 ) -> Result<ExitCode, String> {
     // 装载（模式 A 需 pack+loom-bin 成对；只给一个 = fail-closed）。
-    let hitset = match (pack, loom_bin) {
-        (Some(p), Some(bin)) => {
-            let packs = [p];
-            load_from_cli(bin, &packs, shard_path, code_path)
+    let hitset = match (packs.is_empty(), loom_bin) {
+        (false, Some(bin)) => {
+            let pack_refs: Vec<&Path> = packs.iter().map(PathBuf::as_path).collect();
+            load_from_cli(bin, &pack_refs, shard_path, code_path)
                 .map_err(|e| format!("模式 A 装载失败: {e}"))?
         }
-        (None, None) => {
+        (true, None) => {
             load_from_shard(shard_path, code_path).map_err(|e| format!("模式 B 装载失败: {e}"))?
         }
-        (Some(_), None) => return Err("给了 --pack 缺 --loom-bin（模式 A 需要成对）".to_string()),
-        (None, Some(_)) => return Err("给了 --loom-bin 缺 --pack（模式 A 需要成对）".to_string()),
+        (false, None) => return Err("给了 --pack 缺 --loom-bin（模式 A 需要成对）".to_string()),
+        (true, Some(_)) => return Err("给了 --loom-bin 缺 --pack（模式 A 需要成对）".to_string()),
     };
     let prestate = read_prestate(prestate_path)?;
     // on-demand fork：pin block（latest → eth_blockNumber 具体块号）+

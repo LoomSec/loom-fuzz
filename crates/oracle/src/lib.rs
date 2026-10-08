@@ -40,11 +40,13 @@ mod poc;
 mod report;
 pub mod verdict;
 
-pub use family::{check_arbitrary_call, CallCheck, CheckInput};
-pub use hit::{CallArm, GuardFact, Hit, SELECTOR_SENTINEL};
+pub use family::{
+    check_arbitrary_call, check_deputy_call, check_drain_forward, CallCheck, CheckInput,
+};
+pub use hit::{CallArm, GuardFact, Hit, HitFamily, SELECTOR_SENTINEL};
 pub use poc::{
     build_poc, bytes_hex, calldata_of, hex_bytes, hex_u256, input_from_calldata, replay, Poc,
-    PocDeployment, PocFork, PocTx, POC_FORMAT,
+    PocCall, PocDeployment, PocFork, PocTx, POC_FORMAT,
 };
 pub use report::{coverage, Budgets, Coverage, FuzzReport, Guidance, HitEntry, REPORT_FORMAT};
 pub use verdict::Family;

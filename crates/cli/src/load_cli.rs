@@ -1,11 +1,13 @@
 //! 模式 A（CLI 在位）装载器：子进程调用 loom-evm 发布的 `loom` 二进制，
-//! `loom query <pack>... <shard> --json` 取 `vuln_arbitrary` 谓词的
-//! rows；step → pc 与支配 guard 仍走本仓库 xlayer 展开（与模式 B 同源，
-//! 见 docs/architecture.md 的模式 A 契约）。
+//! `loom query <pack>... <shard> --json` 取检测谓词（#20 多族：
+//! arbitrary_call 的 `vuln_arbitrary` + approval_drain 的
+//! `deputy_call`/`drain_forward`）的 rows；step → pc 与支配 guard
+//! 仍走本仓库 xlayer 展开（与模式 B 同源，见 docs/architecture.md
+//! 的模式 A 契约）。
 //!
 //! fail-closed：二进制缺失 / 非零退出 / JSON 缺字段 / 结果截断 /
 //! 未满足 oracle demand / Func 列渲染无法识别，一律 typed 报错，
-//! 不静默降级。
+//! 不静默降级。三个谓词段全缺 = 契约外输入，报错。
 
 use std::path::Path;
 use std::process::Command;
@@ -21,8 +23,10 @@ const STDERR_LIMIT: usize = 4096;
 /// 模式 A：`loom query <pack>... <shard> --json` + `bytecode.hex` →
 /// `HitSet`。
 ///
-/// `packs` 至少应含一个产出 `vuln_arbitrary` 谓词的检测 pack
-/// （loom-evm 的 `packs/detect/arbitrary_call.lq` 即契约参考）。
+/// `packs` 至少一个；产出段按已知谓词表解析（`vuln_arbitrary` /
+/// `deputy_call` / `drain_forward`——loom-evm 的
+/// `packs/detect/arbitrary_call.lq` 与 `packs/detect/approval_drain.lq`
+/// 即契约参考）。三个谓词段全缺 = 契约外输入，fail-closed。
 pub fn load_from_cli(
     loom_bin: &Path,
     packs: &[&Path],
@@ -78,90 +82,131 @@ pub fn load_from_cli(
         .ok_or_else(|| LoadError::LoomJson {
             reason: "顶层缺 queries 数组".to_string(),
         })?;
-    let vuln = queries
-        .iter()
-        .find(|q| q.get("predicate").and_then(serde_json::Value::as_str) == Some("vuln_arbitrary"))
-        .ok_or_else(|| LoadError::LoomJson {
-            reason: "queries 中无 vuln_arbitrary 谓词结果段".to_string(),
-        })?;
-    let rows = vuln
-        .get("rows")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| LoadError::LoomJson {
-            reason: "vuln_arbitrary 缺 rows 数组".to_string(),
-        })?;
-    let total_rows = vuln
-        .get("total_rows")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| LoadError::LoomJson {
-            reason: "vuln_arbitrary 缺 total_rows（uint）".to_string(),
-        })?;
-    if rows.len() as u64 != total_rows {
-        return Err(LoadError::LoomTruncated {
-            predicate: "vuln_arbitrary".to_string(),
-            total_rows: total_rows as usize,
-            served_rows: rows.len(),
-        });
+
+    /// 已知检测谓词：谓词名 → （族，列数）。deputy_call/drain_forward
+    /// 来自 approval_drain pack（loom 的 gen_deputy_call 是中间谓词，
+    /// 不装载——deputy_call 与其行集相同）。
+    const PREDICATES: &[(&str, loom_fuzz_oracle::HitFamily, usize)] = &[
+        (
+            "vuln_arbitrary",
+            loom_fuzz_oracle::HitFamily::ArbitraryCall,
+            3,
+        ),
+        (
+            "deputy_call",
+            loom_fuzz_oracle::HitFamily::ApprovalDrainDeputy,
+            3,
+        ),
+        (
+            "drain_forward",
+            loom_fuzz_oracle::HitFamily::ApprovalDrainForward,
+            2,
+        ),
+    ];
+
+    let mut parsed: Vec<(FuncRef, u32, String, loom_fuzz_oracle::HitFamily)> = Vec::new();
+    let mut any_section = false;
+    for (predicate, family, arity) in PREDICATES {
+        let Some(section) = queries
+            .iter()
+            .find(|q| q.get("predicate").and_then(serde_json::Value::as_str) == Some(predicate))
+        else {
+            continue; // 该 pack 未参与查询：段缺失合法（族无行）
+        };
+        any_section = true;
+        let rows = section
+            .get("rows")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| LoadError::LoomJson {
+                reason: format!("{predicate} 缺 rows 数组"),
+            })?;
+        let total_rows = section
+            .get("total_rows")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| LoadError::LoomJson {
+                reason: format!("{predicate} 缺 total_rows（uint）"),
+            })?;
+        if rows.len() as u64 != total_rows {
+            return Err(LoadError::LoomTruncated {
+                predicate: predicate.to_string(),
+                total_rows: total_rows as usize,
+                served_rows: rows.len(),
+            });
+        }
+        for row in rows {
+            let cells = row.as_array().ok_or_else(|| LoadError::RowMalformed {
+                predicate: predicate.to_string(),
+                reason: "行不是数组".to_string(),
+            })?;
+            if cells.len() != *arity {
+                return Err(LoadError::RowMalformed {
+                    predicate: predicate.to_string(),
+                    reason: format!("行列数 {} ≠ {arity}", cells.len()),
+                });
+            }
+            let cell = |i: usize| -> Result<String, LoadError> {
+                cells[i]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| LoadError::RowMalformed {
+                        predicate: predicate.to_string(),
+                        reason: format!("第 {i} 列不是字符串"),
+                    })
+            };
+            let func = cell(0)?;
+            let step = cell(1)?;
+            // 证据列：deputy/vuln 有（渲染文本，仅报告对象）；drain 无
+            //（loom 谓词本身不投影 t）——drain 行的证据渲染在装配期
+            // 从 input operand 回填（classify_hit），此处留空串。
+            let evidence = if *arity == 3 { cell(2)? } else { String::new() };
+            let step: u32 = step
+                .parse()
+                .map_err(|_| LoadError::StepMalformed { cell: step.clone() })?;
+            parsed.push((parse_func(&func)?, step, evidence, *family));
+        }
     }
     // 顶层 truncated 旗标是同一事实的另一路声明，双保险。
     if json.get("truncated").and_then(serde_json::Value::as_bool) == Some(true) {
         return Err(LoadError::LoomTruncated {
-            predicate: "vuln_arbitrary".to_string(),
-            total_rows: total_rows as usize,
-            served_rows: rows.len(),
+            predicate: "（顶层 truncated 旗标）".to_string(),
+            total_rows: 0,
+            served_rows: 0,
         });
     }
-
-    let mut parsed = Vec::with_capacity(rows.len());
-    for row in rows {
-        let cells = row.as_array().ok_or_else(|| LoadError::RowMalformed {
-            predicate: "vuln_arbitrary".to_string(),
-            reason: "行不是数组".to_string(),
-        })?;
-        if cells.len() != 3 {
-            return Err(LoadError::RowMalformed {
-                predicate: "vuln_arbitrary".to_string(),
-                reason: format!("行列数 {} ≠ 3（期望 [func, step, t]）", cells.len()),
-            });
-        }
-        let cell = |i: usize| -> Result<String, LoadError> {
-            cells[i]
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| LoadError::RowMalformed {
-                    predicate: "vuln_arbitrary".to_string(),
-                    reason: format!("第 {i} 列不是字符串"),
-                })
-        };
-        let func = cell(0)?;
-        let step = cell(1)?;
-        let evidence = cell(2)?;
-        let step: u32 = step
-            .parse()
-            .map_err(|_| LoadError::StepMalformed { cell: step.clone() })?;
-        parsed.push((parse_func(&func)?, step, evidence));
+    if !any_section {
+        return Err(LoadError::LoomJson {
+            reason: "queries 中无已知检测谓词段（vuln_arbitrary/deputy_call/drain_forward）"
+                .to_string(),
+        });
     }
 
     let shard_model = crate::load_shard::open_shard(shard)?;
     let view = Xlayer::new(&shard_model);
     let rows = parsed
         .into_iter()
-        .map(|(f, step, evidence)| {
+        .map(|(f, step, evidence, family)| {
             let (fn_idx, selector) = resolve_func(&shard_model, f)?;
             // evidence_expr/arm 与模式 B 同源回填：loom query 只给渲染
             // 文本，结构化表达式 id 从本仓库展开流按步序定位，保证两
             // 模式 HitSet 逐字段相等（定位不到 = 步序语义分歧，报错）。
-            let (evidence_expr, arm) = crate::detect::classify_hit(&view, fn_idx, step)
+            // drain_forward 的证据文本也由此回填（input operand 渲染）。
+            let (evidence_expr, arm) = crate::detect::classify_hit(&view, fn_idx, step, family)
                 .ok_or_else(|| LoadError::StepMalformed {
                     cell: format!("fn {fn_idx} step {step} 无法在展开流定位 call 效果"),
                 })?;
+            let evidence = if evidence.is_empty() {
+                crate::render::render_node(&view, evidence_expr)
+            } else {
+                evidence
+            };
             Ok(Row {
                 fn_idx,
                 selector,
                 step,
+                family,
                 evidence,
                 evidence_expr: Some(evidence_expr),
-                arm: Some(arm),
+                arm,
             })
         })
         .collect::<Result<Vec<_>, LoadError>>()?;

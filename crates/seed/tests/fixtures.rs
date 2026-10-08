@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use alloy_primitives::U256;
 use loom_fuzz_cli::{load_from_shard, Hit, HitSet};
+use loom_fuzz_oracle::HitFamily;
 use loom_fuzz_seed::{compile, locate, HitView, Input, SeedOutput, Tail, Target};
 use loom_fuzz_shard::Shard;
 use loom_fuzz_xlayer::Xlayer;
@@ -61,7 +62,13 @@ fn head_word(input: &Input, slot: usize) -> Option<U256> {
 fn trv_like_compiles_to_selector_seeds() {
     let (shard, hitset) = load("trv-like", "trv-like.lst", "TrvLikeRouter.bin-runtime");
     let view = Xlayer::new(&shard);
-    assert_eq!(hitset.hits.len(), 1, "trv-like 应有 1 条裸转发命中");
+    // #20 多族：arbitrary 族仍恰好 1 条（approval_drain 族行并列存在）。
+    let arbitrary = hitset
+        .hits
+        .iter()
+        .filter(|h| h.family == HitFamily::ArbitraryCall)
+        .count();
+    assert_eq!(arbitrary, 1, "trv-like 应有 1 条裸转发命中");
     let out = compile_hit(&shard, &view, &hitset, &hitset.hits[0]);
 
     assert!(!out.inputs.is_empty(), "种子集非空");
@@ -89,7 +96,12 @@ fn guard_boundary_golden() {
         "GuardBoundaryRouter.bin-runtime",
     );
     let view = Xlayer::new(&shard);
-    assert_eq!(hitset.hits.len(), 1, "guard-boundary 应有 1 条裸转发命中");
+    let arbitrary = hitset
+        .hits
+        .iter()
+        .filter(|h| h.family == HitFamily::ArbitraryCall)
+        .count();
+    assert_eq!(arbitrary, 1, "guard-boundary 应有 1 条裸转发命中");
     let hit = &hitset.hits[0];
     let out = compile_hit(&shard, &view, &hitset, hit);
     assert_eq!(

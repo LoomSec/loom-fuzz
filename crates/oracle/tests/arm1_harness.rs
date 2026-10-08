@@ -91,6 +91,7 @@ fn session() -> loom_fuzz_fuzz::SessionReport {
 
 fn hit() -> Hit {
     Hit {
+        family: Default::default(),
         selector: 0xdeadbeef,
         step: 1,
         target_pcs: vec![16],

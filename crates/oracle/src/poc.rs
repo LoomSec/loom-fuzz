@@ -20,7 +20,7 @@ use sha3::{Digest, Keccak256};
 use loom_fuzz_fuzz::{run_targeted, ExecConfig, Input, Tail, Target, ValueDictionary};
 use loom_fuzz_seed::HitView;
 
-use crate::hit::Hit;
+use crate::hit::{Hit, HitFamily};
 use crate::verdict::{judge_with, HitReport, JudgeInput, Verdict};
 
 /// poc.json 格式标识（破坏性变更递增）。
@@ -61,8 +61,24 @@ pub struct Poc {
     /// 执行地址（fork 态 = 真实地址；缺省 = 管线固定 0x2222…22）。
     #[serde(default)]
     pub contract: Option<String>,
+    /// 检测族（#20；缺省 arbitrary_call——旧 poc 回放兼容）。
+    #[serde(default)]
+    pub family: HitFamily,
+    /// 定罪的那次呼出（#20；target + input hex）。L2 通用动作选择
+    /// 的形状依据；旧 poc 无此字段（None）= 形状不可用。
+    #[serde(default)]
+    pub call: Option<PocCall>,
     /// 手写 replay 命令串（含本文件名）。
     pub replay: String,
+}
+
+/// 定罪呼出（poc.json 形态；与 RecordedCall 同要素）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PocCall {
+    /// "0x" + 40 hex
+    pub target: String,
+    /// "0x" + hex
+    pub input: String,
 }
 
 /// fork 配置（poc.json 形态）。
@@ -265,6 +281,11 @@ pub fn build_poc(
             })
             .collect(),
         contract: Some(bytes_hex(&cfg.address)),
+        family: hit_report.hit.family,
+        call: Some(PocCall {
+            target: bytes_hex(&witness.evidence_call.target),
+            input: bytes_hex(&witness.evidence_call.input),
+        }),
         replay,
     })
 }
@@ -366,6 +387,7 @@ pub fn replay(
         pc: poc.pc,
     };
     let hit = Hit {
+        family: poc.family,
         selector,
         step: poc.step,
         target_pcs: vec![poc.pc],
@@ -419,6 +441,7 @@ mod tests {
         let report = HitReport {
             verdict: Verdict::Confirmed,
             hit: Hit {
+                family: Default::default(),
                 selector: 0x90ce82d4,
                 step: 19,
                 target_pcs: vec![384],
@@ -485,6 +508,11 @@ mod tests {
         assert_eq!(poc.prestate.len(), 1);
         assert!(poc.replay.contains("loom-fuzz replay poc-test.json"));
         assert!(poc.replay.contains("--code <bytecode.hex>"));
+        // #20：族 + 定罪呼出留盘（L2 形状选择依据）。
+        assert_eq!(poc.family, crate::HitFamily::ArbitraryCall);
+        let call = poc.call.as_ref().expect("confirmed 必有定罪呼出");
+        assert_eq!(call.target, bytes_hex(&[0x7d; 20]));
+        assert_eq!(call.input, bytes_hex(&[1, 2, 3, 4]));
 
         // serde 往返逐字节一致。
         let json = serde_json::to_vec(&poc).unwrap();

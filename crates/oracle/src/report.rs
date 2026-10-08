@@ -120,6 +120,7 @@ mod tests {
         HitReport {
             verdict: Verdict::Unreachable,
             hit: Hit {
+                family: Default::default(),
                 selector: 0x90ce82d4,
                 step: 19,
                 target_pcs: pcs.to_vec(),

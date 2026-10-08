@@ -1,0 +1,5 @@
+0xc9f27a50f82571c1c8423a42970613b8dbda14ef
+chain: ethereum mainnet
+provenance: BlockMachine rpc-eth 拉取（eth_getCode @ latest，2026-10-08）；
+  地址经链上 code 与本地 bin-runtime 逐字节比对一致（= 本目录
+  vvisr-rewards.bin-runtime）。

