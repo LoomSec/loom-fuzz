@@ -30,6 +30,13 @@ loom-evm 反编译产出的静态事实直接编译成 fuzz 的输入空间：
 
 静态知道的一切，fuzzer 进场时就带着；剩下的未知量（存储根、外部调用响应）才是 fuzz 的搜索空间。
 
+## 输入双模式
+
+- **loom CLI 在位**：调用 loom-evm 发布的 `loom` 二进制（`query --json` / `facts`）装载命中与 pc 映射
+- **纯文件**：只给 `bytecode.hex` + `.lst` shard，内置读取器（`crates/shard`）自行解析
+
+两种模式归一为同一 `HitSet`，闭环管线对来源无感。详见 [docs/architecture.md](docs/architecture.md) 与 [docs/shard-format.md](docs/shard-format.md)。
+
 ## 里程碑
 
 - **M0**：单合约、纯字节码、单交易见证闭环，arbitrary_call 族先行；验收 = TRV 样本出 confirmed、噪声行出 unreachable
