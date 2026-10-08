@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use alloy_primitives::U256;
 use revm::handler::MainnetContext;
 use revm::{
-    bytecode::Bytecode,
+    bytecode::{opcode, Bytecode},
     context::{CfgEnv, Context, TxEnv},
     context_interface::ContextTr,
     database::CacheDB,
@@ -32,13 +32,20 @@ pub(crate) struct RunResult {
     pub trace: WitnessTrace,
     /// fitness 计算所需的 visited pcs（有序去重）。
     pub visited_pcs: Vec<u32>,
+    /// 本 run 观测到的比较操作数对（LT/GT/SLT/SGT/EQ，step 时栈顶
+    /// 两元；ISZERO 不收——单操作数，无回灌价值）。
+    pub cmp_observed: Vec<[U256; 2]>,
+    /// 本 run 观测到的 storage 键值对（SLOAD：step 记键、step_end
+    /// 收值）。
+    pub storage_observed: Vec<(U256, U256)>,
 }
 
 type Db = CacheDB<EmptyDB>;
 type Ctx = MainnetContext<Db>;
 
-/// witness inspector：`step` 记 pc；`call`/`create` 记 CALL 族效果；
-/// 步数超上限主动 OOG 截停。
+/// witness inspector：`step` 记 pc + 比较操作数 + SLOAD 键；`step_end`
+/// 收 SLOAD 值；`call`/`create` 记 CALL 族效果；步数超上限主动 OOG
+/// 截停。
 pub(crate) struct WitnessInspector {
     step_cap: u64,
     steps: u64,
@@ -49,6 +56,12 @@ pub(crate) struct WitnessInspector {
     calls: Vec<RecordedCall>,
     /// 步数上限触发的截停（gas 未耗尽，人为截停，如实标 truncated）。
     step_capped: bool,
+    /// 比较操作数观测（#6 算子 1 的变异池来源）。
+    cmp_observed: Vec<[U256; 2]>,
+    /// SLOAD 观测（#6 算子 4 的变异池来源）。
+    storage_observed: Vec<(U256, U256)>,
+    /// step 时暂存的 SLOAD 键，step_end 对值。
+    pending_sload: Option<U256>,
 }
 
 impl WitnessInspector {
@@ -60,8 +73,19 @@ impl WitnessInspector {
             visited: BTreeSet::new(),
             calls: Vec::new(),
             step_capped: false,
+            cmp_observed: Vec::new(),
+            storage_observed: Vec::new(),
+            pending_sload: None,
         }
     }
+}
+
+/// 收比较操作数的指令家族（ISZERO 除外：单操作数，无回灌价值）。
+fn is_cmp(op: u8) -> bool {
+    matches!(
+        op,
+        opcode::LT | opcode::GT | opcode::SLT | opcode::SGT | opcode::EQ
+    )
 }
 
 impl Inspector<Ctx> for WitnessInspector {
@@ -70,6 +94,19 @@ impl Inspector<Ctx> for WitnessInspector {
         let pc = interp.bytecode.pc() as u32;
         self.last_pc = Some(pc);
         self.visited.insert(pc);
+        // 比较操作数观测：step 在指令执行前触发，栈顶两元即操作数。
+        // 两侧都收（不判定比较结果——结果条件收需要 step_end 回读已
+        // 弹出的操作数，机制复杂且无收益：收两侧天然覆盖"未通过的
+        // 一侧"）。
+        let op = interp.bytecode.opcode();
+        if is_cmp(op) {
+            if let (Ok(a), Ok(b)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                self.cmp_observed.push([a, b]);
+            }
+        } else if op == opcode::SLOAD {
+            // step_end 收值（值在指令执行后上栈）。
+            self.pending_sload = interp.stack.peek(0).ok();
+        }
         if self.steps >= self.step_cap {
             // 主动截停：按 OOG 收尾（gas 记满额），上层据
             // `step_capped` 如实标 truncated。
@@ -78,6 +115,14 @@ impl Inspector<Ctx> for WitnessInspector {
             interp
                 .bytecode
                 .set_action(InterpreterAction::Return(result));
+        }
+    }
+
+    fn step_end(&mut self, interp: &mut Interpreter, _context: &mut Ctx) {
+        if let Some(key) = self.pending_sload.take() {
+            if let Ok(value) = interp.stack.peek(0) {
+                self.storage_observed.push((key, value));
+            }
         }
     }
 
@@ -216,6 +261,8 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
             truncated,
         },
         visited_pcs: inspector.visited.iter().copied().collect(),
+        cmp_observed: inspector.cmp_observed,
+        storage_observed: inspector.storage_observed,
     }
 }
 

@@ -16,7 +16,8 @@ use loom_fuzz_seed::{Input, Target, ValueDictionary};
 
 use crate::cfg::DistanceTable;
 use crate::evm;
-use crate::mutate::{input_key, mutate, random_input};
+use crate::mutate::{input_key, random_input};
+use crate::mutators::{const_pool, mutate, MutCtx, Pools};
 use crate::rng::Rng;
 
 /// 会话配置：合约字节码 + prestate 布置 + 预算 + 确定性种子。
@@ -142,7 +143,8 @@ pub fn run_targeted(
 ) -> SessionReport {
     let table = DistanceTable::new(&cfg.code, target.hit.target_pcs());
 
-    // 制导会话。
+    // 制导会话。常量池（字典 ∪ PUSH 立即数）会话级构建一次。
+    let consts = const_pool(&cfg.code, dict);
     let mut session = Session::new(cfg, &table, cfg.seed_rng);
     let head_len_hint = seeds.iter().map(|s| s.head.len()).max().unwrap_or(2).max(1);
     for seed in seeds {
@@ -166,7 +168,7 @@ pub fn run_targeted(
     while !session.reached && session.budget_left() {
         let parents: Vec<Input> = session.select_parents().into_iter().cloned().collect();
         for parent in &parents {
-            let child = mutate(session.rng_mut(), parent, dict);
+            let child = session.mutate_child(parent, &consts);
             if session.run_one(&child) {
                 break;
             }
@@ -215,6 +217,9 @@ struct Session<'a> {
     best: Option<Evaluated>,
     corpus: Vec<Evaluated>,
     corpus_keys: BTreeSet<Vec<u8>>,
+    /// 比较操作数池 + 存储观测池（#6 算子 1/4 的回灌来源，
+    /// 会话级累积，去重有上限）。
+    pools: Pools,
 }
 
 impl<'a> Session<'a> {
@@ -230,7 +235,17 @@ impl<'a> Session<'a> {
             best: None,
             corpus: Vec::new(),
             corpus_keys: BTreeSet::new(),
+            pools: Pools::new(),
         }
+    }
+
+    /// 单轮变异：构造 MutCtx（随机源 + 常量池 + 运行时池）后走
+    /// mutators 的组合选择（定长五算子 / 变长尾算子 / legacy 兜底）。
+    fn mutate_child(&mut self, parent: &Input, consts: &[U256]) -> Input {
+        let cmp_pool = self.pools.cmp();
+        let storage_pool = self.pools.storage();
+        let mut ctx = MutCtx::new(&mut self.rng, consts, &cmp_pool, &storage_pool);
+        mutate(parent, &mut ctx)
     }
 
     fn population_len(&self) -> usize {
@@ -253,6 +268,9 @@ impl<'a> Session<'a> {
         }
         self.runs += 1;
         let result = evm::execute(self.cfg, input, STEP_CAP);
+        // 观测入池（去重有上限）：比较操作数 → 算子 1，SLOAD 键值
+        // 对 → 算子 4。
+        self.pools.absorb(&result);
         let fitness = self.table.fitness(result.visited_pcs.iter().copied());
         let hit_now = result
             .visited_pcs
