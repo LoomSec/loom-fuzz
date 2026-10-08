@@ -10,10 +10,35 @@ loom-fuzz 从不依赖 loom-evm 的代码，只通过两种**文件/进程契约
 
 目标机器已安装 loom-evm 发布的二进制（`loom`）。loom-fuzz 以子进程方式调用：
 
-- `loom query <pack> <shard> --json` → 命中行（selector / effect 步序 / 证据表达式原文）
-- `loom facts <shard>` → 每函数事实流的 `pc` 映射（effect 步序 → 字节码 pc）
+- `loom query <pack>... <shard> --json` → 检测 pack 的 `vuln_arbitrary` 谓词 rows
+- **额外输入**：`bytecode.hex`（运行时字节码 hex 文本）——`.lst` 不含字节码，
+  `HitSet.code` 必须由调用方单独提供（两个装载器签名都收 `code_hex`）。
 
 适用：分析与 fuzz 同机的交互式工作流。CLI 的 JSON 输出即契约，loom-evm 端需保证其稳定性（发版纪律）。
+
+**模式 A 契约 = loom CLI JSON 的最小稳定子集**（`loom query --json` 顶层）：
+
+| 字段 | 类型 | 处置 |
+|---|---|---|
+| `queries` | 数组 | 按键 `predicate` 查找 `"vuln_arbitrary"` 结果段；缺段 = typed 报错（`LoomJson`） |
+| `queries[].predicate` | 字符串 | 谓词名 |
+| `queries[].rows` | 字符串数组的数组 | `vuln_arbitrary` 的行：`[func, step, t]` 三列（见下） |
+| `queries[].total_rows` | uint | 与 `rows.len()` 不等即视为截断，fail-closed 报错（`LoomTruncated`） |
+| `truncated` | bool | `true` 即结果不完整，fail-closed 报错（同上） |
+| `unserved_demand` | uint | `> 0` 表示有 oracle demand 未满足（结果可能不完整），fail-closed 报错（`LoomUnservedDemand`） |
+| `unserved_keys` | 字符串数组 | 仅供诊断展示 |
+
+`vuln_arbitrary` 行形态：`[func, step, t]`，全部字符串列——
+
+| 列 | 类型 | 示例 | 说明 |
+|---|---|---|---|
+| `func` | `0x%08x` \| `f{local}@c{contract}` | `"0x90ce82d4"` | 有 selector 函数的渲染；无 selector（fallback/receive 等）渲染 `f{local}@c{contract}`（单 shard 装载要求 `c0`）；其它形态（如 `def...@c...`）= 契约外输入，fail-closed 报错（`FuncUnrecognized`） |
+| `step` | 十进制数字字符串 | `"19"` | 效果步序（x-layer 步序），非数字 = typed 报错 |
+| `t` | 表达式渲染文本 | `"cast160(calldata_word(0x4))"` | 证据表达式原文，原样保留为 `Hit.evidence` |
+
+步序 → pc 映射与支配 guard **两种模式都走本仓库 xlayer 展开**（不发
+`loom facts`）：装载器内部统一，loom 展开步序已由 xlayer golden 对拍
+验证一致，保证检测来源对 pc/guard 计算无感。
 
 ### 模式 B：纯文件
 
@@ -31,14 +56,29 @@ HitSet {
   hits: Vec<Hit>,                       // 每条检测命中
 }
 Hit {
-  selector: u32,                        // 函数 selector（无函数上下文为哨兵值）
+  selector: u32,                        // 函数 selector（无函数上下文 u32::MAX 哨兵）
   target_pcs: Vec<u32>,                 // 帧 → PC 集合（定向目标）
-  evidence: ExprRef,                    // 证据表达式（oracle 求值对象）
+  evidence: String,                     // 证据表达式的规范化渲染文本（oracle 求值对象）
   dominating_guards: Vec<GuardFact>,    // 支配 guard（seed 编译输入）
 }
+GuardFact { cond: String, polarity: bool, pc: u32 }
 ```
 
 模式 A/B 只是 HitSet 的两个装载器（`crates/cli` 里的 `load_from_cli` / `load_from_shard`），闭环管线对来源无感。
+
+- 模式 A：`load_from_cli(loom_bin, packs, shard, code_hex)`——子进程
+  `loom query`，fail-closed（二进制缺失 / 非零退出 / JSON 缺字段 /
+  截断 / 未满足 demand / Func 列无法识别，全部 typed 报错）。
+- 模式 B：`load_from_shard(shard, code_hex)`——纯文件，内置
+  arbitrary_call 检测推导（臂 3 裸转发 + 臂 1 目标可控；
+  `caller_test` / `scope_cmp` 语义照 loom-evm 内建关系逐条对齐）。
+  M0 已知近似：`whitelisted` 只实现可信身份比对与 caller 键控
+  mapping 成员测试两臂（`registry_validated` 族未实现，可能对
+  注册表验证类合约过报）；`identity_ref_contract`（臂 2/4，需链上
+  oracle）在无 oracle 时装配为空，模式 B 不实现。
+- 两模式等价性由 golden 对拍测试钉死：同一 shard 上
+  `load_from_cli` 与 `load_from_shard` 的 HitSet 逐字段相等
+  （code、hits 全部字段含 dominating_guards）。
 
 ## 闭环管线
 
@@ -74,7 +114,7 @@ fuzz_report.json（覆盖统计 + 未触发假设，全部落盘可重放，确�
 | `crates/seed` | guard 事实 → 种子 Input | 待开工 |
 | `crates/fuzz` | revm 执行 + --target 制导 + 变异器 + witness 记录 | 待开工 |
 | `crates/oracle` | 证据表达式族检查器 + 三值判决 + poc/report 落盘 | 待开工 |
-| `crates/cli` | 入口：模式 A/B 装载 + 管线串联 | 随上列就绪逐个接入 |
+| `crates/cli` | 入口：模式 A/B 装载 + 管线串联 | M0.3 双模式装载器已就绪（PR #3） |
 
 ## 边界纪律
 
