@@ -6,14 +6,30 @@
 //! - Aave V3 fork 池（1.25MB，37 个函数）：大文件 + zlib DEFS 段覆盖。
 
 use loom_fuzz_shard::{Entry, ExprNode, Shard};
+use std::path::Path;
 
 const TRV_ROUTER: &str = "/tmp/trv_router.lst";
 const AAVE_POOL: &str =
     "/tmp/3e5e08d8844ae2cd651ebb2a7fb9b17957e955a905701a2e5df0debbfff407a5.lst";
 
+/// fixture 是 loom-evm 写出的真实分片（真实合约分析产物，不进仓库）。
+/// 缺失时优雅跳过——外部贡献者没有这两个 /tmp 文件，不应看到红测试。
+fn open_fixture(path: &str) -> Option<Shard> {
+    if !Path::new(path).exists() {
+        eprintln!(
+            "skip: 缺少 loom-evm 写出的测试分片 {path}（真实合约分析产物，不进仓库；\
+             用 `loom store <bytecode> -o {path}` 在本机生成）"
+        );
+        return None;
+    }
+    Some(Shard::open(path).expect("fixture shard opens"))
+}
+
 #[test]
 fn trv_function_table_contains_forward_request() {
-    let shard = Shard::open(TRV_ROUTER).expect("trv shard opens");
+    let Some(shard) = open_fixture(TRV_ROUTER) else {
+        return;
+    };
     let forward = shard
         .function_by_selector(0xe27fbed3)
         .expect("0xe27fbed3 (forwardRequest) 必须在函数表里");
@@ -30,7 +46,9 @@ fn trv_function_table_contains_forward_request() {
 
 #[test]
 fn trv_forward_request_reaches_effects() {
-    let shard = Shard::open(TRV_ROUTER).expect("trv shard opens");
+    let Some(shard) = open_fixture(TRV_ROUTER) else {
+        return;
+    };
     let forward = shard.function_by_selector(0xe27fbed3).unwrap();
     // 函数自身的事实流：input_read（selector 分发与 calldata 解码）。
     let own: Vec<_> = forward
@@ -66,7 +84,9 @@ fn trv_forward_request_reaches_effects() {
 
 #[test]
 fn trv_guards_present() {
-    let shard = Shard::open(TRV_ROUTER).expect("trv shard opens");
+    let Some(shard) = open_fixture(TRV_ROUTER) else {
+        return;
+    };
     let guard_count: usize = shard
         .functions()
         .iter()
@@ -77,7 +97,9 @@ fn trv_guards_present() {
 
 #[test]
 fn trv_expr_tree_traversable_with_calldata_slice() {
-    let shard = Shard::open(TRV_ROUTER).expect("trv shard opens");
+    let Some(shard) = open_fixture(TRV_ROUTER) else {
+        return;
+    };
     assert!(shard.manifest.nodes as usize == shard.exprs().len());
 
     // 找到 b_calldata_slice 形态节点并校验其子引用可解析（表达式树
@@ -107,7 +129,9 @@ fn trv_expr_tree_traversable_with_calldata_slice() {
 #[test]
 fn aave_pool_parses_with_37_functions() {
     // 大文件 + DEFS zlib 段：解析不 panic、计数精确。
-    let shard = Shard::open(AAVE_POOL).expect("aave shard opens");
+    let Some(shard) = open_fixture(AAVE_POOL) else {
+        return;
+    };
     assert_eq!(shard.functions().len(), 37);
     assert_eq!(shard.manifest.functions as usize, 37);
     assert!(shard.manifest.nodes as usize == shard.exprs().len());
@@ -139,7 +163,9 @@ fn corrupt_inputs_are_errors_not_panics() {
 #[test]
 fn trv_step_numbering_counts_effects_in_order() {
     // x-layer 步序：Guard/Effect/Outcome 连续编号，Apply/Exit 不占号。
-    let shard = Shard::open(TRV_ROUTER).expect("trv shard opens");
+    let Some(shard) = open_fixture(TRV_ROUTER) else {
+        return;
+    };
     let forward = shard.function_by_selector(0xe27fbed3).unwrap();
     let steps: Vec<u32> = forward.entries.iter().filter_map(|e| e.step()).collect();
     assert!(!steps.is_empty());

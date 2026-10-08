@@ -861,7 +861,11 @@ mod reader {
         let mut definitions = Vec::with_capacity(n);
         let mut pc = 0_i64;
         for _ in 0..n {
-            pc += d2.zigzag()?;
+            // checked_add：伪造的 pc 增量在 debug 下会让裸 + 溢出 panic、
+            // release 下回绕后可能落回合法区间——溢出一律按解析错误处理。
+            pc = pc
+                .checked_add(d2.zigzag()?)
+                .ok_or(Error::BadReference("definition pc"))?;
             if pc < 0 || pc > u32::MAX as i64 {
                 return Err(Error::BadReference("definition pc"));
             }
