@@ -121,6 +121,10 @@ pub struct SessionReport {
     /// selector 固定为目标 selector（完全随机 selector 过不了
     /// dispatcher，基线恒不可达，没有对照意义）。
     pub baseline_runs_to_reach: Option<u64>,
+    /// 会话 corpus 规模（去重后保留的输入数；fuzz_report 的
+    /// corpus 口径）。
+    #[serde(default)]
+    pub corpus_size: usize,
 }
 
 /// 步数上限（每 run）：gas 之外的硬兜（min gas/opcode ≥ 2，
@@ -338,6 +342,7 @@ impl<'a> Session<'a> {
             trace,
             runs_completed: self.runs,
             baseline_runs_to_reach: None,
+            corpus_size: self.corpus.len(),
         }
     }
 }

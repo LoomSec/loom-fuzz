@@ -109,6 +109,7 @@ pub(crate) fn assemble(
         let dominating = dominating_guards(shard, view, entries, row.step, *scope);
         hits.push(Hit {
             selector: row.selector,
+            step: row.step,
             target_pcs: vec![*pc],
             evidence: row.evidence,
             dominating_guards: dominating,
