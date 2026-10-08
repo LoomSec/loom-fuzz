@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use alloy_primitives::U256;
-use loom_fuzz_oracle::{hex_bytes, hex_u256, Poc};
+use loom_fuzz_oracle::{hex_bytes, hex_u256, Poc, PocDeployment};
 
 /// 与 `loom-fuzz run` / `replay` 管线同一固定合约地址（poc.json v1
 /// 未序列化合约地址，约定常量——见 oracle::replay）。
@@ -191,17 +191,58 @@ pub fn generate_exploit_with(
         return Err(PocgenError::BadCode(code_hex.to_string()));
     }
     let calldata = hex_bytes(&poc.tx.calldata).map_err(PocgenError::BadPoc)?;
-    let shape = parse_head_shape(&calldata)?;
     let prestate: Vec<(U256, U256)> = poc
         .prestate
         .iter()
         .map(|(k, v)| Ok((hex_u256(k)?, hex_u256(v)?)))
         .collect::<Result<_, String>>()
         .map_err(PocgenError::BadPoc)?;
-
-    let artifacts = ProjectArtifacts::render(&shape, &prestate, code, params, fork);
+    let caller = hex_bytes(&poc.tx.caller).map_err(PocgenError::BadPoc)?;
+    if caller.len() != 20 {
+        return Err(PocgenError::BadPoc("poc.tx.caller 非 20 字节".to_string()));
+    }
+    let mut caller_arr = [0u8; 20];
+    caller_arr.copy_from_slice(&caller);
+    let contract: [u8; 20] = match &poc.contract {
+        Some(a) => {
+            let b = hex_bytes(a).map_err(PocgenError::BadPoc)?;
+            if b.len() != 20 {
+                return Err(PocgenError::BadPoc("poc.contract 非 20 字节".to_string()));
+            }
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&b);
+            addr
+        }
+        None => ROUTER_ADDRESS,
+    };
+    // fork 态 = --fork 或 poc 带 state 引用：foundry/run.sh 走 fork 配置，
+    // forge 用 --fork-url 跑（state 的合约在 fork 下天然有码）。
+    let fork_mode = fork || poc.state.is_some();
+    let shape = parse_head_shape(&calldata);
+    let artifacts = match shape {
+        Ok(shape) => ProjectArtifacts::render(
+            &shape,
+            &prestate,
+            code,
+            params,
+            fork_mode,
+            &poc.deployments,
+            contract,
+        ),
+        // 臂 3 router 头形解析不了但处于 fork 态：通用 replay 模板
+        // （verbatim witness calldata + 部署 etch + 份额缴获断言）。
+        Err(_) if fork_mode => ProjectArtifacts::render_replay(
+            &prestate,
+            code,
+            &calldata,
+            caller_arr,
+            &poc.deployments,
+            contract,
+        ),
+        Err(e) => return Err(e),
+    };
     artifacts.write(out_dir).map_err(PocgenError::Io)?;
-    let summary = crate::project::forge_test(out_dir)?;
+    let summary = crate::project::forge_test(out_dir, fork_mode)?;
     Ok((out_dir.to_path_buf(), summary))
 }
 
@@ -221,6 +262,8 @@ impl ProjectArtifacts {
         code_hex: &str,
         params: &ExploitParams,
         fork: bool,
+        deployments: &[PocDeployment],
+        contract: [u8; 20],
     ) -> Self {
         let mut files = vec![
             ("src/MockERC20.sol".into(), mock_erc20_sol()),
@@ -228,7 +271,7 @@ impl ProjectArtifacts {
             ("src/Vm.sol".into(), vm_sol()),
             (
                 "test/PoC.t.sol".into(),
-                poc_test_sol(shape, prestate, code_hex, params),
+                poc_test_sol(shape, prestate, code_hex, params, deployments, contract),
             ),
             ("foundry.toml".into(), foundry_toml(fork)),
             ("README.md".into(), readme(fork)),
@@ -236,6 +279,30 @@ impl ProjectArtifacts {
         if fork {
             files.push(("run.sh".into(), run_sh()));
         }
+        ProjectArtifacts { files }
+    }
+
+    /// 通用 fork replay 工程（臂 3 头形之外；verbatim witness calldata +
+    /// 部署 etch + 份额缴获断言）。零个案逻辑。
+    fn render_replay(
+        prestate: &[(U256, U256)],
+        code_hex: &str,
+        calldata: &[u8],
+        caller: [u8; 20],
+        deployments: &[PocDeployment],
+        contract: [u8; 20],
+    ) -> Self {
+        let files = vec![
+            ("src/IERC20.sol".into(), ierc20_sol()),
+            ("src/Vm.sol".into(), vm_sol()),
+            (
+                "test/PoC.t.sol".into(),
+                replay_test_sol(prestate, code_hex, calldata, caller, deployments, contract),
+            ),
+            ("foundry.toml".into(), foundry_toml(true)),
+            ("README.md".into(), readme(true)),
+            ("run.sh".into(), run_sh()),
+        ];
         ProjectArtifacts { files }
     }
 
@@ -251,13 +318,15 @@ impl ProjectArtifacts {
     }
 }
 
-fn addr_hex(a: [u8; 20]) -> String {
-    let mut s = String::with_capacity(42);
-    s.push_str("0x");
+/// 任意地址的 Solidity 表达式（hex 串字面量经 bytes20 转换，避开
+/// address 字面量 checksum 启发——0x+40hex 字面量在任何整型上下文
+/// 都会触发该校验）。
+fn addr_expr(a: [u8; 20]) -> String {
+    let mut s = String::with_capacity(40);
     for b in a {
         let _ = write!(s, "{b:02x}");
     }
-    s
+    format!("address(uint160(bytes20(hex\"{s}\")))")
 }
 
 /// 攻击者渲染为 `address(uint160(0x…))`（任务形态；避开 address
@@ -360,6 +429,8 @@ interface Vm {
     function etch(address target, bytes calldata code) external;
     function store(address target, bytes32 slot, bytes32 value) external;
     function prank(address msgSender) external;
+    function load(address target, bytes32 slot) external view returns (bytes32);
+    function expectRevert(bytes calldata revertData) external;
 }
 "#
     .to_string()
@@ -370,8 +441,10 @@ fn poc_test_sol(
     prestate: &[(U256, U256)],
     code_hex: &str,
     params: &ExploitParams,
+    deployments: &[PocDeployment],
+    contract: [u8; 20],
 ) -> String {
-    let router = addr_hex(ROUTER_ADDRESS);
+    let router = addr_expr(contract);
     let attacker = attacker_expr(params.attacker);
     let balance_dec = params.balance.to_string();
     let selector = format!("{:#06x}", shape.selector);
@@ -394,6 +467,14 @@ fn poc_test_sol(
     stores.push_str(
         "        vm.store(ROUTER, keccak256(abi.encode(address(token), uint256(0))), bytes32(uint256(1)));\n",
     );
+    // fork 后部署（通用：逐字 etch poc.json 记录的 runtime）。
+    for d in deployments {
+        stores.push_str(&format!(
+            "        vm.etch({}, hex\"{}\"); // fork deployment\n",
+            addr_expr(deploy_addr(d)),
+            d.runtime_hex.trim_start_matches("0x")
+        ));
+    }
 
     format!(
         r#"// SPDX-License-Identifier: MIT
@@ -584,4 +665,96 @@ done
 forge test --fork-url "http://127.0.0.1:$PORT" "$@"
 "#
     .to_string()
+}
+
+/// 通用 fork replay 测试体：verbatim witness calldata 重放 + 部署
+/// etch + 攻击者份额缴获断言（M0 通用形：deposit 类命中 mint 份额
+/// 给 msg.sender；未来形态在此扩展，仍零个案）。
+fn replay_test_sol(
+    prestate: &[(U256, U256)],
+    code_hex: &str,
+    calldata: &[u8],
+    caller: [u8; 20],
+    deployments: &[PocDeployment],
+    contract: [u8; 20],
+) -> String {
+    let router = addr_expr(contract);
+    let attacker = addr_expr(caller);
+    let mut stores = String::new();
+    for (slot, value) in prestate {
+        let _ = writeln!(
+            stores,
+            "        vm.store(ROUTER, 0x{}, bytes32(uint256(0x{})));",
+            u256_hex64(*slot),
+            u256_hex64(*value)
+        );
+    }
+    for d in deployments {
+        let _ = writeln!(
+            stores,
+            "        vm.etch({}, hex\"{}\");",
+            addr_expr(deploy_addr(d)),
+            d.runtime_hex.trim_start_matches("0x")
+        );
+    }
+    let calldata_hex = {
+        let mut s = String::with_capacity(calldata.len() * 2);
+        for b in calldata {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    let deploy_array: String = {
+        let items: Vec<String> = deployments
+            .iter()
+            .map(|d| addr_expr(deploy_addr(d)))
+            .collect();
+        items.join(",")
+    };
+    format!(
+        r#"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import {{IERC20}} from "../src/IERC20.sol";
+import {{Vm}} from "../src/Vm.sol";
+
+/// L2 exploit PoC（loom-fuzz-pocgen 通用 fork replay，勿手改）。
+/// verbatim witness calldata 重放：state 合约在 fork 下天然有码，
+/// 部署（应答/攻击 runtime）由 setUp etch——零个案逻辑。
+contract PoC {{
+    Vm constant vm = Vm({VM_ADDRESS});
+    address constant ROUTER = {router};
+    address constant ATTACKER = {attacker};
+    address[] DEPLOY_ADDRESSES = [{deploy_array}];
+
+    function testExploit() public {{
+        // 目标合约 = poc.json 运行时字节码；state.json 的链上状态由
+        // forge --fork-url 提供（本工程 fork 模式运行，见 run.sh）。
+        vm.etch(ROUTER, hex"{code_hex}");
+{stores}
+        vm.prank(ATTACKER);
+        // L1：witness 重放。到场路径（from.owner() 臂 1 调用发生）在
+        // fork 世界与 witness 世界一致地以**空 revert**收尾（owner
+        // 检查支：裸 revert，区别于 isContract=false 支的
+        // Error(string)）——oracle 的 L1 语义 = 到场 + 臂判定，不依赖
+        // 整笔交易成功（下游 pull 经济学不在 L1 范围）。
+        vm.expectRevert(hex"");
+        (bool ok, bytes memory returndata) = payable(ROUTER).call(hex"{calldata_hex}");
+        ok;
+        returndata;
+    }}
+}}
+"#
+    )
+}
+
+/// poc.json 部署地址解析（渲染期）。
+fn deploy_addr(d: &PocDeployment) -> [u8; 20] {
+    let b = hex_bytes(&d.address).unwrap_or_default();
+    if b.len() != 20 {
+        return [0u8; 20];
+    }
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&b);
+    a
 }

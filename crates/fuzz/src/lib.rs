@@ -106,11 +106,21 @@
 mod cfg;
 mod evm;
 mod exec;
+mod fork;
 mod mutate;
 mod mutators;
 mod rng;
 
 pub use cfg::DistanceTable;
-pub use exec::{run_targeted, ExecConfig, OutcomeKind, RecordedCall, SessionReport, WitnessTrace};
+pub use evm::probe_execute;
+pub use exec::{
+    responder_runtime, responder_runtime_sender, run_targeted, Deployment, ExecConfig, OutcomeKind,
+    RecordedCall, SessionReport, StateSource, WitnessTrace,
+};
+pub use fork::{
+    hex_addr as fork_hex_addr, hex_u256 as fork_hex_u256, u256_hex as fork_u256_hex, ForkAccount,
+    ForkMeta, ForkStateFile,
+};
 pub use loom_fuzz_seed::{HitView, Input, Tail, Target, ValueDictionary};
+pub use mutate::random_input;
 pub use rng::Rng;

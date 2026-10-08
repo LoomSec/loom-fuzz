@@ -17,7 +17,7 @@ use revm::{
     database_interface::EmptyDB,
     inspector::Inspector,
     interpreter::{
-        interpreter_types::{Jumps, LoopControl},
+        interpreter_types::{InputsTr, Jumps, LoopControl},
         CallInputs, CallScheme, CreateInputs, Interpreter, InterpreterAction, InterpreterResult,
     },
     primitives::{hardfork::SpecId, Address, Bytes, TxKind},
@@ -38,6 +38,8 @@ pub(crate) struct RunResult {
     /// 本 run 观测到的 storage 键值对（SLOAD：step 记键、step_end
     /// 收值）。
     pub storage_observed: Vec<(U256, U256)>,
+    /// SLOAD 站点（地址, 槽）——fork 物化的触及槽集。
+    pub sload_sites: Vec<([u8; 20], U256)>,
 }
 
 type Db = CacheDB<EmptyDB>;
@@ -62,6 +64,8 @@ pub(crate) struct WitnessInspector {
     storage_observed: Vec<(U256, U256)>,
     /// step 时暂存的 SLOAD 键，step_end 对值。
     pending_sload: Option<U256>,
+    /// SLOAD 站点（地址, 槽）——fork 状态物化的触及槽集来源。
+    sload_sites: Vec<([u8; 20], U256)>,
 }
 
 impl WitnessInspector {
@@ -76,6 +80,7 @@ impl WitnessInspector {
             cmp_observed: Vec::new(),
             storage_observed: Vec::new(),
             pending_sload: None,
+            sload_sites: Vec::new(),
         }
     }
 }
@@ -104,8 +109,13 @@ impl Inspector<Ctx> for WitnessInspector {
                 self.cmp_observed.push([a, b]);
             }
         } else if op == opcode::SLOAD {
-            // step_end 收值（值在指令执行后上栈）。
+            // step_end 收值（值在指令执行后上栈）；记站点供 fork 物化。
             self.pending_sload = interp.stack.peek(0).ok();
+            let addr = interp.input.target_address();
+            self.sload_sites.push((
+                addr.into_array(),
+                interp.stack.peek(0).ok().unwrap_or(U256::ZERO),
+            ));
         }
         if self.steps >= self.step_cap {
             // 主动截停：按 OOG 收尾（gas 记满额），上层据
@@ -195,6 +205,22 @@ impl Inspector<Ctx> for WitnessInspector {
     }
 }
 
+/// fork 状态物化的探测产物：witness trace + SLOAD 站点（地址, 槽）。
+pub struct ProbeOutcome {
+    pub trace: WitnessTrace,
+    pub sload_sites: Vec<([u8; 20], U256)>,
+}
+
+/// 探测执行（pub）：调用方从 trace（calls/deployments）与
+/// sload_sites 收集触及集。
+pub fn probe_execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> ProbeOutcome {
+    let r = execute(cfg, input, step_cap);
+    ProbeOutcome {
+        trace: r.trace,
+        sload_sites: r.sload_sites,
+    }
+}
+
 /// 单 run：布置世界状态 → 执行 → 收 witness。`input` 序列化为
 /// calldata（selector 4B + head 原样拼接 + tail 原样拼接；执行器
 /// 不感知 ABI，指针槽正确性是种子/变异器的责任，见 lib.rs 职责边界）。
@@ -211,10 +237,60 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
             ..Default::default()
         },
     );
+    // fork 状态 hydration（state.json 物化产物；Genesis = 跳过）。
+    match &cfg.state_source {
+        crate::exec::StateSource::Genesis => {}
+        crate::exec::StateSource::StateFile(path) => {
+            let state = crate::fork::ForkStateFile::load(path)
+                .unwrap_or_else(|e| panic!("state 加载失败（CLI 已校验，契约内）: {e}"));
+            for (addr, account) in &state.addresses {
+                let address = Address::from(crate::fork::hex_addr(addr).expect("state 地址已验证"));
+                // 分析合约自身的 code 用分析产物（state 里的真实
+                // code 不覆盖——执行对象是 .bin-runtime）；其余账户
+                // 照单 hydration。
+                let code = if address == Address::from(cfg.address) {
+                    cfg.code.clone()
+                } else {
+                    crate::fork::hex_bytes(&account.code_hex).expect("state code 已验证")
+                };
+                db.insert_account_info(
+                    address,
+                    revm::state::AccountInfo {
+                        balance: crate::fork::hex_u256(&account.balance)
+                            .expect("state balance 已验证"),
+                        nonce: u64::from_str_radix(account.nonce.trim_start_matches("0x"), 16)
+                            .expect("state nonce 已验证"),
+                        code: Some(Bytecode::new_legacy(Bytes::from(code))),
+                        ..Default::default()
+                    },
+                );
+                for (slot, value) in &account.slots {
+                    db.insert_account_storage(
+                        address,
+                        crate::fork::hex_u256(slot).expect("state slot 已验证"),
+                        crate::fork::hex_u256(value).expect("state value 已验证"),
+                    )
+                    .expect("CacheDB 插槽不落盘，不会失败");
+                }
+            }
+        }
+    }
     // prestate 存储槽。
     for (slot, value) in &cfg.prestate {
         db.insert_account_storage(Address::from(cfg.address), *slot, *value)
             .expect("CacheDB 插槽不落盘，不会失败");
+    }
+    // fork 后部署的攻击合约（overlay 在状态/prestate 之上）。
+    for deploy in &cfg.deployments {
+        db.insert_account_info(
+            Address::from(deploy.address),
+            revm::state::AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code: Some(Bytecode::new_legacy(Bytes::from(deploy.runtime.clone()))),
+                ..Default::default()
+            },
+        );
     }
     // caller 账户：大额余额（余额敏感分支读到确定值）、nonce 0。
     let caller = Address::from(input.caller);
@@ -258,10 +334,12 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
                     outcome: OutcomeKind::Invalid,
                     gas_used: cfg.gas_per_tx,
                     truncated: true,
+                    deployments: cfg.deployments.clone(),
                 },
                 visited_pcs: Vec::new(),
                 cmp_observed: Vec::new(),
                 storage_observed: Vec::new(),
+                sload_sites: Vec::new(),
             };
         }
     };
@@ -277,10 +355,12 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
             outcome,
             gas_used,
             truncated,
+            deployments: cfg.deployments.clone(),
         },
         visited_pcs: inspector.visited.iter().copied().collect(),
         cmp_observed: inspector.cmp_observed,
         storage_observed: inspector.storage_observed,
+        sload_sites: inspector.sload_sites,
     }
 }
 
@@ -368,6 +448,8 @@ mod tests {
             time_budget: std::time::Duration::from_secs(5),
             gas_per_tx: 100_000,
             run_baseline: false,
+            state_source: Default::default(),
+            deployments: Vec::new(),
         };
         let input = Input {
             selector: 0xdeadbeef,
@@ -386,6 +468,7 @@ mod tests {
         // CALL 指令的 pc = 倒数第二条指令（CALL @ len-2）。
         assert_eq!(call.pc, Some((cfg.code.len() - 2) as u32));
         assert_eq!(run.trace.outcome, OutcomeKind::Stop);
+        assert!(run.trace.deployments.is_empty());
     }
 
     /// 步数上限触发主动截停：死循环字节码（JUMPDEST 处无条件跳回
@@ -403,6 +486,8 @@ mod tests {
             time_budget: std::time::Duration::from_secs(5),
             gas_per_tx: 1_000_000,
             run_baseline: false,
+            state_source: Default::default(),
+            deployments: Vec::new(),
         };
         let input = Input {
             selector: 0,

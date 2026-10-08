@@ -37,7 +37,7 @@ pub(crate) fn input_key(input: &Input) -> Vec<u8> {
 /// 字典 = 静态分析产物，属 fuzzer 的合法进场知识））。selector 固定
 /// 为目标 selector（完全随机 selector 过不了 dispatcher，基线恒
 /// 不可达，没有对照意义）。value 恒 0（payable 语义留给 #6）。
-pub(crate) fn random_input(
+pub fn random_input(
     rng: &mut Rng,
     selector: u32,
     head_len: usize,

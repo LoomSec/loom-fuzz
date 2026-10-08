@@ -28,7 +28,9 @@ use loom_fuzz_xlayer::Xlayer;
 
 use loom_fuzz_cli::{load_from_cli, load_from_shard};
 
-const CONTRACT_ADDRESS: [u8; 20] = [0x22; 20];
+mod state;
+
+pub(crate) const CONTRACT_ADDRESS: [u8; 20] = [0x22; 20];
 
 #[derive(Parser)]
 #[command(
@@ -84,6 +86,56 @@ enum Cmd {
         /// forge test（--emit-poc <dir>）
         #[arg(long)]
         emit_poc: Option<PathBuf>,
+        /// fork 态：fetch-state 物化的 state.json（链上状态 hydration）。
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// fork 后部署攻击合约（可多次）：`<addr>:<runtime-hex 或
+        /// responder 或 responder-sender>`；responder = 任何 call 返回
+        /// 0x01…（通用应答），responder-sender = 返回 msg.sender。
+        #[arg(long = "deploy")]
+        deploy: Vec<String>,
+        /// 分析合约的链上真实地址：fork 态在真实地址上执行（其
+        /// 链上存储/余额/外部视角全部归位）；缺省 = 固定 0x2222…22。
+        #[arg(long)]
+        contract_addr: Option<String>,
+    },
+    /// fork 链上状态物化：探测执行收集触及集 → JSON-RPC 拉取 →
+    /// 迭代加深 → state.json（不存 key）。
+    FetchState {
+        /// .lst shard
+        #[arg(long)]
+        shard: PathBuf,
+        /// 运行时字节码 hex 文件
+        #[arg(long)]
+        code: PathBuf,
+        /// 检测 pack（模式 A，成对给 --loom-bin）
+        #[arg(long)]
+        pack: Option<PathBuf>,
+        /// loom 二进制（模式 A）
+        #[arg(long)]
+        loom_bin: Option<PathBuf>,
+        /// JSON-RPC URL（缺省 env BLOCKMACHINE_RPC_URL → BlockMachine 默认）
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// pin block：数字 / latest / 0x-hex
+        #[arg(long, default_value = "latest")]
+        block: String,
+        /// 探测输入的确定性种子
+        #[arg(long, default_value_t = 0xC0DE)]
+        seed: u64,
+        /// 每轮探测 runs
+        #[arg(long, default_value_t = 64)]
+        probe_runs: u64,
+        /// state.json 输出路径
+        #[arg(long)]
+        out: PathBuf,
+        /// 分析合约的链上真实地址（其存储映射到执行地址 0x2222…22）
+        #[arg(long)]
+        contract_addr: Option<String>,
+        /// 引导探测输入：上轮 witness 的 calldata（hex）——迭代加深
+        /// 收集更深状态（如外部合约的 owner 槽）。
+        #[arg(long)]
+        probe_calldata: Option<String>,
     },
     /// L2 exploit 影响层：poc.json → Foundry 工程 + forge test（绿灯 = 终判）
     Exploit {
@@ -138,6 +190,9 @@ fn run() -> Result<ExitCode, String> {
             dict_word,
             out,
             emit_poc,
+            state,
+            deploy,
+            contract_addr,
         } => cmd_run(
             &shard,
             &code,
@@ -151,7 +206,45 @@ fn run() -> Result<ExitCode, String> {
             &dict_word,
             &out,
             emit_poc.as_deref(),
+            state.as_deref(),
+            &deploy,
+            contract_addr.as_deref(),
         ),
+        Cmd::FetchState {
+            shard,
+            code,
+            pack,
+            loom_bin,
+            rpc_url,
+            block,
+            seed,
+            probe_runs,
+            out,
+            contract_addr,
+            probe_calldata,
+        } => {
+            let outcome = state::cmd_fetch_state(
+                &shard,
+                &code,
+                pack.as_deref(),
+                loom_bin.as_deref(),
+                rpc_url.as_deref(),
+                &block,
+                seed,
+                probe_runs,
+                &out,
+                contract_addr.as_deref(),
+                probe_calldata.as_deref(),
+            )?;
+            println!(
+                "state.json: {} 地址 / {} 槽（{} 轮收敛）→ {}",
+                outcome.addresses,
+                outcome.slots,
+                outcome.rounds,
+                outcome.out.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Cmd::Exploit {
             poc,
             code,
@@ -167,6 +260,43 @@ fn run() -> Result<ExitCode, String> {
 }
 
 /// prestate JSON（hex → hex 的 map）读取解析（fail-closed）。
+/// 装载 HitSet（模式 A/B 同 run），返回命中集。
+pub(crate) fn load_hits(
+    shard_path: &Path,
+    code_path: &Path,
+    pack: Option<&Path>,
+    loom_bin: Option<&Path>,
+) -> Result<Vec<Hit>, String> {
+    let hitset = match (pack, loom_bin) {
+        (Some(p), Some(bin)) => {
+            let packs = [p];
+            load_from_cli(bin, &packs, shard_path, code_path)
+                .map_err(|e| format!("模式 A 装载失败: {e}"))?
+        }
+        (None, None) => {
+            load_from_shard(shard_path, code_path).map_err(|e| format!("模式 B 装载失败: {e}"))?
+        }
+        (Some(_), None) => return Err("给了 --pack 缺 --loom-bin（模式 A 成对）".to_string()),
+        (None, Some(_)) => return Err("给了 --loom-bin 缺 --pack（模式 A 成对）".to_string()),
+    };
+    Ok(hitset.hits)
+}
+
+/// 读取运行时字节码 hex 文件（fail-closed）。
+pub(crate) fn read_code(code_path: &Path) -> Result<Vec<u8>, String> {
+    let text = std::fs::read_to_string(code_path)
+        .map_err(|e| format!("无法读取 code {}: {e}", code_path.display()))?;
+    let hex = text.trim().trim_start_matches("0x");
+    if hex.is_empty() || !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(format!("code {} 不是合法 hex", code_path.display()));
+    }
+    Ok((0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("逐字符已验证"))
+        .collect())
+}
+
 fn read_prestate(path: Option<&Path>) -> Result<BTreeMap<U256, U256>, String> {
     let Some(path) = path else {
         return Ok(BTreeMap::new());
@@ -194,6 +324,9 @@ fn cmd_run(
     dict_words: &[String],
     out_dir: &Path,
     emit_poc: Option<&Path>,
+    state_path: Option<&Path>,
+    deploy_flags: &[String],
+    contract_addr: Option<&str>,
 ) -> Result<ExitCode, String> {
     // 装载（模式 A 需 pack+loom-bin 成对；只给一个 = fail-closed）。
     let hitset = match (pack, loom_bin) {
@@ -209,6 +342,51 @@ fn cmd_run(
         (None, Some(_)) => return Err("给了 --loom-bin 缺 --pack（模式 A 需要成对）".to_string()),
     };
     let prestate = read_prestate(prestate_path)?;
+    // fork 态：state.json（CLI 先校验加载一次，执行器每 run 重读——
+    // 文件级确定性）。
+    let state_source = match state_path {
+        Some(p) => {
+            loom_fuzz_fuzz::ForkStateFile::load(p).map_err(|e| format!("--state 加载失败: {e}"))?;
+            loom_fuzz_fuzz::StateSource::StateFile(p.to_path_buf())
+        }
+        None => loom_fuzz_fuzz::StateSource::Genesis,
+    };
+    // 执行地址：fork 态可在真实地址上执行（链上状态归位）。
+    let exec_address: [u8; 20] = match contract_addr {
+        Some(a) => {
+            let b = loom_fuzz_oracle::hex_bytes(a)?;
+            if b.len() != 20 {
+                return Err(format!("--contract-addr 非 20 字节: {a:?}"));
+            }
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&b);
+            addr
+        }
+        None => CONTRACT_ADDRESS,
+    };
+    // fork 后部署：`<addr>:<runtime-hex|responder|responder-sender>`。
+    let mut deployments: Vec<loom_fuzz_fuzz::Deployment> = Vec::new();
+    for d in deploy_flags {
+        let (addr, spec) = d.split_once(':').ok_or_else(|| {
+            format!("--deploy 形态应为 <addr>:<runtime-hex|responder|responder-sender>: {d:?}")
+        })?;
+        let address_bytes = loom_fuzz_oracle::hex_bytes(addr)?;
+        if address_bytes.len() != 20 {
+            return Err(format!("--deploy 地址非 20 字节: {addr:?}"));
+        }
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&address_bytes);
+        let runtime = match spec {
+            "responder" => loom_fuzz_fuzz::responder_runtime({
+                let mut w = [0u8; 32];
+                w[31] = 1; // 通用非零应答
+                w
+            }),
+            "responder-sender" => loom_fuzz_fuzz::responder_runtime_sender(),
+            hex => loom_fuzz_oracle::hex_bytes(hex)?,
+        };
+        deployments.push(loom_fuzz_fuzz::Deployment { address, runtime });
+    }
     let dict_extra: Vec<U256> = dict_words
         .iter()
         .map(|w| hex_u256(w))
@@ -251,13 +429,15 @@ fn cmd_run(
 
         let cfg = ExecConfig {
             code: hitset.code.clone(),
-            address: CONTRACT_ADDRESS,
+            address: exec_address,
             prestate: prestate.clone(),
             seed_rng: seed,
             max_runs,
             time_budget: Duration::from_secs(time_budget_secs),
             gas_per_tx,
             run_baseline: !baseline_seen,
+            state_source: state_source.clone(),
+            deployments: deployments.clone(),
         };
         // ABI 形态基座种子：seed 编译器 M0 不产动态尾（其 assumption
         // 如实记录），管线泛型补 n = 1..=4 个零参槽 + 指针尾（末槽 =
@@ -415,7 +595,7 @@ fn abi_tail() -> Tail {
 /// 含 "loom" 前缀——≥4 字节，满足 oracle 的 trivial 长度下限。
 /// n 到 9：真实函数头宽可达 0x120（9 槽，如 anySwapOut*WithPermit
 /// 的 msg.data.length ≥ 4+0x120 守卫）。
-fn abi_base_seeds(selector: u32) -> Vec<SeedInput> {
+pub(crate) fn abi_base_seeds(selector: u32) -> Vec<SeedInput> {
     let tail_bytes = match abi_tail() {
         Tail::Bytes(b) => b,
         _ => unreachable!("abi_tail 恒 Bytes"),

@@ -55,6 +55,7 @@ loom-evm 反编译产出的静态事实直接编译成 fuzz 的输入空间：
 - **M0.4**：`crates/fuzz` revm 单合约定向执行器——CFG PC 距离制导 + witness 记录（#5；revm 42 / CANCUN，确定性 xorshift64* 进化环 + 纯随机基线对照）
 - **M0.5**：`crates/oracle` arbitrary_call 族 oracle + 三值判决 + `loom-fuzz` CLI 管线（run/replay，poc.json 一键重放 verdict 逐字节一致，#7）
 - **M0.6**：`crates/pocgen` exploit 影响层——L1 witness → L2 价值影响 Foundry PoC，forge test 绿灯 = 终判（#10，fork 模式 = BlockMachine）
+- **M0.7**：fork 链上状态执行——fetch-state 两阶段物化（state.json）+ 本地 overlay（prestate/deployment），真实合约真实状态上跑定向执行（#21，BlockMachine keyless/bearer 双路）
 
 ```sh
 loom-fuzz run --shard hit.lst --code bytecode.hex --prestate slots.json --out out/

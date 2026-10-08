@@ -148,6 +148,7 @@ mod tests {
                 outcome: loom_fuzz_fuzz::OutcomeKind::Stop,
                 gas_used: 0,
                 truncated: false,
+                deployments: Vec::new(),
             },
             pc: 1,
             evidence_call: loom_fuzz_fuzz::RecordedCall {

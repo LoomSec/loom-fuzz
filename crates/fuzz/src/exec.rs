@@ -20,6 +20,62 @@ use crate::mutate::{input_key, random_input};
 use crate::mutators::{const_pool, mutate, MutCtx, Pools};
 use crate::rng::Rng;
 
+/// fork 状态来源（issue #21）：Genesis = 空库（默认，现状）；
+/// StateFile = fetch-state 物化的链上状态（两阶段物化产物），
+/// 执行时 hydration 进 CacheDB，prestate/deployment overlay 照旧。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateSource {
+    #[default]
+    Genesis,
+    StateFile(std::path::PathBuf),
+}
+
+/// fork 后的攻击合约部署（setUp etch——"fork 后部署攻击合约"，
+/// overlay 在状态与 prestate 之上）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deployment {
+    pub address: [u8; 20],
+    pub runtime: Vec<u8>,
+}
+
+/// 通用应答 runtime 构造器（**零签名感知**）：任何 call 返回固定
+/// 32 字节字。逐指令：
+///   PUSH32 word     ; 应答字
+///   PUSH1 0; MSTORE ; mem[0..32] = word
+///   PUSH1 32; PUSH1 0; RETURN
+pub fn responder_runtime(word: [u8; 32]) -> Vec<u8> {
+    let mut code = Vec::with_capacity(38);
+    code.push(0x7f);
+    code.extend_from_slice(&word);
+    code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    code
+}
+
+/// responder 特例：返回 msg.sender（160 位左对齐）——"谁问都是
+/// 调用者本人"。附带**被调记录**：slot 0 = 1（被调 flag，PoC L1
+/// 断言用），slot 1 = msg.sender（身份仿冒链记录，PoC L2 断言用）。
+/// 逐指令：CALLER; PUSH1 1; SSTORE（slot1=caller）→ CALLER;
+/// PUSH1 0x60; SHL; PUSH1 0; MSTORE（返回字）→ PUSH1 1; PUSH1 0;
+/// SSTORE（flag）→ PUSH1 32; PUSH1 0; RETURN。
+pub fn responder_runtime_sender() -> Vec<u8> {
+    vec![
+        0x33, // CALLER
+        0x60, 0x01, // PUSH1 1
+        0x55, // SSTORE：slot 1 = msg.sender
+        0x33, // CALLER
+        0x60, 0x60, // PUSH1 96
+        0x1b, // SHL
+        0x60, 0x00, // PUSH1 0
+        0x52, // MSTORE
+        0x60, 0x01, // PUSH1 1
+        0x60, 0x00, // PUSH1 0
+        0x55, // SSTORE：slot 0 = 1（被调 flag）
+        0x60, 0x20, // PUSH1 32
+        0x60, 0x00, // PUSH1 0
+        0xf3, // RETURN
+    ]
+}
+
 /// 会话配置：合约字节码 + prestate 布置 + 预算 + 确定性种子。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecConfig {
@@ -38,6 +94,12 @@ pub struct ExecConfig {
     pub time_budget: Duration,
     /// 每 run 的 tx gas limit。燃料耗尽 → 该 run 如实标 truncated。
     pub gas_per_tx: u64,
+    /// fork 状态来源（默认 Genesis = 空库现状）。
+    #[serde(default)]
+    pub state_source: StateSource,
+    /// fork 后部署的攻击合约（setUp etch，overlay 在状态/prestate 上）。
+    #[serde(default)]
+    pub deployments: Vec<Deployment>,
     /// 是否跑纯随机基线（默认建议 true；`baseline_runs_to_reach`
     /// 是制导收益数据）。基线同预算、selector 固定为目标 selector、
     /// 无种子无制导。
@@ -98,6 +160,9 @@ pub struct WitnessTrace {
     /// 本 run 是否被截断（燃料耗尽或步数上限）。SessionReport 的
     /// `truncated` 取自报告所基于的这次 run。
     pub truncated: bool,
+    /// 本 run 生效的 fork 后部署（来自 ExecConfig；witness 记录）。
+    #[serde(default)]
+    pub deployments: Vec<Deployment>,
 }
 
 /// 会话报告：全部 serde，poc.json 直接复用 best_input / trace。
@@ -328,6 +393,7 @@ impl<'a> Session<'a> {
                         outcome: OutcomeKind::Invalid,
                         gas_used: 0,
                         truncated: false,
+                        deployments: Vec::new(),
                     },
                 )
             }
@@ -378,6 +444,8 @@ mod tests {
             time_budget: Duration::from_secs(5),
             gas_per_tx: 100_000,
             run_baseline: false,
+            state_source: Default::default(),
+            deployments: Vec::new(),
         };
         let seeds = vec![Input {
             selector: 0,
@@ -421,6 +489,8 @@ mod tests {
             time_budget: Duration::from_secs(5),
             gas_per_tx: 100_000,
             run_baseline: false,
+            state_source: Default::default(),
+            deployments: Vec::new(),
         };
         let report = run_targeted(&cfg, &target, &[], &ValueDictionary { words: vec![] });
         assert!(!report.reached);

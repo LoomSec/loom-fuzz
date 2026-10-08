@@ -51,8 +51,25 @@ pub struct Poc {
     /// shard，用它作求值承诺重放臂 1 判定（witness 变了即不一致）。
     #[serde(default)]
     pub evidence_value: Option<String>,
+    /// fork 状态引用（fetch-state 的 state.json 路径；Genesis = null）。
+    #[serde(default)]
+    pub state: Option<String>,
+    /// 执行地址（fork 态在真实地址上执行；缺省 = 管线固定 0x2222…22）。
+    #[serde(default)]
+    pub contract: Option<String>,
+    /// fork 后部署的攻击合约（pocgen 据此刻蚀应答/攻击 runtime）。
+    #[serde(default)]
+    pub deployments: Vec<PocDeployment>,
     /// 手写 replay 命令串（含本文件名）。
     pub replay: String,
+}
+
+/// fork 后部署（poc.json 形态）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PocDeployment {
+    /// "0x" + 40 hex
+    pub address: String,
+    pub runtime_hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +244,19 @@ pub fn build_poc(
         max_runs,
         time_budget_secs,
         evidence_value: witness.evidence_value.clone(),
+        state: match &cfg.state_source {
+            loom_fuzz_fuzz::StateSource::Genesis => None,
+            loom_fuzz_fuzz::StateSource::StateFile(p) => Some(p.to_string_lossy().into_owned()),
+        },
+        contract: Some(bytes_hex(&cfg.address)),
+        deployments: cfg
+            .deployments
+            .iter()
+            .map(|d| PocDeployment {
+                address: bytes_hex(&d.address),
+                runtime_hex: bytes_hex(&d.runtime),
+            })
+            .collect(),
         replay,
     })
 }
@@ -265,13 +295,44 @@ pub fn replay(
 
     let cfg = ExecConfig {
         code: code.to_vec(),
-        address: [0x22; 20], // 与 run 管线同一固定合约地址
+        address: match &poc.contract {
+            Some(a) => {
+                let b = hex_bytes(a)?;
+                if b.len() != 20 {
+                    return Err("poc.contract 非 20 字节".to_string());
+                }
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&b);
+                addr
+            }
+            None => [0x22; 20], // 与 run 管线同一固定合约地址
+        },
         prestate,
         seed_rng: poc.seed,
         max_runs: poc.max_runs.max(1),
         time_budget: Duration::from_secs(poc.time_budget_secs.max(60)),
         gas_per_tx: 1_000_000,
         run_baseline: false,
+        state_source: match &poc.state {
+            Some(p) => loom_fuzz_fuzz::StateSource::StateFile(std::path::PathBuf::from(p)),
+            None => loom_fuzz_fuzz::StateSource::Genesis,
+        },
+        deployments: poc
+            .deployments
+            .iter()
+            .map(|d| {
+                let b = hex_bytes(&d.address)?;
+                if b.len() != 20 {
+                    return Err("poc.deployment.address 非 20 字节".to_string());
+                }
+                let mut a = [0u8; 20];
+                a.copy_from_slice(&b);
+                Ok(loom_fuzz_fuzz::Deployment {
+                    address: a,
+                    runtime: hex_bytes(&d.runtime_hex)?,
+                })
+            })
+            .collect::<Result<_, String>>()?,
     };
     let selector = u32::from_str_radix(poc.selector.trim_start_matches("0x"), 16)
         .map_err(|e| format!("poc.selector 非法: {e}"))?;
@@ -370,6 +431,7 @@ mod tests {
                     outcome: OutcomeKind::Stop,
                     gas_used: 1,
                     truncated: false,
+                    deployments: Vec::new(),
                 },
                 input,
                 pc: 384,
@@ -392,6 +454,8 @@ mod tests {
             time_budget: Duration::from_secs(5),
             gas_per_tx: 100_000,
             run_baseline: false,
+            state_source: Default::default(),
+            deployments: Vec::new(),
         };
         (report, cfg)
     }

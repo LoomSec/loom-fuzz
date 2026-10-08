@@ -136,6 +136,9 @@ loom-fuzz run --shard x.lst --code bytecode.hex [--prestate slots.json]   [--pac
   [--seed N] [--max-runs N] [--gas-per-tx N] [--dict-word 0x..]... [--out dir]
 # 重放 poc.json：重建会话重跑判决；exit 0 = verdict 与记录一致
 loom-fuzz replay poc-….json --code bytecode.hex [--prestate slots.json]
+# fork 状态物化 / fork 态执行
+loom-fuzz fetch-state --shard x.lst --code bytecode.hex --block latest   --contract-addr 0x… [--probe-calldata 0x…] --out state.json
+loom-fuzz run … --state state.json --contract-addr 0x…   --deploy 0x…:responder-sender   # 或 <hex runtime> / responder
 # L2 exploit 影响层：confirmed poc.json → Foundry 工程 + forge test
 loom-fuzz exploit poc-….json --code bytecode.hex --out exploit/ [--fork]
 ```
