@@ -310,6 +310,38 @@ pub fn dominating_guards(
         .collect()
 }
 
+/// 模式 A 回填：由 `(fn_idx, step)` 在展开流里定位 call 效果，给出
+/// 证据表达式 id 与检测臂——形状判定与 `detect_arbitrary_call` 同源
+///（loom query 已定罪，此处不重复 caller_checked/whitelisted 检查）。
+/// 定位不到 = 两模式步序语义分歧，fail-closed 报 `None`。
+pub fn classify_hit(
+    view: &Xlayer<'_>,
+    fn_idx: usize,
+    step: u32,
+) -> Option<(u32, loom_fuzz_oracle::CallArm)> {
+    let entries = view.expand(fn_idx)?;
+    let entry = entries.iter().find(|e| match e {
+        XEntry::Effect { kind, step: i, .. } => kind == "call" && *i == step,
+        _ => false,
+    })?;
+    let XEntry::Effect { operands, .. } = entry else {
+        return None;
+    };
+    let operand = |name: &str| operands.iter().find(|(n, _)| n == name).map(|(_, id)| *id);
+    let target = operand("target")?;
+    // 臂 3 优先：非静态 call 且 input 子树含原始 calldata 切片。
+    if let (Some(call_kind), Some(input)) = (operand("call_kind"), operand("input")) {
+        if op_of(view, call_kind).as_deref() != Some("staticcall")
+            && subtree(view, input)
+                .iter()
+                .any(|&n| is_op(view, n, &RAW_FORWARD_OPS))
+        {
+            return Some((target, loom_fuzz_oracle::CallArm::Arm3));
+        }
+    }
+    Some((target, loom_fuzz_oracle::CallArm::Arm1))
+}
+
 /// 内置 arbitrary_call 检测：扫描全部函数的 xlayer 展开流，产出
 /// `(函数, 步序, 证据 operand)` 原始命中集（每函数每步序至多一条，
 /// 臂 1 / 臂 3 并集去重——与 loom 关系语义的去重一致）。

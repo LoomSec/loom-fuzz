@@ -148,13 +148,20 @@ pub fn load_from_cli(
         .into_iter()
         .map(|(f, step, evidence)| {
             let (fn_idx, selector) = resolve_func(&shard_model, f)?;
+            // evidence_expr/arm 与模式 B 同源回填：loom query 只给渲染
+            // 文本，结构化表达式 id 从本仓库展开流按步序定位，保证两
+            // 模式 HitSet 逐字段相等（定位不到 = 步序语义分歧，报错）。
+            let (evidence_expr, arm) = crate::detect::classify_hit(&view, fn_idx, step)
+                .ok_or_else(|| LoadError::StepMalformed {
+                    cell: format!("fn {fn_idx} step {step} 无法在展开流定位 call 效果"),
+                })?;
             Ok(Row {
                 fn_idx,
                 selector,
                 step,
                 evidence,
-                evidence_expr: None,
-                arm: None,
+                evidence_expr: Some(evidence_expr),
+                arm: Some(arm),
             })
         })
         .collect::<Result<Vec<_>, LoadError>>()?;
