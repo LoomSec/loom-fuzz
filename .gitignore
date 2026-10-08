@@ -1,1 +1,4 @@
 /target
+.env
+fuzz_report.json
+poc-*.json

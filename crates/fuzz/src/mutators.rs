@@ -166,6 +166,10 @@ pub(crate) enum HeadOp {
     BoundaryIncDec,
     StorageReplay,
     GaussianScale,
+    /// 多槽协同（issue #25）：k ∈ {2,3} 个不同槽同时从字典/比较池
+    /// 抽词覆写——真实案例（vvisr fork 态）winning witness 需
+    /// "from==字典词 ∧ amount 过阈值"同现，单槽变异 ~1e-6/子代。
+    Coordinated,
 }
 
 /// 变长尾算子编号。
@@ -250,9 +254,10 @@ pub(crate) fn tail_block_replace(tail: &mut [u8], word_idx: usize, word: [u8; 32
 // 单轮变异（随机选择算子 + 单点应用）
 // ---------------------------------------------------------------------------
 
-/// 定长算子按权重随机选一（cmp 25 / const 25 / boundary 20 /
-/// storage 20 / gaussian 10）。池可用性作为参数传入（避开与
-/// rng 的借用冲突）。
+/// 定长算子按权重随机选一（cmp 23 / const 23 / boundary 18 /
+/// storage 16 / gaussian 10 / coordinated 8——低权重专科：同现
+/// 约束场景才赚，常规单槽约束下破坏兄弟槽）。池可用性作为参数
+/// 传入（避开与 rng 的借用冲突）。
 fn pick_head_op(
     rng: &mut Rng,
     has_cmp: bool,
@@ -264,11 +269,15 @@ fn pick_head_op(
     }
     for _ in 0..8 {
         match rng.below(100) {
-            0..=24 if has_cmp => return Some(HeadOp::CmpFeedback),
-            25..=49 if has_const => return Some(HeadOp::ConstOverwrite),
-            50..=69 => return Some(HeadOp::BoundaryIncDec), // 无池依赖
-            70..=89 if has_storage => return Some(HeadOp::StorageReplay),
-            90..=99 => return Some(HeadOp::GaussianScale), // 无池依赖
+            0..=22 if has_cmp => return Some(HeadOp::CmpFeedback),
+            23..=45 if has_const => return Some(HeadOp::ConstOverwrite),
+            46..=63 => return Some(HeadOp::BoundaryIncDec), // 无池依赖
+            64..=79 if has_storage => return Some(HeadOp::StorageReplay),
+            80..=89 => return Some(HeadOp::GaussianScale), // 无池依赖
+            // 协同 = 同现约束专科（低权重：多槽同时覆写常破坏兄弟槽
+            // 的脆弱等值约束——guard-boundary 的 nonce 实测）；需要
+            // 至少一个词池（字典/比较）。
+            90..=97 if has_cmp || has_const => return Some(HeadOp::Coordinated),
             _ => continue,
         }
     }
@@ -320,6 +329,27 @@ pub(crate) fn mutate(parent: &Input, ctx: &mut MutCtx<'_>) -> Input {
                     let pct = SCALES[rng.below(SCALES.len() as u64) as usize];
                     let up = rng.below(2) == 0;
                     child.head[slot] = op_gaussian(child.head[slot], pct, up);
+                }
+                Some(HeadOp::Coordinated) => {
+                    // k ∈ {2,3} 个不同槽，各从比较池/字典 50/50 抽词
+                    // 同时覆写（单算子单应用：一轮一次协同）。k 不超
+                    // 头槽数（头长 1 时退化单槽）。
+                    let k = (2 + rng.below(2) as usize).min(child.head.len());
+                    let mut chosen: Vec<usize> = vec![slot];
+                    while chosen.len() < k {
+                        let s = rng.below(child.head.len() as u64) as usize;
+                        if !chosen.contains(&s) {
+                            chosen.push(s);
+                        }
+                    }
+                    for s in chosen {
+                        let word = if !ctx.cmp_pool.is_empty() && rng.below(2) == 0 {
+                            ctx.cmp_pool[rng.below(ctx.cmp_pool.len() as u64) as usize]
+                        } else {
+                            ctx.consts[rng.below(ctx.consts.len() as u64) as usize]
+                        };
+                        child.head[s] = word.to_be_bytes::<32>();
+                    }
                 }
                 None => legacy_head(rng, &mut child),
             }
@@ -462,6 +492,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            guard_context: Vec::new(),
         }
     }
 
@@ -672,6 +703,9 @@ mod tests {
                 }
                 HeadOp::GaussianScale => {
                     child.head[0] = op_gaussian(child.head[0], 50, true);
+                }
+                HeadOp::Coordinated => {
+                    // 纯效果走 propose 路径；此分集测试只要求不碰 tail。
                 }
             }
             assert_eq!(child.tail, Tail::Bytes(tail_bytes.clone()), "{op:?}");

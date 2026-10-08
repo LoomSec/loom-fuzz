@@ -17,7 +17,7 @@ use loom_fuzz_seed::{Input, Target, ValueDictionary};
 use crate::cfg::DistanceTable;
 use crate::evm;
 use crate::mutate::{input_key, random_input};
-use crate::mutators::{const_pool, mutate, MutCtx, Pools};
+use crate::mutators::{const_pool, Pools};
 use crate::rng::Rng;
 
 /// fork 后的攻击合约部署（CacheDB 本地写 overlay——"fork 后部署
@@ -53,6 +53,9 @@ pub struct ExecConfig {
     /// 攻击合约部署（setUp etch，overlay 在状态/prestate 上）。
     #[serde(default)]
     pub deployments: Vec<Deployment>,
+    /// 支配 guard 上下文（revert 归因用；装载端经 xlayer 渲染 cond）。
+    #[serde(default)]
+    pub guard_context: Vec<GuardContext>,
     /// 是否跑纯随机基线（默认建议 true；`baseline_runs_to_reach`
     /// 是制导收益数据）。基线同预算、selector 固定为目标 selector、
     /// 无种子无制导。
@@ -145,6 +148,67 @@ pub struct SessionReport {
     pub corpus_size: usize,
 }
 
+/// revert 归因（issue #25）：一条支配 guard 的失败记录——执行器在
+/// revert 时归属"最近经过的支配 guard"（visited 序的最后一个 guard
+/// pc；polarity_failed 恒 true = 该 guard 的通过条件未成立）。cond
+/// 由装载端用 xlayer 渲染（loom 特色上下文）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardFeedback {
+    pub pc: u32,
+    pub cond_rendered: String,
+    pub polarity_failed: bool,
+}
+
+/// 执行期支配 guard 上下文（ExecConfig 携带，装载端渲染 cond）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardContext {
+    pub pc: u32,
+    pub cond: String,
+}
+
+/// 单 run 的提案反馈（喂给 Proposer）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunFeedback {
+    pub input: Input,
+    /// 本 run 的结局。
+    pub outcome: OutcomeKind,
+    /// 本 run 的 CFG 距离（fitness）。
+    pub best_distance: u32,
+    /// revert 归因：最近经过的支配 guard（非 revert = None）。
+    pub reverted_guard: Option<GuardFeedback>,
+}
+
+/// 提案预算：数量上限 + 剩余时间（时间制预算）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposalBudget {
+    pub max_candidates: usize,
+    pub time_left: Duration,
+}
+
+/// 提案器上下文：会话每代前刷新的共享池（变异器的池来源）。
+#[derive(Debug, Clone, Copy)]
+pub struct ProposerCtx<'a> {
+    pub consts: &'a [U256],
+    pub cmp_pool: &'a [U256],
+    pub storage_pool: &'a [(U256, U256)],
+}
+
+/// 可插拔提案器（issue #25 分层搜索）： DictionaryProposer =
+/// 既有基座 + 协同变异的封装；LlmProposer = LLM 候选 + 失败回退
+/// 字典（fail-closed）。**判决独立**：judge/oracle 不感知提案器，
+/// LLM 只影响搜索路径不影响判决；replay 无 LLM 参与。
+pub trait Proposer {
+    /// 会话每代前刷新共享池（默认 no-op；dictionary 需要）。
+    fn refresh(&mut self, _ctx: &ProposerCtx<'_>) {}
+    /// 给反馈与预算，产下一批候选。
+    fn propose(&mut self, feedback: &[RunFeedback], budget: ProposalBudget) -> Vec<Input>;
+    /// LLM 提案器的状态排泄（交互落盘 + 失败 assumption）；非 LLM
+    /// 提案器默认空。CLI 据此填 fuzz_report.llm_interactions。
+    fn drain_llm(&mut self) -> (Vec<crate::propose::LlmInteraction>, Vec<String>) {
+        (Vec::new(), Vec::new())
+    }
+}
+
 /// 步数上限（每 run）：gas 之外的硬兜（min gas/opcode ≥ 2，
 /// 正常执行到不了这个量级；防 gas_per_tx 被设成天文数字时单
 /// run 拖死会话）。
@@ -153,15 +217,38 @@ const STEP_CAP: u64 = 10_000_000;
 /// corpus 上限（按 fitness 截断保留）。
 const CORPUS_CAP: usize = 64;
 
+/// 精英集上限（父代选择来源）。
+const ELITE_CAP: usize = 16;
+
 /// 种群下限：种子不足时用随机输入补到该数（多样性）。
 const MIN_POPULATION: usize = 8;
 
-/// 定向执行入口：CFG 距离制导的进化环 + 基线对照。
+/// 定向执行入口：CFG 距离制导的进化环 + 基线对照（默认
+/// DictionaryProposer）。
 pub fn run_targeted(
     cfg: &ExecConfig,
     target: &Target<'_>,
     seeds: &[Input],
     dict: &ValueDictionary,
+) -> SessionReport {
+    run_targeted_with(
+        cfg,
+        target,
+        seeds,
+        dict,
+        &mut crate::propose::DictionaryProposer::new(cfg.seed_rng ^ 0x00D1_C710_AA8E_5EED),
+    )
+}
+
+/// 定向执行入口（提案器可插拔版）：进化环由 `proposer` 驱动——
+/// 每代 refresh 池 → 取反馈窗 → 提案 → 评估。**判决独立**：
+/// oracle/judge 不感知提案器；replay 无 LLM 参与，verdict 一致。
+pub fn run_targeted_with(
+    cfg: &ExecConfig,
+    target: &Target<'_>,
+    seeds: &[Input],
+    dict: &ValueDictionary,
+    proposer: &mut dyn Proposer,
 ) -> SessionReport {
     let table = DistanceTable::new(&cfg.code, target.hit.target_pcs());
 
@@ -186,11 +273,32 @@ pub fn run_targeted(
             break;
         }
     }
-    // 进化环。
-    while !session.reached && session.budget_left() {
-        let parents: Vec<Input> = session.select_parents().into_iter().cloned().collect();
-        for parent in &parents {
-            let child = session.mutate_child(parent, &consts);
+    // 进化环：提案器驱动（默认 DictionaryProposer；LLM 只改搜索路径）。
+    // 连续空代（提案器不产候选）三代即停——防零候选提案器把
+    // 时间预算烧光（fail-closed：无候选 = 搜索无法继续）。
+    let mut empty_gens = 0u32;
+    while !session.reached && session.budget_left() && empty_gens < 3 {
+        let cmp_pool = session.pools.cmp();
+        let storage_pool = session.pools.storage();
+        proposer.refresh(&ProposerCtx {
+            consts: &consts,
+            cmp_pool: &cmp_pool,
+            storage_pool: &storage_pool,
+        });
+        let feedback = session.proposer_feedback();
+        let candidates = proposer.propose(
+            &feedback,
+            ProposalBudget {
+                max_candidates: crate::propose::DEFAULT_MAX_CANDIDATES,
+                time_left: session.time_left(),
+            },
+        );
+        if candidates.is_empty() {
+            empty_gens += 1;
+        } else {
+            empty_gens = 0;
+        }
+        for child in candidates {
             if session.run_one(&child) {
                 break;
             }
@@ -223,6 +331,7 @@ struct Evaluated {
     input: Input,
     fitness: u32,
     trace: WitnessTrace,
+    guard: Option<GuardFeedback>,
 }
 
 /// 会话（制导与基线共用）：预算控制 + corpus + 最优记录。
@@ -242,6 +351,10 @@ struct Session<'a> {
     /// 比较操作数池 + 存储观测池（#6 算子 1/4 的回灌来源，
     /// 会话级累积，去重有上限）。
     pools: Pools,
+    /// 反馈窗（每 run 一条，喂提案器；截 [`FEEDBACK_WINDOW`]）。
+    feedback: Vec<RunFeedback>,
+    /// 精英集：全程 fitness 最优的前 ELITE_CAP（父代选择压力来源）。
+    elite: Vec<Evaluated>,
 }
 
 impl<'a> Session<'a> {
@@ -258,16 +371,34 @@ impl<'a> Session<'a> {
             corpus: Vec::new(),
             corpus_keys: BTreeSet::new(),
             pools: Pools::new(),
+            feedback: Vec::new(),
+            elite: Vec::new(),
         }
     }
 
-    /// 单轮变异：构造 MutCtx（随机源 + 常量池 + 运行时池）后走
-    /// mutators 的组合选择（定长五算子 / 变长尾算子 / legacy 兜底）。
-    fn mutate_child(&mut self, parent: &Input, consts: &[U256]) -> Input {
-        let cmp_pool = self.pools.cmp();
-        let storage_pool = self.pools.storage();
-        let mut ctx = MutCtx::new(&mut self.rng, consts, &cmp_pool, &storage_pool);
-        mutate(parent, &mut ctx)
+    /// 反馈切片：corpus（全史 fitness 最优、去重）+ 最近窗口，截
+    /// FEEDBACK_WINDOW。corpus 与旧 select_parents 的父代池同源——
+    /// 保证 DictionaryProposer 的选择压力与旧进化环一致。
+    fn proposer_feedback(&self) -> Vec<RunFeedback> {
+        let mut out: Vec<RunFeedback> = self
+            .corpus
+            .iter()
+            .map(|e| RunFeedback {
+                input: e.input.clone(),
+                outcome: e.trace.outcome,
+                best_distance: e.fitness,
+                reverted_guard: e.guard.clone(),
+            })
+            .collect();
+        for f in self
+            .feedback
+            .iter()
+            .rev()
+            .take(crate::propose::FEEDBACK_WINDOW.saturating_sub(out.len()))
+        {
+            out.push(f.clone());
+        }
+        out
     }
 
     fn population_len(&self) -> usize {
@@ -282,6 +413,24 @@ impl<'a> Session<'a> {
         self.runs < self.cfg.max_runs && Instant::now() < self.deadline
     }
 
+    fn time_left(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// 记录一条 run 反馈（revert 归因经 RunResult.feedback_guard）。
+    fn push_feedback(&mut self, run: &crate::evm::RunResult, input: &Input, fitness: u32) {
+        self.feedback.push(RunFeedback {
+            input: input.clone(),
+            outcome: run.trace.outcome,
+            best_distance: fitness,
+            reverted_guard: run.feedback_guard.clone(),
+        });
+        let window = crate::propose::FEEDBACK_WINDOW;
+        if self.feedback.len() > window {
+            self.feedback.drain(0..self.feedback.len() - window);
+        }
+    }
+
     /// 评估一个输入：执行 + fitness + 命中/最优/corpus 维护。
     /// 返回 true = 命中（调用方应停止产生新候选）。
     fn run_one(&mut self, input: &Input) -> bool {
@@ -294,6 +443,7 @@ impl<'a> Session<'a> {
         // 对 → 算子 4。
         self.pools.absorb(&result);
         let fitness = self.table.fitness(result.visited_pcs.iter().copied());
+        self.push_feedback(&result, input, fitness);
         let hit_now = result
             .visited_pcs
             .iter()
@@ -302,6 +452,7 @@ impl<'a> Session<'a> {
             input: input.clone(),
             fitness,
             trace: result.trace,
+            guard: result.feedback_guard.clone(),
         };
         if hit_now {
             self.reached = true;
@@ -314,7 +465,15 @@ impl<'a> Session<'a> {
                 input: evaluated.input.clone(),
                 fitness,
                 trace: evaluated.trace.clone(),
+                guard: evaluated.guard.clone(),
             });
+        }
+        // 精英集维护：按 fitness 插入截断（按输入去重）——父代选择
+        // 压力来源（反馈窗只有最近 N 条，全史最优会滚出窗口）。
+        if !self.elite.iter().any(|e| e.input == evaluated.input) {
+            self.elite.push(evaluated.clone());
+            self.elite.sort_by_key(|e| (e.fitness, input_key(&e.input)));
+            self.elite.truncate(ELITE_CAP);
         }
         // 距离创新低 → 入 corpus（去重，cap 按 fitness 截断）。
         if self.corpus_keys.insert(input_key(&evaluated.input)) {
@@ -323,12 +482,6 @@ impl<'a> Session<'a> {
             self.corpus.truncate(CORPUS_CAP);
         }
         false
-    }
-
-    /// 选择父代：corpus 中 fitness 最优的前一半（至少 1）。
-    fn select_parents(&self) -> Vec<&Input> {
-        let keep = (self.corpus.len() / 2).max(1).min(self.corpus.len());
-        self.corpus[..keep].iter().map(|e| &e.input).collect()
     }
 
     fn into_report(self) -> SessionReport {
@@ -399,6 +552,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            guard_context: Vec::new(),
         };
         let seeds = vec![Input {
             selector: 0,
@@ -444,6 +598,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            guard_context: Vec::new(),
         };
         let report = run_targeted(&cfg, &target, &[], &ValueDictionary { words: vec![] });
         assert!(!report.reached);

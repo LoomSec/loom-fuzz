@@ -16,7 +16,7 @@ use std::time::Duration;
 use alloy_primitives::U256;
 use clap::{Parser, Subcommand};
 
-use loom_fuzz_fuzz::{run_targeted, DistanceTable, ExecConfig};
+use loom_fuzz_fuzz::{DistanceTable, ExecConfig};
 use loom_fuzz_oracle::{
     build_poc, coverage, hex_u256, replay, Budgets, FuzzReport, Guidance, Hit, HitEntry, HitReport,
     Poc, Verdict, REPORT_FORMAT,
@@ -64,11 +64,16 @@ enum Cmd {
         /// 确定性种子
         #[arg(long, default_value_t = 0xC0FF_EE00_0000_0001)]
         seed: u64,
-        /// runs 预算上限
-        #[arg(long, default_value_t = 2_000)]
+        /// runs 预算上限（默认 60_000——时间预算先到为准；显式小
+        /// 预算用于定向测试）
+        #[arg(long, default_value_t = 60_000)]
         max_runs: u64,
         /// 时间预算（秒）
-        #[arg(long, default_value_t = 300)]
+        #[arg(
+            long = "time-budget",
+            alias = "time-budget-secs",
+            default_value_t = 300
+        )]
         time_budget_secs: u64,
         /// 每 run 的 tx gas limit
         #[arg(long, default_value_t = 1_000_000)]
@@ -102,6 +107,10 @@ enum Cmd {
         /// 合约自身状态错位）——CLI 强制。
         #[arg(long)]
         contract_addr: Option<String>,
+        /// 提案器：dictionary（默认）或 llm（env LLM_API_BASE/KEY/
+        /// MODEL；失败 fail-closed 回退字典）。
+        #[arg(long, default_value = "dictionary")]
+        proposer: String,
     },
     /// L2 exploit 影响层：poc.json → Foundry 工程 + forge test（绿灯 = 终判）
     Exploit {
@@ -160,6 +169,7 @@ fn run() -> Result<ExitCode, String> {
             fork_block,
             deploy,
             contract_addr,
+            proposer,
         } => cmd_run(
             &shard,
             &code,
@@ -177,6 +187,7 @@ fn run() -> Result<ExitCode, String> {
             &fork_block,
             &deploy,
             contract_addr.as_deref(),
+            &proposer,
         ),
         Cmd::Exploit {
             poc,
@@ -224,6 +235,7 @@ fn cmd_run(
     fork_block: &str,
     deploy_flags: &[String],
     contract_addr: Option<&str>,
+    proposer: &str,
 ) -> Result<ExitCode, String> {
     // 装载（模式 A 需 pack+loom-bin 成对；只给一个 = fail-closed）。
     let hitset = match (pack, loom_bin) {
@@ -311,6 +323,7 @@ fn cmd_run(
 
     // 补充字典词进每个 hit 的编译字典（registry 常量补法）。
     let mut reports: Vec<HitReport> = Vec::new();
+    let mut report_llm_interactions: Vec<loom_fuzz_fuzz::propose::LlmInteraction> = Vec::new();
     let mut hit_entries: Vec<HitEntry> = Vec::new();
     let mut assumptions: Vec<String> = Vec::new();
     let mut corpus_total = 0usize;
@@ -349,6 +362,15 @@ fn cmd_run(
             run_baseline: !baseline_seen,
             fork: fork.clone(),
             deployments: deployments.clone(),
+            // revert 归因上下文：支配 guard（装载端已渲染 cond）。
+            guard_context: hit
+                .dominating_guards
+                .iter()
+                .map(|g| loom_fuzz_fuzz::GuardContext {
+                    pc: g.pc,
+                    cond: g.cond.clone(),
+                })
+                .collect(),
         };
         // ABI 形态基座种子：seed 编译器 M0 不产动态尾（其 assumption
         // 如实记录），管线泛型补 n = 1..=4 个零参槽 + 指针尾（末槽 =
@@ -375,7 +397,59 @@ fn cmd_run(
                 }
             }
         }
-        let session = run_targeted(&cfg, &target, &seeds, &seed_out.dict);
+        // 全槽字典基座（issue #25）：**全字典词** × 槽位变体——
+        // 与 --dict-word 的保留通道同机制，覆盖字典里的运行时/静态
+        // 词（token 地址、阈值常量等）。规模上限 64：超了按字典序
+        // 截断并记 assumption（落 fuzz_report）。
+        let (base, note) = full_dict_base(seeds.len(), hit.selector, &seed_out.dict.words);
+        seeds.extend(base);
+        if let Some(note) = note {
+            if !seed_out.assumptions.contains(&note) {
+                seed_out.assumptions.push(note);
+            }
+        }
+        // 提案器（分层搜索，issue #25）：默认 dictionary；--proposer
+        // llm 走 LLM 候选 + 字典回退（判决独立，replay 无 LLM）。
+        let mut proposer_box: Box<dyn loom_fuzz_fuzz::Proposer> = match proposer {
+            "dictionary" => Box::new(loom_fuzz_fuzz::DictionaryProposer::new(
+                cfg.seed_rng ^ 0x00D1_C710_AA8E_5EED,
+            )),
+            "llm" => {
+                let llm_cfg = loom_fuzz_fuzz::llm::LlmConfig::from_env().ok_or_else(|| {
+                    "LLM_API_KEY 未设置（--proposer llm 需要；失败也不会静默，先 fail-closed 拒绝）"
+                        .to_string()
+                })?;
+                Box::new(loom_fuzz_fuzz::llm::LlmProposer::new(
+                    llm_cfg,
+                    hit.selector,
+                    hit.target_pcs.clone(),
+                    hit.dominating_guards
+                        .iter()
+                        .map(|g| (g.pc, g.cond.clone()))
+                        .collect(),
+                    seed_out.dict.words.iter().take(24).copied().collect(),
+                    cfg.seed_rng ^ 0x00D1_C710_AA8E_5EED,
+                ))
+            }
+            other => return Err(format!("--proposer 只支持 dictionary|llm: {other:?}")),
+        };
+        let session = loom_fuzz_fuzz::run_targeted_with(
+            &cfg,
+            &target,
+            &seeds,
+            &seed_out.dict,
+            &mut *proposer_box,
+        );
+        // LLM 交互/失败 assumption 落盘（dictionary 路线为空）。
+        {
+            let (interactions, llm_notes) = proposer_box.drain_llm();
+            report_llm_interactions.extend(interactions);
+            for a in llm_notes {
+                if !assumptions.contains(&a) {
+                    assumptions.push(a);
+                }
+            }
+        }
         let calldata = loom_fuzz_oracle::calldata_of(
             session
                 .best_input
@@ -448,6 +522,7 @@ fn cmd_run(
         coverage: coverage(&reports, table.executable_pc_count()),
         corpus: corpus_total,
         assumptions,
+        llm_interactions: report_llm_interactions,
         guidance: Guidance {
             guided_best_runs_total: guided_runs_total,
             baseline_runs_to_reach: baseline,
@@ -470,6 +545,27 @@ fn cmd_run(
 /// 补充常量的槽位扫描变体：n ∈ 1..=9 词头、第 k 槽 = 常量、其余
 /// 零、无尾——"哪个槽该填哪个常量"由执行验证（不假设 ABI 形参
 /// 位置；如 anyswap 的 code-size 守卫要求某槽 = 带码地址）。
+/// 种子的字典序键（去重/截断用；与 seed crate 的 sort_key 同形）。
+fn seed_sort_key(s: &SeedInput) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + 20 + 32 + s.head.len() * 32 + 8);
+    key.extend_from_slice(&s.selector.to_be_bytes());
+    key.extend_from_slice(&s.caller);
+    key.extend_from_slice(&s.value.to_be_bytes::<32>());
+    for word in &s.head {
+        key.extend_from_slice(word);
+    }
+    match &s.tail {
+        Tail::Empty => key.push(0),
+        Tail::Bytes(b) => {
+            key.push(1);
+            key.extend_from_slice(&(b.len() as u64).to_be_bytes());
+            key.extend_from_slice(b);
+        }
+        Tail::Free => key.push(2),
+    }
+    key
+}
+
 fn dict_slot_variants(selector: u32, word: U256) -> Vec<SeedInput> {
     let mut out = Vec::new();
     for n in 1..=9usize {
@@ -607,4 +703,67 @@ fn cmd_replay(
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// 全槽字典基座：全字典词 × 槽位变体（裸头 + 带尾基座），执行
+/// 验证选槽。规模上限 64（`reserved` = 保留通道已占额度，超出
+/// 部分按字典序截断，返回截断 assumption）。
+fn full_dict_base(
+    reserved: usize,
+    selector: u32,
+    dict_words: &[U256],
+) -> (Vec<SeedInput>, Option<String>) {
+    const BASE_CAP: usize = 64;
+    let mut candidates: Vec<SeedInput> = Vec::new();
+    for w in dict_words {
+        candidates.extend(dict_slot_variants(selector, *w));
+        for base in abi_base_seeds(selector) {
+            for k in 0..base.head.len() {
+                let mut variant = base.clone();
+                variant.head[k] = w.to_be_bytes::<32>();
+                candidates.push(variant);
+            }
+        }
+    }
+    // 去重（字节序键）+ 字典序截断到剩余额度。
+    candidates.sort_by_key(seed_sort_key);
+    candidates.dedup_by_key(|s| seed_sort_key(s));
+    let budget = BASE_CAP.saturating_sub(reserved);
+    let total = candidates.len();
+    let note = (total > budget).then(|| {
+        format!(
+            "全槽字典基座：词×槽变体 {total} 超上限额度 {budget}（保留通道 {reserved}），按字典序截断，未收录变体留搜索空间"
+        )
+    });
+    (candidates.into_iter().take(budget).collect(), note)
+}
+
+#[cfg(test)]
+mod seed_base_tests {
+    use super::*;
+
+    #[test]
+    fn full_dict_base_caps_at_64_with_assumption() {
+        // 500 个词 × 9 槽 × 2 族 ≫ 64：截断 + assumption。
+        let words: Vec<U256> = (0..500u64).map(U256::from).collect();
+        let (seeds, note) = full_dict_base(10, 0xdeadbeef, &words);
+        assert!(seeds.len() <= 54, "截断到 64-reserved");
+        assert!(note.unwrap().contains("按字典序截断"));
+        // 确定性：同输入同输出。
+        let (seeds2, _) = full_dict_base(10, 0xdeadbeef, &words);
+        assert_eq!(seeds, seeds2);
+    }
+
+    #[test]
+    fn full_dict_base_two_words_truncates_deterministically() {
+        // 每词 ≥99 变体（9 裸头 + 9×10 槽基座×两族），2 词 ≫ 64：
+        // 必截断（assumption 如实），且截断确定性。
+        let words = vec![U256::from(1u64), U256::from(0x42u64)];
+        let (seeds, note) = full_dict_base(0, 0xdeadbeef, &words);
+        assert!(note.unwrap().contains("按字典序截断"));
+        assert!(!seeds.is_empty());
+        assert!(seeds.len() <= 64);
+        let (seeds2, _) = full_dict_base(0, 0xdeadbeef, &words);
+        assert_eq!(seeds, seeds2);
+    }
 }

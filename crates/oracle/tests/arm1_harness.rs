@@ -77,6 +77,7 @@ fn session() -> loom_fuzz_fuzz::SessionReport {
         run_baseline: false,
         fork: None,
         deployments: Vec::new(),
+        guard_context: Vec::new(),
     };
     let hit = HarnessHit;
     let target = Target { hit: &hit, func: 0 };
