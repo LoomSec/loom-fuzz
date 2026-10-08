@@ -42,6 +42,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // 子命令旗面天然不均
 enum Cmd {
     /// 跑完整闭环：装载 → seed → fuzz → oracle → fuzz_report.json (+ poc.json)
     Run {
@@ -84,6 +85,23 @@ enum Cmd {
         /// forge test（--emit-poc <dir>）
         #[arg(long)]
         emit_poc: Option<PathBuf>,
+        /// on-demand fork：JSON-RPC URL（env BLOCKMACHINE_RPC_URL 兜底，
+        /// 默认 https://rpc-eth.blockmachine.io）。
+        #[arg(long)]
+        fork_url: Option<String>,
+        /// pin block（数字/"latest"——latest 先解析成具体块号，确定性
+        /// 前提）。
+        #[arg(long, default_value = "latest")]
+        fork_block: String,
+        /// fork 后部署攻击合约（可多次）：`<addr>:<runtime-hex 或
+        /// responder 或 responder-sender>`（responder = 任何 call 返回
+        /// 0x01…，responder-sender = 返回 msg.sender，ABI 右对齐）。
+        #[arg(long = "deploy")]
+        deploy: Vec<String>,
+        /// 分析合约的链上真实地址：fork 态必须在真实地址上执行（否则
+        /// 合约自身状态错位）——CLI 强制。
+        #[arg(long)]
+        contract_addr: Option<String>,
     },
     /// L2 exploit 影响层：poc.json → Foundry 工程 + forge test（绿灯 = 终判）
     Exploit {
@@ -138,6 +156,10 @@ fn run() -> Result<ExitCode, String> {
             dict_word,
             out,
             emit_poc,
+            fork_url,
+            fork_block,
+            deploy,
+            contract_addr,
         } => cmd_run(
             &shard,
             &code,
@@ -151,6 +173,10 @@ fn run() -> Result<ExitCode, String> {
             &dict_word,
             &out,
             emit_poc.as_deref(),
+            fork_url.as_deref(),
+            &fork_block,
+            &deploy,
+            contract_addr.as_deref(),
         ),
         Cmd::Exploit {
             poc,
@@ -194,6 +220,10 @@ fn cmd_run(
     dict_words: &[String],
     out_dir: &Path,
     emit_poc: Option<&Path>,
+    fork_url: Option<&str>,
+    fork_block: &str,
+    deploy_flags: &[String],
+    contract_addr: Option<&str>,
 ) -> Result<ExitCode, String> {
     // 装载（模式 A 需 pack+loom-bin 成对；只给一个 = fail-closed）。
     let hitset = match (pack, loom_bin) {
@@ -209,6 +239,65 @@ fn cmd_run(
         (None, Some(_)) => return Err("给了 --loom-bin 缺 --pack（模式 A 需要成对）".to_string()),
     };
     let prestate = read_prestate(prestate_path)?;
+    // on-demand fork：pin block（latest → eth_blockNumber 具体块号）+
+    // 执行地址归位（fork 态强制 --contract-addr，否则合约自身状态
+    // 错位——fail-closed）。
+    let key = std::env::var("BLOCKMACHINE_API_KEY").unwrap_or_default();
+    let fork = match fork_url {
+        Some(_) => {
+            let url = fork_url
+                .map(str::to_string)
+                .or_else(|| std::env::var("BLOCKMACHINE_RPC_URL").ok())
+                .unwrap_or_else(|| "https://rpc-eth.blockmachine.io".to_string());
+            let block_number = loom_fuzz_fuzz::pin_block(&url, &key, fork_block)?;
+            Some(loom_fuzz_fuzz::ForkConfig {
+                rpc_url: url,
+                block_number,
+            })
+        }
+        None => None,
+    };
+    if fork.is_some() && contract_addr.is_none() {
+        return Err(
+            "fork 态必须 --contract-addr <真实地址>（执行地址归位，否则合约自身状态错位）"
+                .to_string(),
+        );
+    }
+    let exec_address: [u8; 20] = match contract_addr {
+        Some(a) => {
+            let b = loom_fuzz_oracle::hex_bytes(a)?;
+            if b.len() != 20 {
+                return Err(format!("--contract-addr 非 20 字节: {a:?}"));
+            }
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&b);
+            addr
+        }
+        None => CONTRACT_ADDRESS,
+    };
+    // fork 后部署：`<addr>:<runtime-hex|responder|responder-sender>`。
+    let mut deployments: Vec<loom_fuzz_fuzz::Deployment> = Vec::new();
+    for d in deploy_flags {
+        let (addr, spec) = d.split_once(':').ok_or_else(|| {
+            format!("--deploy 形态应为 <addr>:<runtime-hex|responder|responder-sender>: {d:?}")
+        })?;
+        let address_bytes = loom_fuzz_oracle::hex_bytes(addr)?;
+        if address_bytes.len() != 20 {
+            return Err(format!("--deploy 地址非 20 字节: {addr:?}"));
+        }
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&address_bytes);
+        let runtime = match spec {
+            "responder" => loom_fuzz_fuzz::responder_runtime({
+                let mut w = [0u8; 32];
+                w[31] = 1;
+                w
+            }),
+            "responder-sender" => loom_fuzz_fuzz::responder_runtime_sender(),
+            hex => loom_fuzz_oracle::hex_bytes(hex)?,
+        };
+        deployments.push(loom_fuzz_fuzz::Deployment { address, runtime });
+    }
     let dict_extra: Vec<U256> = dict_words
         .iter()
         .map(|w| hex_u256(w))
@@ -251,13 +340,15 @@ fn cmd_run(
 
         let cfg = ExecConfig {
             code: hitset.code.clone(),
-            address: CONTRACT_ADDRESS,
+            address: exec_address,
             prestate: prestate.clone(),
             seed_rng: seed,
             max_runs,
             time_budget: Duration::from_secs(time_budget_secs),
             gas_per_tx,
             run_baseline: !baseline_seen,
+            fork: fork.clone(),
+            deployments: deployments.clone(),
         };
         // ABI 形态基座种子：seed 编译器 M0 不产动态尾（其 assumption
         // 如实记录），管线泛型补 n = 1..=4 个零参槽 + 指针尾（末槽 =
@@ -273,6 +364,16 @@ fn cmd_run(
         for w in &dict_extra {
             seeds.push(registry_candidate_seed(hit.selector, *w));
             seeds.extend(dict_slot_variants(hit.selector, *w));
+            // 基座变体：常量落槽在 **ABI 形态基座**上（带指针尾）——
+            // 动态形参函数（vvisr deposit 的 bytes 形参）裸头变体
+            // 死在解码器，组合（常量×基座尾）只能等进化碰运气。
+            for base in abi_base_seeds(hit.selector) {
+                for k in 0..base.head.len() {
+                    let mut variant = base.clone();
+                    variant.head[k] = w.to_be_bytes::<32>();
+                    seeds.push(variant);
+                }
+            }
         }
         let session = run_targeted(&cfg, &target, &seeds, &seed_out.dict);
         let calldata = loom_fuzz_oracle::calldata_of(
@@ -421,17 +522,23 @@ fn abi_base_seeds(selector: u32) -> Vec<SeedInput> {
         _ => unreachable!("abi_tail 恒 Bytes"),
     };
     (1..=9)
-        .map(|n| {
-            let mut head = vec![[0u8; 32]; n];
-            // 指针槽 = 头宽（n×32，可超 255——n 到 9 = 0x120）。
-            head[n - 1] = U256::from(n as u64 * 0x20).to_be_bytes::<32>();
-            SeedInput {
+        .flat_map(|n| {
+            // 双假设：指针槽 = 头宽（ABI 标准形）**或全零**（动态形参
+            // 偏移 0/未用形——vvisr deposit 实测 winning witness 是
+            // word2=0 + 尾原样在场）。两个形态都进搜索空间。
+            let pointer = {
+                let mut head = vec![[0u8; 32]; n];
+                head[n - 1] = U256::from(n as u64 * 0x20).to_be_bytes::<32>();
+                head
+            };
+            let zero = vec![[0u8; 32]; n];
+            [pointer, zero].into_iter().map(|head| SeedInput {
                 selector,
                 caller: [0x33; 20],
                 value: U256::ZERO,
                 head,
                 tail: Tail::Bytes(tail_bytes.clone()),
-            }
+            })
         })
         .collect()
 }

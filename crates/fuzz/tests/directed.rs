@@ -137,6 +137,8 @@ fn exec_config(
         time_budget: Duration::from_secs(300),
         gas_per_tx: 1_000_000,
         run_baseline: baseline,
+        fork: None,
+        deployments: Vec::new(),
     }
 }
 

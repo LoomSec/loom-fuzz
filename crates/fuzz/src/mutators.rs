@@ -460,6 +460,8 @@ mod tests {
             time_budget: Duration::from_secs(5),
             gas_per_tx: 100_000,
             run_baseline: false,
+            fork: None,
+            deployments: Vec::new(),
         }
     }
 

@@ -106,11 +106,15 @@
 mod cfg;
 mod evm;
 mod exec;
+mod fork;
 mod mutate;
 mod mutators;
 mod rng;
 
 pub use cfg::DistanceTable;
-pub use exec::{run_targeted, ExecConfig, OutcomeKind, RecordedCall, SessionReport, WitnessTrace};
+pub use exec::{
+    run_targeted, Deployment, ExecConfig, OutcomeKind, RecordedCall, SessionReport, WitnessTrace,
+};
+pub use fork::{pin_block, responder_runtime, responder_runtime_sender, ForkConfig, ForkDb};
 pub use loom_fuzz_seed::{HitView, Input, Tail, Target, ValueDictionary};
 pub use rng::Rng;

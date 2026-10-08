@@ -143,6 +143,7 @@ mod tests {
                 tail: loom_fuzz_fuzz::Tail::Empty,
             },
             trace: loom_fuzz_fuzz::WitnessTrace {
+                deployments: Vec::new(),
                 visited_pcs: vec![1, 2, 3],
                 calls: Vec::new(),
                 outcome: loom_fuzz_fuzz::OutcomeKind::Stop,

@@ -280,6 +280,7 @@ mod tests {
                 outcome: OutcomeKind::Stop,
                 gas_used: 1,
                 truncated,
+                deployments: Vec::new(),
             },
             truncated,
             runs_completed: 1,

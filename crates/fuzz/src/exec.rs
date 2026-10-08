@@ -20,6 +20,14 @@ use crate::mutate::{input_key, random_input};
 use crate::mutators::{const_pool, mutate, MutCtx, Pools};
 use crate::rng::Rng;
 
+/// fork 后的攻击合约部署（CacheDB 本地写 overlay——"fork 后部署
+/// 攻击合约"；Genesis 态同样可用）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deployment {
+    pub address: [u8; 20],
+    pub runtime: Vec<u8>,
+}
+
 /// 会话配置：合约字节码 + prestate 布置 + 预算 + 确定性种子。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecConfig {
@@ -38,6 +46,13 @@ pub struct ExecConfig {
     pub time_budget: Duration,
     /// 每 run 的 tx gas limit。燃料耗尽 → 该 run 如实标 truncated。
     pub gas_per_tx: u64,
+    /// on-demand fork（None = Genesis 空库，默认现状）：AlloyDB 远程
+    /// 状态 + CacheDB overlay，pin block 确定性。
+    #[serde(default)]
+    pub fork: Option<crate::fork::ForkConfig>,
+    /// 攻击合约部署（setUp etch，overlay 在状态/prestate 上）。
+    #[serde(default)]
+    pub deployments: Vec<Deployment>,
     /// 是否跑纯随机基线（默认建议 true；`baseline_runs_to_reach`
     /// 是制导收益数据）。基线同预算、selector 固定为目标 selector、
     /// 无种子无制导。
@@ -98,6 +113,9 @@ pub struct WitnessTrace {
     /// 本 run 是否被截断（燃料耗尽或步数上限）。SessionReport 的
     /// `truncated` 取自报告所基于的这次 run。
     pub truncated: bool,
+    /// 本 run 生效的部署（witness 记录；poc.json 落盘）。
+    #[serde(default)]
+    pub deployments: Vec<Deployment>,
 }
 
 /// 会话报告：全部 serde，poc.json 直接复用 best_input / trace。
@@ -328,6 +346,7 @@ impl<'a> Session<'a> {
                         outcome: OutcomeKind::Invalid,
                         gas_used: 0,
                         truncated: false,
+                        deployments: Vec::new(),
                     },
                 )
             }
@@ -378,6 +397,8 @@ mod tests {
             time_budget: Duration::from_secs(5),
             gas_per_tx: 100_000,
             run_baseline: false,
+            fork: None,
+            deployments: Vec::new(),
         };
         let seeds = vec![Input {
             selector: 0,
@@ -421,6 +442,8 @@ mod tests {
             time_budget: Duration::from_secs(5),
             gas_per_tx: 100_000,
             run_baseline: false,
+            fork: None,
+            deployments: Vec::new(),
         };
         let report = run_targeted(&cfg, &target, &[], &ValueDictionary { words: vec![] });
         assert!(!report.reached);
