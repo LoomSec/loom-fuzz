@@ -33,18 +33,19 @@
 //! 规范化切分（head = 完整 32B 块，tail = 余字节），序列化回
 //! calldata 逐字节相同，执行等价。
 
+pub mod eval;
 mod family;
 mod hit;
 mod poc;
 mod report;
 pub mod verdict;
 
-pub use family::{check_arbitrary_call, CallCheck};
-pub use hit::{GuardFact, Hit, SELECTOR_SENTINEL};
+pub use family::{check_arbitrary_call, CallCheck, CheckInput};
+pub use hit::{CallArm, GuardFact, Hit, SELECTOR_SENTINEL};
 pub use poc::{
     build_poc, bytes_hex, calldata_of, hex_bytes, hex_u256, input_from_calldata, replay, Poc,
     PocTx, POC_FORMAT,
 };
 pub use report::{coverage, Budgets, Coverage, FuzzReport, Guidance, HitEntry, REPORT_FORMAT};
 pub use verdict::Family;
-pub use verdict::{judge, HitReport, Verdict, Witness};
+pub use verdict::{judge, judge_with, HitReport, JudgeInput, Verdict, Witness};

@@ -153,6 +153,8 @@ pub fn load_from_cli(
                 selector,
                 step,
                 evidence,
+                evidence_expr: None,
+                arm: None,
             })
         })
         .collect::<Result<Vec<_>, LoadError>>()?;

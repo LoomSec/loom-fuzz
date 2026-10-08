@@ -272,6 +272,7 @@ fn cmd_run(
         // 调用方显式补充的少数常量。
         for w in &dict_extra {
             seeds.push(registry_candidate_seed(hit.selector, *w));
+            seeds.extend(dict_slot_variants(hit.selector, *w));
         }
         let session = run_targeted(&cfg, &target, &seeds, &seed_out.dict);
         let calldata = loom_fuzz_oracle::calldata_of(
@@ -280,7 +281,15 @@ fn cmd_run(
                 .as_ref()
                 .ok_or("会话无 best_input（契约外：一 run 未执行）")?,
         );
-        let report = loom_fuzz_oracle::judge(hit, &session, &calldata);
+        let report = loom_fuzz_oracle::judge_with(
+            hit,
+            &session,
+            &calldata,
+            &loom_fuzz_oracle::JudgeInput {
+                view: Some(&view),
+                expected_evidence: None,
+            },
+        );
         corpus_total += session.corpus_size;
         guided_runs_total += session.best_runs;
         if cfg.run_baseline {
@@ -357,6 +366,27 @@ fn cmd_run(
     Ok(ExitCode::SUCCESS)
 }
 
+/// 补充常量的槽位扫描变体：n ∈ 1..=9 词头、第 k 槽 = 常量、其余
+/// 零、无尾——"哪个槽该填哪个常量"由执行验证（不假设 ABI 形参
+/// 位置；如 anyswap 的 code-size 守卫要求某槽 = 带码地址）。
+fn dict_slot_variants(selector: u32, word: U256) -> Vec<SeedInput> {
+    let mut out = Vec::new();
+    for n in 1..=9usize {
+        for k in 0..n {
+            let mut head = vec![[0u8; 32]; n];
+            head[k] = word.to_be_bytes::<32>();
+            out.push(SeedInput {
+                selector,
+                caller: [0x33; 20],
+                value: U256::ZERO,
+                head,
+                tail: Tail::Empty,
+            });
+        }
+    }
+    out
+}
+
 /// registry 常量候选种子（见调用点注释）：(address, bytes) 形参
 /// ABI 基座，首槽 = 常量。
 fn registry_candidate_seed(selector: u32, word: U256) -> SeedInput {
@@ -383,15 +413,18 @@ fn abi_tail() -> Tail {
 
 /// ABI 形态基座种子（见调用点注释）。tail = len 字（=4）+ 32B 块
 /// 含 "loom" 前缀——≥4 字节，满足 oracle 的 trivial 长度下限。
+/// n 到 9：真实函数头宽可达 0x120（9 槽，如 anySwapOut*WithPermit
+/// 的 msg.data.length ≥ 4+0x120 守卫）。
 fn abi_base_seeds(selector: u32) -> Vec<SeedInput> {
     let tail_bytes = match abi_tail() {
         Tail::Bytes(b) => b,
         _ => unreachable!("abi_tail 恒 Bytes"),
     };
-    (1..=4)
+    (1..=9)
         .map(|n| {
             let mut head = vec![[0u8; 32]; n];
-            head[n - 1][31] = (n as u8) * 0x20; // 指针槽 = 头宽
+            // 指针槽 = 头宽（n×32，可超 255——n 到 9 = 0x120）。
+            head[n - 1] = U256::from(n as u64 * 0x20).to_be_bytes::<32>();
             SeedInput {
                 selector,
                 caller: [0x33; 20],

@@ -98,9 +98,14 @@ HitSet
   ▼
 族 oracle + 三值判决（crates/oracle）
   │  ⑤ 到目标帧后在具体 trace 上求值证据表达式（按族定制检查器；
-  │     M0 = arbitrary_call 臂 3：target pc 后的 RecordedCall，
-  │     kind ∈ {CALL,CALLCODE,DELEGATECALL} 且 input 是原始交易
-  │     calldata 的字节子串（≥4B 防 trivial 匹配）→ Confirmed+Witness）
+  │     M0 = arbitrary_call，按检测臂定罪（Hit.arm，mode B 装载时确定）：
+  │     臂 3 裸转发：target pc 后的 RecordedCall，kind ∈
+  │     {CALL,CALLCODE,DELEGATECALL} 且 input 是原始交易 calldata
+  │     的字节子串（≥4B 防 trivial 匹配）；
+  │     臂 1 目标可控：call.target（低 160）== 证据表达式在 witness
+  │     calldata 上的求值结果（evidence_expr + xlayer 求值器，
+  │     cast160(calldata_word/b_calldata_slice) 形态 → Confirmed+Witness，
+  │     求值结果以 evidence_value 内嵌 poc.json，replay 作承诺重放））
   │  ⑥ 判决真值表（fail-closed：无见证只降级不过滤）：
   │        reached && !truncated && 证据成立 → confirmed → poc.json
   │          （loom-fuzz-poc@1：tx/prestate/seed/max_runs + replay 命令串，

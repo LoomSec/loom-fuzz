@@ -21,7 +21,7 @@ use loom_fuzz_fuzz::{run_targeted, ExecConfig, Input, Tail, Target, ValueDiction
 use loom_fuzz_seed::HitView;
 
 use crate::hit::Hit;
-use crate::verdict::{judge, HitReport, Verdict};
+use crate::verdict::{judge_with, HitReport, JudgeInput, Verdict};
 
 /// poc.json 格式标识（破坏性变更递增）。
 pub const POC_FORMAT: &str = "loom-fuzz-poc@1";
@@ -47,6 +47,10 @@ pub struct Poc {
     pub seed: u64,
     pub max_runs: u64,
     pub time_budget_secs: u64,
+    /// 臂 1 求值结果（hex 字；臂 3 / 求值 ⊥ = null）。replay 无
+    /// shard，用它作求值承诺重放臂 1 判定（witness 变了即不一致）。
+    #[serde(default)]
+    pub evidence_value: Option<String>,
     /// 手写 replay 命令串（含本文件名）。
     pub replay: String,
 }
@@ -222,6 +226,7 @@ pub fn build_poc(
         seed,
         max_runs,
         time_budget_secs,
+        evidence_value: witness.evidence_value.clone(),
         replay,
     })
 }
@@ -294,6 +299,8 @@ pub fn replay(
         step: poc.step,
         target_pcs: vec![poc.pc],
         evidence: String::new(),
+        evidence_expr: None,
+        arm: None,
         dominating_guards: Vec::new(),
     };
     let target = Target {
@@ -306,7 +313,22 @@ pub fn replay(
         &[witness_input],
         &ValueDictionary { words: Vec::new() },
     );
-    Ok(judge(&hit, &report, &calldata))
+    // replay：无 shard——臂 1 用 poc 内嵌的求值承诺重放判定。
+    let expected_evidence = poc
+        .evidence_value
+        .as_deref()
+        .map(hex_u256)
+        .transpose()
+        .map_err(|e| format!("poc.evidence_value 非法: {e}"))?;
+    Ok(judge_with(
+        &hit,
+        &report,
+        &calldata,
+        &JudgeInput {
+            view: None,
+            expected_evidence,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -330,9 +352,12 @@ mod tests {
                 step: 19,
                 target_pcs: vec![384],
                 evidence: String::new(),
+                evidence_expr: None,
+                arm: None,
                 dominating_guards: Vec::new(),
             },
             witness: Some(crate::verdict::Witness {
+                evidence_value: None,
                 trace: WitnessTrace {
                     visited_pcs: vec![384],
                     calls: vec![RecordedCall {
