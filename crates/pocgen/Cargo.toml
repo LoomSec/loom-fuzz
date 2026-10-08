@@ -1,22 +1,19 @@
 [package]
-name = "loom-fuzz-cli"
-description = "HitSet dual-mode loaders (loom CLI in-place / pure-file) + the loom-fuzz pipeline binary"
+name = "loom-fuzz-pocgen"
+description = "L2 exploit layer: synthesize value-impact Foundry PoC projects from confirmed witnesses"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "loom-fuzz"
-path = "src/main.rs"
-
 [dependencies]
 alloy-primitives = { version = "1.6.1", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-loom-fuzz-fuzz = { version = "0.1.0", path = "../fuzz" }
 loom-fuzz-oracle = { version = "0.1.0", path = "../oracle" }
-loom-fuzz-pocgen = { version = "0.1.0", path = "../pocgen" }
+serde_json = "1"
+
+[dev-dependencies]
+loom-fuzz-cli = { version = "0.1.0", path = "../cli" }
+loom-fuzz-fuzz = { version = "0.1.0", path = "../fuzz" }
 loom-fuzz-seed = { version = "0.1.0", path = "../seed" }
 loom-fuzz-shard = { version = "0.1.0", path = "../shard" }
 loom-fuzz-xlayer = { version = "0.1.0", path = "../xlayer" }
-serde_json = "1"

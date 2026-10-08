@@ -30,3 +30,10 @@ service 无代码，CALL 按 EVM 语义对空账户返回成功（`require(ok)` 
 cast keccak   0x000000000000000000000000000000000000000000000000000000000000007d  0000000000000000000000000000000000000000000000000000000000000000
 # = 0x6515432d9c8ed80ddc22d864380ff3c9b81ae737e57d049dd92abee2d8e1a7da
 ```
+
+## exploit PoC 生成（M0.6）
+
+```sh
+loom-fuzz run --shard fixtures/trv-like/trv-like.lst   --code fixtures/trv-like/TrvLikeRouter.bin-runtime   --prestate fixtures/trv-like/prestate.json   --dict-word 0x7d --emit-poc out/ --out out/
+# out/exploit-2429453012-19/ 即机械合成的 Foundry 工程（forge test 绿灯 = 终判）
+```
