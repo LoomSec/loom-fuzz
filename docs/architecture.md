@@ -96,14 +96,38 @@ HitSet
   │  ③ --target 制导：CFG PC 距离表，距离缩小的输入保留进化
   │  ④ 变异：比较操作数回灌 / 常量池整参覆盖 / 存储值入池 / 数值高斯缩放
   ▼
-族 oracle + 三值判决
-  │  ⑤ 到目标帧后在具体 trace 上求值证据表达式（按族定制检查器）
-  │  ⑥ confirmed → 生成 Foundry PoC 工程（Solidity 代码，forge test 绿灯 = 终判；
-  │        exploit 级 PoC 含价值影响断言，见 #10）
-  │        ｜预算耗尽 → unreachable｜截断 → inconclusive
+族 oracle + 三值判决（crates/oracle）
+  │  ⑤ 到目标帧后在具体 trace 上求值证据表达式（按族定制检查器；
+  │     M0 = arbitrary_call 臂 3：target pc 后的 RecordedCall，
+  │     kind ∈ {CALL,CALLCODE,DELEGATECALL} 且 input 是原始交易
+  │     calldata 的字节子串（≥4B 防 trivial 匹配）→ Confirmed+Witness）
+  │  ⑥ 判决真值表（fail-closed：无见证只降级不过滤）：
+  │        reached && !truncated && 证据成立 → confirmed → poc.json
+  │          （loom-fuzz-poc@1：tx/prestate/seed/max_runs + replay 命令串，
+  │          replay 用确定性参数重建会话重跑，verdict 逐字节一致）
+  │        未到达 → unreachable（FP 候选降级）｜truncated → inconclusive
   ▼
-fuzz_report.json（覆盖统计 + 未触发假设，全部落盘可重放，确定性种子）
+fuzz_report.json（loom-fuzz-report@1：per-hit 判决 + 覆盖 + corpus 规模
+  + seed 编译全量假设 + guided vs baseline 数据；空命中集也照落）
 ```
+
+## CLI（crates/cli 的 bin）
+
+```sh
+# 闭环：模式 B 装载 → seed → fuzz（每 hit 一个独立会话）→ oracle → 落盘
+loom-fuzz run --shard x.lst --code bytecode.hex [--prestate slots.json]   [--pack arbitrary_call.lq --loom-bin /path/to/loom]   # 模式 A（成对给）
+  [--seed N] [--max-runs N] [--gas-per-tx N] [--dict-word 0x..]... [--out dir]
+# 重放 poc.json：重建会话重跑判决；exit 0 = verdict 与记录一致
+loom-fuzz replay poc-….json --code bytecode.hex [--prestate slots.json]
+```
+
+- prestate / dict-word：shard 无 registry/白名单事实段的 M0 补法——
+  布置经 `--prestate`（hex→hex map），registry 常量经 `--dict-word`
+  进值字典与候选种子（docs 值字典定义）。种子尾部 M0 恒空，管线另补
+  泛型 ABI 形态基座种子（n=1..4 零参槽 + 指针尾），指针槽正确性由此
+  进搜索空间。
+- 判决 exit 语义：`run` 恒 0（判决如实落盘）；输入/装载错误 fail-closed
+  退出 2 并指明缺什么；`replay` 0 = 一致、1 = 不一致。
 
 ## Crate 规划
 
@@ -113,7 +137,7 @@ fuzz_report.json（覆盖统计 + 未触发假设，全部落盘可重放，确�
 | `crates/xlayer` | shard 原始流 → xeffect 展开视图（DEFS 路由展开，#8） | M0.2 已就绪 |
 | `crates/seed` | guard 事实 → 种子 Input（支配 guard 结构化反解：selector 头 / guard 常量 / 边界值 ±1 / caller / 存储槽标 free） | M0.3 已就绪 |
 | `crates/fuzz` | revm 执行 + --target 制导 + 变异器 + witness 记录 | M0.4 已就绪（#5） |
-| `crates/oracle` | 证据表达式族检查器 + 三值判决 + poc/report 落盘 | 待开工 |
+| `crates/oracle` | 证据表达式族检查器 + 三值判决 + poc/report 落盘 | M0.5 已就绪（#7） |
 | `crates/cli` | 入口：模式 A/B 装载 + 管线串联 | M0.3 双模式装载器已就绪（PR #3） |
 
 ## 边界纪律

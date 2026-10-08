@@ -5,36 +5,15 @@
 //! 集合、证据表达式的规范化渲染文本，以及支配 guard 事实（seed 编译
 //! 输入）。两种装载器（`load_from_cli` / `load_from_shard`）产出
 //! 逐字段相等的 `HitSet`。
+//!
+//! `Hit` / `GuardFact` / `SELECTOR_SENTINEL` 类型本体在
+//! [`loom_fuzz_oracle`]（判决 crate），此处 re-export 保持既有路径
+//! 可用；依赖方向 cli（装载）→ oracle（判决），无环。
 
 use std::fmt;
 use std::path::PathBuf;
 
-/// 一条检测命中的支配 guard 事实：`cond` 是守卫条件的规范化渲染
-/// （loom 同款 S 表达式文本，见 `render` 模块），`polarity` 是条件
-/// 的真假支，`pc` 是产生该守卫的单字节码方程原点。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GuardFact {
-    pub cond: String,
-    pub polarity: bool,
-    pub pc: u32,
-}
-
-/// 一条检测命中。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Hit {
-    /// 函数 selector；无函数上下文（fallback/receive 等）为
-    /// `u32::MAX` 哨兵。
-    pub selector: u32,
-    /// 命中效果的原点 pc 集合（xlayer 展开后 step → pc）。
-    pub target_pcs: Vec<u32>,
-    /// 证据表达式的规范化渲染文本（oracle 求值对象；模式 A 为 loom
-    /// CLI JSON 原文，模式 B 为本仓库渲染器输出，golden 对拍一致）。
-    pub evidence: String,
-    /// 支配 guard：步序早于命中步序、作用域与命中作用域
-    /// prefix-comparable（ancestor-or-self 任一方向）的守卫，
-    /// 按步序升序。
-    pub dominating_guards: Vec<GuardFact>,
-}
+pub use loom_fuzz_oracle::{GuardFact, Hit, SELECTOR_SENTINEL};
 
 /// 装载产物：运行时字节码 + 检测命中集。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +130,3 @@ impl From<loom_fuzz_shard::Error> for LoadError {
         LoadError::Shard(e)
     }
 }
-
-/// 无函数上下文的 selector 哨兵（fallback/receive 等无 selector 入口）。
-pub const SELECTOR_SENTINEL: u32 = u32::MAX;

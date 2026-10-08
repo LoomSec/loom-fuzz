@@ -152,6 +152,12 @@ impl DistanceTable {
     pub(crate) fn block_count(&self) -> usize {
         self.block_dist.len()
     }
+
+    /// 可执行指令 pc 数（coverage 的 total 口径：pc_to_block 有效
+    /// 项计数——每个非 PUSH 数据区的指令 pc 恰属一块）。
+    pub fn executable_pc_count(&self) -> usize {
+        self.pc_to_block.iter().filter(|&&b| b != u32::MAX).count()
+    }
 }
 
 /// 基本块：[start, end]（含两端 pc；end 可能是 PUSH 数据字节），
