@@ -38,6 +38,9 @@ pub(crate) struct RunResult {
     /// 本 run 观测到的 storage 键值对（SLOAD：step 记键、step_end
     /// 收值）。
     pub storage_observed: Vec<(U256, U256)>,
+    /// revert 归因：最近经过的支配 guard（ExecConfig.guard_context
+    /// 非空且结局 Revert 时产出）。
+    pub feedback_guard: Option<crate::exec::GuardFeedback>,
 }
 
 /// 泛型上下文：Genesis（EmptyDB）与 fork（ForkDb 包装）通用。
@@ -53,6 +56,9 @@ pub(crate) struct WitnessInspector {
     /// 即 CALL/CREATE 指令的 pc）。
     last_pc: Option<u32>,
     visited: BTreeSet<u32>,
+    /// 访问序（revert 归因："最近经过的支配 guard" = visited 序的
+    /// 最后一个 guard pc）。
+    visited_order: Vec<u32>,
     calls: Vec<RecordedCall>,
     /// 步数上限触发的截停（gas 未耗尽，人为截停，如实标 truncated）。
     step_capped: bool,
@@ -71,6 +77,7 @@ impl WitnessInspector {
             steps: 0,
             last_pc: None,
             visited: BTreeSet::new(),
+            visited_order: Vec::new(),
             calls: Vec::new(),
             step_capped: false,
             cmp_observed: Vec::new(),
@@ -94,6 +101,7 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
         let pc = interp.bytecode.pc() as u32;
         self.last_pc = Some(pc);
         self.visited.insert(pc);
+        self.visited_order.push(pc);
         // 比较操作数观测：step 在指令执行前触发，栈顶两元即操作数。
         // 两侧都收（不判定比较结果——结果条件收需要 step_end 回读已
         // 弹出的操作数，机制复杂且无收益：收两侧天然覆盖"未通过的
@@ -301,6 +309,7 @@ fn execute_on<DB: revm::DatabaseRef>(
                 visited_pcs: Vec::new(),
                 cmp_observed: Vec::new(),
                 storage_observed: Vec::new(),
+                feedback_guard: None,
             };
         }
     };
@@ -309,6 +318,21 @@ fn execute_on<DB: revm::DatabaseRef>(
     let (outcome, gas_used, truncated_by_gas) = map_result(&result.result);
     let truncated = inspector.step_capped || truncated_by_gas;
 
+    // revert 归因：visited 序的最后一个 guard pc。
+    let feedback_guard = if outcome == OutcomeKind::Revert && !cfg.guard_context.is_empty() {
+        inspector.visited_order.iter().rev().find_map(|pc| {
+            cfg.guard_context
+                .iter()
+                .find(|g| g.pc == *pc)
+                .map(|g| crate::exec::GuardFeedback {
+                    pc: g.pc,
+                    cond_rendered: g.cond.clone(),
+                    polarity_failed: true,
+                })
+        })
+    } else {
+        None
+    };
     RunResult {
         trace: WitnessTrace {
             visited_pcs: inspector.visited.iter().copied().collect(),
@@ -321,6 +345,7 @@ fn execute_on<DB: revm::DatabaseRef>(
         visited_pcs: inspector.visited.iter().copied().collect(),
         cmp_observed: inspector.cmp_observed,
         storage_observed: inspector.storage_observed,
+        feedback_guard,
     }
 }
 
@@ -410,6 +435,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            guard_context: Vec::new(),
         };
         let input = Input {
             selector: 0xdeadbeef,
@@ -447,6 +473,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            guard_context: Vec::new(),
         };
         let input = Input {
             selector: 0,

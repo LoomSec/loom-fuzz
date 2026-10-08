@@ -341,6 +341,8 @@ pub fn replay(
                 })
             })
             .collect::<Result<_, String>>()?,
+        // replay 无 LLM 参与（判决独立）；guard 上下文不参与重放。
+        guard_context: Vec::new(),
     };
     let selector = u32::from_str_radix(poc.selector.trim_start_matches("0x"), 16)
         .map_err(|e| format!("poc.selector 非法: {e}"))?;
@@ -464,6 +466,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            guard_context: Vec::new(),
         };
         (report, cfg)
     }

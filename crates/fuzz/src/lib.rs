@@ -107,14 +107,20 @@ mod cfg;
 mod evm;
 mod exec;
 mod fork;
+#[cfg(feature = "llm")]
+pub mod llm;
 mod mutate;
 mod mutators;
+pub mod propose;
 mod rng;
 
 pub use cfg::DistanceTable;
 pub use exec::{
-    run_targeted, Deployment, ExecConfig, OutcomeKind, RecordedCall, SessionReport, WitnessTrace,
+    run_targeted, run_targeted_with, Deployment, ExecConfig, GuardContext, GuardFeedback,
+    OutcomeKind, ProposalBudget, Proposer, ProposerCtx, RecordedCall, RunFeedback, SessionReport,
+    WitnessTrace,
 };
 pub use fork::{pin_block, responder_runtime, responder_runtime_sender, ForkConfig, ForkDb};
 pub use loom_fuzz_seed::{HitView, Input, Tail, Target, ValueDictionary};
+pub use propose::{DictionaryProposer, LlmInteraction};
 pub use rng::Rng;

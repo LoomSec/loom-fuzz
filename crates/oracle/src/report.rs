@@ -26,6 +26,9 @@ pub struct FuzzReport {
     pub corpus: usize,
     /// seed 编译器的全量未触发/不可解假设（跨 hit 去重保留序）。
     pub assumptions: Vec<String>,
+    /// LLM 提案交互（prompt/响应全量落盘；dictionary 路线为空）。
+    #[serde(default)]
+    pub llm_interactions: Vec<loom_fuzz_fuzz::propose::LlmInteraction>,
     pub guidance: Guidance,
 }
 
