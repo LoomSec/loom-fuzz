@@ -42,6 +42,7 @@ loom-evm 反编译产出的静态事实直接编译成 fuzz 的输入空间：
 ## 里程碑
 
 - **M0**：单合约、纯字节码、单交易见证闭环，arbitrary_call 族先行；验收 = TRV 样本出 confirmed、噪声行出 unreachable
+- **M0.2**：`crates/xlayer`——DEFS 路由展开自包含复现（与 `loom query` 诊断 pack 在同一 shard 上对拍一致，#8）；TRV 形状样本见 `fixtures/trv-like/`（真实 TRV 字节码受阻见 #11）
 - **M1+**：多检测族推广、存储根 RPC 注入、（后续）多交易状态ful 与 fork 场景
 
 ## License

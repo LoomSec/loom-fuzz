@@ -44,6 +44,9 @@ Hit {
 
 ```
 HitSet
+  │  ⓪ 装载前经 xlayer 展开（crates/xlayer）：shard 原始流只含
+  │     input_read + Apply 边，DEFS 路由展开（帧实参代入 + 作用域
+  │     rebase）物化为 xeffect/xguard/xoutcome 视图后才进闭环
   │  ① seed 编译（crates/seed）
   │     支配 guard 代数形状 → 精确种子 Input：
   │     selector 头 / guard 常量 / 边界值 ±1 / caller / 存储槽(标 free)
@@ -67,6 +70,7 @@ fuzz_report.json（覆盖统计 + 未触发假设，全部落盘可重放，确�
 | crate | 职责 | 状态 |
 |---|---|---|
 | `crates/shard` | .lst 读取器（纯文件模式的核心） | M0.1 已就绪（PR #1） |
+| `crates/xlayer` | shard 原始流 → xeffect 展开视图（DEFS 路由展开，#8） | M0.2 已就绪 |
 | `crates/seed` | guard 事实 → 种子 Input | 待开工 |
 | `crates/fuzz` | revm 执行 + --target 制导 + 变异器 + witness 记录 | 待开工 |
 | `crates/oracle` | 证据表达式族检查器 + 三值判决 + poc/report 落盘 | 待开工 |
