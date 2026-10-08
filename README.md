@@ -65,6 +65,39 @@ loom-fuzz replay out/poc-….json --code bytecode.hex   # exit 0 = verdict 一�
 ```
 - **M1+**：多检测族推广、存储根 RPC 注入、（后续）多交易状态ful 与 fork 场景
 
+## 真实案例复现
+
+两个真实主网合约的全链路（loom shard → dictionary 搜索 confirmed → 机械合成 L2 PoC → `forge test` 绿灯）均已实测打通。环境约定：仓库根 `.env` 提供 `BLOCKMACHINE_RPC_URL`（eth 归档端点）与 `BLOCKMACHINE_API_KEY`（**空 = 无 key 直连**，非空经 anvil `--fork-header` Bearer 代理）；跑 golden/实跑前 `set -a && . .env && set +a`，并 `export LOOM_BIN=<loom-evm 二进制路径>`。
+
+### vvisr RewardsHypervisor（eth `0xc9f27a50f82571c1c8423a42970613b8dbda14ef`）
+
+fork 态 arbitrary_call（pin 块 + `--deploy` 攻击合约）：
+
+```sh
+loom-fuzz run --shard fixtures/real-world/vvisr-rewards/vvisr.lst \
+  --code fixtures/real-world/vvisr-rewards/vvisr-rewards.bin-runtime \
+  --contract-addr 0xc9f27a50f82571c1c8423a42970613b8dbda14ef \
+  --deploy 0x000000000000000000000000000000000000C0DE:responder-sender \
+  --dict-word 0x000000000000000000000000000000000000C0DE \
+  --seed 42 --fork-url "$BLOCKMACHINE_RPC_URL" --time-budget 600 --out /tmp/out-x
+```
+
+实测：confirmed 689 runs / 106s；`--emit-poc` 产物 `forge test` 绿灯（eth fork + `vm.etch` 真实运行时 + responder `0x…C0DE`）。
+
+### anyswap V4Router（eth `0x6b7a87899490ece95443e979ca9485cbe7e71522`）
+
+Genesis 态 arbitrary_call（router 无外部状态依赖）：
+
+```sh
+loom-fuzz run --shard fixtures/real-world/anyswap-v4router/anyswapv4router.lst \
+  --code fixtures/real-world/anyswap-v4router/AnyswapV4Router.bin-runtime \
+  --seed 42 --max-runs 2000 \
+  --dict-word 0x00000000000000000000000022222222222222222222222222222222222222 \
+  --emit-poc /tmp/any-poc --out /tmp/out-y
+```
+
+实测：4 条命中 confirmed（58/20/58/20 runs）；其中 2 条（`0x1b91a934` / `0x8d7d3eea` 形）L2 PoC `forge test` 绿灯（`[PASS] testExploit()`），另 2 条如实"L2 诚实降级"（定长头零词注入点不足，fail-closed 不硬生成）。
+
 ## License
 
 MIT OR Apache-2.0（首个代码提交时附带）。
