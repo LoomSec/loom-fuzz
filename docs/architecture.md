@@ -111,7 +111,7 @@ fuzz_report.json（覆盖统计 + 未触发假设，全部落盘可重放，确�
 |---|---|---|
 | `crates/shard` | .lst 读取器（纯文件模式的核心） | M0.1 已就绪（PR #1） |
 | `crates/xlayer` | shard 原始流 → xeffect 展开视图（DEFS 路由展开，#8） | M0.2 已就绪 |
-| `crates/seed` | guard 事实 → 种子 Input | 待开工 |
+| `crates/seed` | guard 事实 → 种子 Input（支配 guard 结构化反解：selector 头 / guard 常量 / 边界值 ±1 / caller / 存储槽标 free） | M0.3 已就绪 |
 | `crates/fuzz` | revm 执行 + --target 制导 + 变异器 + witness 记录 | 待开工 |
 | `crates/oracle` | 证据表达式族检查器 + 三值判决 + poc/report 落盘 | 待开工 |
 | `crates/cli` | 入口：模式 A/B 装载 + 管线串联 | M0.3 双模式装载器已就绪（PR #3） |
