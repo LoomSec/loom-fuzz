@@ -55,7 +55,9 @@ HitSet
   ▼
 族 oracle + 三值判决
   │  ⑤ 到目标帧后在具体 trace 上求值证据表达式（按族定制检查器）
-  │  ⑥ confirmed → poc.json（可一键重放）｜预算耗尽 → unreachable｜截断 → inconclusive
+  │  ⑥ confirmed → 生成 Foundry PoC 工程（Solidity 代码，forge test 绿灯 = 终判；
+  │        exploit 级 PoC 含价值影响断言，见 #10）
+  │        ｜预算耗尽 → unreachable｜截断 → inconclusive
   ▼
 fuzz_report.json（覆盖统计 + 未触发假设，全部落盘可重放，确定性种子）
 ```

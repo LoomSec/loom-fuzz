@@ -2,7 +2,9 @@
 
 Witness fuzzing for EVM bytecode, guided end-to-end by [loom-evm](https://github.com/LoomSec/loom-evm)'s static analysis.
 
-loom-evm 的检测命中是精确的 `(函数, 帧, 证据表达式)` 三元组。loom-fuzz 把三元组的每一列编译成闭环的一个角色——种子、目标、判决——回答唯一重要的问题：**这条命中真实可达吗，见证输入是什么？**
+loom-evm 的检测命中是精确的 `(函数, 帧, 证据表达式)` 三元组。loom-fuzz 把三元组的每一列编译成闭环的一个角色——种子、目标、判决——回答唯一重要的问题：**这条命中真实可达吗，能不能直接生成可 `forge test` 的 exploit PoC？**
+
+**产出物 = Solidity PoC 代码**：检测出问题，就生成一份 Foundry 测试工程（`test/PoC.t.sol` + `foundry.toml`，`vm.etch`/`vm.prank`/`vm.store` 布置见证，收尾为价值影响断言），`forge test` 绿灯即终判——和手写 PoC 同一形态，但是机械生成的。
 
 | 命中列 | 在闭环中的角色 |
 |---|---|
