@@ -51,8 +51,18 @@ pub struct ExecConfig {
     #[serde(default)]
     pub fork: Option<crate::fork::ForkConfig>,
     /// 攻击合约部署（setUp etch，overlay 在状态/prestate 上）。
+    /// 与 `address`（victim）合称**合约表**——多合约在场时 call
+    /// target 可指向表内任何成员（issue #34）。
     #[serde(default)]
     pub deployments: Vec<Deployment>,
+    /// 顶层交易入口（issue #34）：None = 直接 call victim（单步
+    /// 默认现状）；Some(addr) = 顶层 call 指向表内另一合约（如
+    /// 攻击代理合约）——caller 轮换 ATTACKER → 入口合约 → victim
+    /// 的第一环。装载选项（CLI `--entry`），地址须在场（victim
+    /// 或 deployments 成员），校验在装载层 fail-closed；执行器
+    /// 只按约定切换 TxEnv 目标。
+    #[serde(default)]
+    pub entry: Option<[u8; 20]>,
     /// 支配 guard 上下文（revert 归因用；装载端经 xlayer 渲染 cond）。
     #[serde(default)]
     pub guard_context: Vec<GuardContext>,
@@ -82,6 +92,11 @@ pub struct RecordedCall {
     /// CALL / CALLCODE / DELEGATECALL / STATICCALL / CREATE / CREATE2 /
     /// SELFDESTRUCT。
     pub kind: String,
+    /// 发出该效果的合约地址（执行 CALL 指令的那一方；oracle 按
+    /// victim 帧过滤的维度，issue #34）。DELEGATECALL 链下为语义
+    /// caller（与 pc 的数值过滤互补）。旧产物缺省 = 零地址。
+    #[serde(default)]
+    pub from: [u8; 20],
     /// 目标地址（CREATE 系为创建出的合约地址）。
     pub target: [u8; 20],
     pub value: U256,
@@ -109,6 +124,11 @@ pub enum OutcomeKind {
 /// 效果 + 结局 + gas。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitnessTrace {
+    /// 目标帧所属合约（target_pcs / visited_pcs 索引的那份字节码的
+    /// 地址——恒 victim；多合约在场时 oracle 据 `RecordedCall.from`
+    /// 过滤出 victim 帧的 call）。旧产物缺省 = 管线固定地址。
+    #[serde(default = "default_contract_addr")]
+    pub contract: [u8; 20],
     pub visited_pcs: Vec<u32>,
     pub calls: Vec<RecordedCall>,
     pub outcome: OutcomeKind,
@@ -209,6 +229,12 @@ pub trait Proposer {
 /// 正常执行到不了这个量级；防 gas_per_tx 被设成天文数字时单
 /// run 拖死会话）。
 const STEP_CAP: u64 = 10_000_000;
+
+/// witness trace 的 serde 缺省合约地址（旧产物无该字段；与管线
+/// CONTRACT_ADDRESS 同约定）。
+fn default_contract_addr() -> [u8; 20] {
+    [0x22; 20]
+}
 
 /// corpus 上限（按 fitness 截断保留）。
 const CORPUS_CAP: usize = 64;
@@ -490,6 +516,7 @@ impl<'a> Session<'a> {
                 (
                     None,
                     WitnessTrace {
+                        contract: self.cfg.address,
                         visited_pcs: Vec::new(),
                         calls: Vec::new(),
                         outcome: OutcomeKind::Invalid,
@@ -548,6 +575,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            entry: None,
             guard_context: Vec::new(),
         };
         let seeds = vec![Input {
@@ -594,6 +622,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            entry: None,
             guard_context: Vec::new(),
         };
         let report = run_targeted(&cfg, &target, &[], &ValueDictionary { words: vec![] });

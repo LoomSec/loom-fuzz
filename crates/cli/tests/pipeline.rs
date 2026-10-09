@@ -232,3 +232,64 @@ fn fail_closed_on_missing_inputs() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--loom-bin"), "指明缺什么: {stderr}");
 }
+
+#[test]
+fn entry_not_in_contract_table_fails_closed() {
+    // issue #34：--entry 须在合约表内（victim 或 --deploy 地址），
+    // 否则 fail-closed 退出 2 并指明缺什么（不硬猜目标）。
+    let dir = out_dir("entry-fail");
+    let fx = fixtures();
+    let out = Command::new(bin())
+        .args([
+            "run",
+            "--shard",
+            &fx.join("fixtures/simple/minibank/minibank.lst")
+                .to_string_lossy(),
+            "--code",
+            &fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
+                .to_string_lossy(),
+            "--entry",
+            "0x9999999999999999999999999999999999999999",
+            "--out",
+            &dir.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("不在合约表"),
+        "fail-closed 指明原因: {stderr}"
+    );
+}
+
+#[test]
+fn multi_deploy_with_forwarder_accepted() {
+    // issue #34：多 --deploy（含机械 forwarder 代理规格）装载归一：
+    // Genesis 态照跑（minibank 无命中 → 空报告 exit 0）。
+    let dir = out_dir("multi-deploy");
+    let fx = fixtures();
+    let out = Command::new(bin())
+        .args([
+            "run",
+            "--shard",
+            &fx.join("fixtures/simple/minibank/minibank.lst")
+                .to_string_lossy(),
+            "--code",
+            &fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
+                .to_string_lossy(),
+            "--deploy",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:forwarder",
+            "--deploy",
+            "0xcccccccccccccccccccccccccccccccccccccccc:responder-sender",
+            "--out",
+            &dir.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

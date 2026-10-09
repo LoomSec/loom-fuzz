@@ -100,7 +100,8 @@ HitSet
   │  ⑤ 到目标帧后在具体 trace 上求值证据表达式（按族定制检查器；
   │     M0 = 三族，Hit.family 分发（#20 多族推广）：
   │     arbitrary_call（Hit.arm，mode B 装载时确定）：
-  │     臂 3 裸转发：target pc 后的 RecordedCall，kind ∈
+  │     臂 3 裸转发：target pc 后且 victim 帧（from == trace.contract，
+│     issue #34 多合约在场的帧归属过滤）的 RecordedCall，kind ∈
   │     {CALL,CALLCODE,DELEGATECALL} 且 input 是原始交易 calldata
   │     的字节子串（≥4B 防 trivial 匹配）；
   │     臂 1 目标可控：call.target（低 160）== 证据表达式在 witness
@@ -166,11 +167,25 @@ loom-fuzz run --shard x.lst --code bytecode.hex [--prestate slots.json]   [--pac
 loom-fuzz replay poc-….json --code bytecode.hex [--prestate slots.json]
 # on-demand fork 执行（env BLOCKMACHINE_RPC_URL/_API_KEY；key 空 = keyless）
 loom-fuzz run … --fork-url <url> --fork-block latest --contract-addr 0x… \
-  --deploy 0x…:responder-sender   # 或 <hex runtime> / responder
+  --deploy 0x…:responder-sender   # 或 <hex runtime> / responder / forwarder
+# 多合约装载 + 攻击代理入口（issue #34，Genesis / fork 两态归一同规格）
+loom-fuzz run … --deploy 0xAA…:forwarder --deploy 0xBB…:responder \
+  --entry 0xAA…   # 入口须 = 分析合约或某个 --deploy 地址（fail-closed）
 # L2 exploit 影响层：confirmed poc.json → Foundry 工程 + forge test
 loom-fuzz exploit poc-….json --code bytecode.hex --out exploit/ [--fork]
 ```
 
+- 多合约装载（issue #34）：`--deploy` 多值 = 合约表多成员（victim +
+  各部署合约，各自独立字节码）；规格 `forwarder` 是机械攻击代理模板
+  （fallback 原样 CALL 转发 calldata 到分析合约，零个案）——victim 帧
+  msg.sender = 代理合约，即 caller 轮换 ATTACKER → 攻击合约 → victim
+  的第一环（deputy 场景 caller 守卫绕过的装载形态）。`--entry <addr>`
+  把顶层交易目标指向表内成员（缺省 = 直接 call victim，单步默认不
+  变；表外地址 fail-closed 报错）。witness 的 RecordedCall 记 `from`
+  （发 call 的合约）+ trace 记 `contract`（目标帧所属合约），oracle
+  据两者过滤 victim 帧的 call——多合约 trace 里 pc 数值跨代码库不
+  再可比的正确性兜底。序列搜索（#35）在合约表上扩展 caller 轮换，
+  本环不预设个案形态。
 - prestate / dict-word：shard 无 registry/白名单事实段的 M0 补法——
   布置经 `--prestate`（hex→hex map），registry 常量经 `--dict-word`
   进值字典与候选种子（docs 值字典定义）。种子尾部 M0 恒空，管线另补

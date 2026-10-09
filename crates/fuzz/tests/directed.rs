@@ -139,6 +139,7 @@ fn exec_config(
         run_baseline: baseline,
         fork: None,
         deployments: Vec::new(),
+        entry: None,
         guard_context: Vec::new(),
     }
 }

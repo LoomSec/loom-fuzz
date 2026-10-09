@@ -153,15 +153,15 @@ pub fn judge_with(
     // 各族的"证据成立"判语文本（定罪时落 reason）。
     let (check, reason_ok) = match family {
         Family::ArbitraryCall => (
-            check_arbitrary_call(hit, &trace.calls, tx_calldata, &check_input),
+            check_arbitrary_call(hit, &trace.calls, tx_calldata, &check_input, trace.contract),
             String::new(), // 两臂各用自己的判语（历史行为不变）
         ),
         Family::ApprovalDrainDeputy => (
-            check_deputy_call(hit, &trace.calls, tx_calldata, &check_input),
+            check_deputy_call(hit, &trace.calls, tx_calldata, &check_input, trace.contract),
             "到场且 deputy_call 证据成立：call.target == cast160(evidence)（confused deputy：有 caller 守卫但目标仍由调用者控制）".to_string(),
         ),
         Family::ApprovalDrainForward => (
-            check_drain_forward(hit, &trace.calls, tx_calldata),
+            check_drain_forward(hit, &trace.calls, tx_calldata, trace.contract),
             "到场且 drain_forward 证据成立：call input 含 calldata 派生切片（宽松 memmem：子串或 32B 头词覆盖）且整体不与 caller 绑定".to_string(),
         ),
     };
@@ -288,10 +288,12 @@ mod tests {
                 tail: loom_fuzz_seed::Tail::Empty,
             }),
             trace: WitnessTrace {
+                contract: [0x22; 20],
                 visited_pcs: if reached { vec![384] } else { vec![0] },
                 calls: if reached {
                     vec![RecordedCall {
                         kind: "CALL".to_string(),
+                        from: [0x22; 20],
                         target: [0x7d; 20],
                         value: alloy_primitives::U256::ZERO,
                         input: b"abcd".to_vec(),

@@ -58,6 +58,11 @@ pub struct Poc {
     /// fork 后部署的攻击合约（pocgen 据此刻蚀）。
     #[serde(default)]
     pub deployments: Vec<PocDeployment>,
+    /// 顶层交易入口（issue #34；None = 直接 call victim，旧 poc
+    /// 兼容）。Some 时 replay 同参重建——经攻击代理合约的见证
+    /// 只有同入口重放才逐字节一致。
+    #[serde(default)]
+    pub entry: Option<String>,
     /// 执行地址（fork 态 = 真实地址；缺省 = 管线固定 0x2222…22）。
     #[serde(default)]
     pub contract: Option<String>,
@@ -280,6 +285,7 @@ pub fn build_poc(
                 runtime_hex: bytes_hex(&d.runtime),
             })
             .collect(),
+        entry: cfg.entry.map(|e| bytes_hex(&e)),
         contract: Some(bytes_hex(&cfg.address)),
         family: hit_report.hit.family,
         call: Some(PocCall {
@@ -362,6 +368,18 @@ pub fn replay(
                 })
             })
             .collect::<Result<_, String>>()?,
+        entry: match &poc.entry {
+            Some(a) => {
+                let b = hex_bytes(a)?;
+                if b.len() != 20 {
+                    return Err("poc.entry 非 20 字节".to_string());
+                }
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&b);
+                Some(addr)
+            }
+            None => None,
+        },
         // replay 不经搜索层（判决独立）；guard 上下文不参与重放。
         guard_context: Vec::new(),
     };
@@ -453,10 +471,12 @@ mod tests {
             witness: Some(crate::verdict::Witness {
                 evidence_value: None,
                 trace: WitnessTrace {
+                    contract: [0x22; 20],
                     deployments: Vec::new(),
                     visited_pcs: vec![384],
                     calls: vec![RecordedCall {
                         kind: "CALL".to_string(),
+                        from: [0x22; 20],
                         target: [0x7d; 20],
                         value: U256::ZERO,
                         input: vec![1, 2, 3, 4],
@@ -470,6 +490,7 @@ mod tests {
                 pc: 384,
                 evidence_call: RecordedCall {
                     kind: "CALL".to_string(),
+                    from: [0x22; 20],
                     target: [0x7d; 20],
                     value: U256::ZERO,
                     input: vec![1, 2, 3, 4],
@@ -489,6 +510,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            entry: None,
             guard_context: Vec::new(),
         };
         (report, cfg)

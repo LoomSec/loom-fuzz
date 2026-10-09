@@ -81,6 +81,7 @@ fn deputy_poc(input: Vec<u8>) -> Poc {
         evidence_value: None,
         fork: None,
         deployments: Vec::new(),
+        entry: None,
         contract: Some(bytes_hex(&ROUTER)),
         family: HitFamily::ApprovalDrainDeputy,
         call: Some(PocCall {

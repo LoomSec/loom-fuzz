@@ -21,6 +21,9 @@
 //!   余额，余额敏感分支读到的是确定值）。
 //! - `TxEnv` = call(cfg.address) + caller/value/calldata（calldata 由
 //!   [`Input`] 序列化：selector 4B + head 槽原样拼接 + tail 原样拼接）。
+//!   多合约在场时（issue #34）顶层目标可为合约表内入口合约
+//!   （`ExecConfig.entry`），缺省 victim 不变——witness 仍单笔
+//!   calldata 模型。
 //! - Inspector（revm-inspector `Inspector` trait）：`step` 钩子记 pc
 //!   （`ExtBytecode::pc()`）进有序集；`call` / `create` 钩子读
 //!   `CallInputs.input.bytes(ctx)`（SharedBuffer 立即拷贝，防止子帧
@@ -39,6 +42,21 @@
 //! 构造的 ABI 编码尾），执行器照拼不误，但指针槽与尾内容的对应关系
 //! 是输入构造方的责任。M0 种子尾部恒空；动态尾由变异器的"动态尾
 //! 生成"（legacy 系列）与变长尾算子带进搜索空间（#6）。
+//!
+//! # 多合约会话与入口合约（issue #34）
+//!
+//! 执行器合约表 = victim（`ExecConfig.address` 的代码）∪
+//! `deployments`（etch 的攻击/辅助合约）。装载选项
+//! `ExecConfig.entry`（CLI `--entry`）把顶层交易目标指向表内任一
+//! 成员——机械用法是 [`forwarder_runtime`] 攻击代理（fallback 原样
+//! CALL 转发 calldata 到 victim），victim 帧 msg.sender 变为代理
+//! 合约，即 caller 轮换 ATTACKER → 攻击合约 → victim 的第一环
+//! （deputy 场景 caller 守卫绕过的装载形态）。witness 记录
+//! [`RecordedCall.from`]（发 call 的合约）与 [`WitnessTrace.contract`]
+//! （目标帧所属合约），oracle 据两者过滤出 victim 帧的 call——
+//! 多合约 trace 里 pc 数值跨代码库不再可比的正确性兜底。
+//! 序列搜索（#35）在合约表上扩展 caller 轮换；本 crate 不预设
+//! 任何个案形态。
 //!
 //! # CFG 距离表
 //!
@@ -118,7 +136,9 @@ pub use exec::{
     OutcomeKind, ProposalBudget, Proposer, ProposerCtx, RecordedCall, RunFeedback, SessionReport,
     WitnessTrace,
 };
-pub use fork::{pin_block, responder_runtime, responder_runtime_sender, ForkConfig, ForkDb};
+pub use fork::{
+    forwarder_runtime, pin_block, responder_runtime, responder_runtime_sender, ForkConfig, ForkDb,
+};
 pub use loom_fuzz_seed::{HitView, Input, Tail, Target, ValueDictionary};
 pub use propose::DictionaryProposer;
 pub use rng::Rng;
