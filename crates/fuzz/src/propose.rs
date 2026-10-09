@@ -52,9 +52,20 @@ impl Proposer for DictionaryProposer {
         }
         // 父代：按**距离升序**（fitness 最优优先）前一半（至少 1
         // 个），按输入去重。距离相同的按字典序键（确定性）。
+        // 父代是**序列**：取其中一步作步级变异亲本——单步父代不耗
+        // 随机数（逐位等价旧路径）；多步父代随机挑一步（序列的其
+        // 他步由执行环的组装算子负责传承/扩展）。
         let mut parents: Vec<(u32, &Input)> = feedback
             .iter()
-            .map(|f| (f.best_distance, &f.input))
+            .map(|f| {
+                let steps = &f.seq.steps;
+                let idx = if steps.len() > 1 {
+                    self.rng.below(steps.len() as u64) as usize
+                } else {
+                    0
+                };
+                (f.best_distance, &steps[idx].input)
+            })
             .collect();
         parents.sort_by_key(|(d, i)| (*d, input_key(i)));
         parents.dedup_by_key(|(_, i)| input_key(i));
@@ -105,7 +116,7 @@ mod tests {
 
     fn fb(input: Input, distance: u32) -> RunFeedback {
         RunFeedback {
-            input,
+            seq: loom_fuzz_seed::TxSequence::single([0x22; 20], input),
             outcome: OutcomeKind::Revert,
             best_distance: distance,
             reverted_guard: Some(GuardFeedback {

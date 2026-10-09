@@ -99,11 +99,21 @@ fn trv_like_confirmed_with_poc() {
     assert_eq!(poc["pc"], 384);
     assert_eq!(poc["step"], 19);
     assert!(poc["digest"].as_str().unwrap().starts_with("0x"));
-    assert!(poc["tx"]["calldata"]
+    // issue #35：poc 序列化形态 = steps（单步 = 单元素序列）。
+    assert_eq!(poc["steps"].as_array().unwrap().len(), 1);
+    assert!(poc["steps"][0]["calldata"]
         .as_str()
         .unwrap()
         .starts_with("0x90ce82d4"));
-    assert!(poc["tx"]["caller"].as_str().unwrap().starts_with("0x"));
+    assert!(poc["steps"][0]["caller"]
+        .as_str()
+        .unwrap()
+        .starts_with("0x"));
+    assert!(poc["steps"][0]["target"]
+        .as_str()
+        .unwrap()
+        .starts_with("0x"));
+    assert!(poc.get("tx").is_none(), "新 poc 不写出 legacy tx");
     assert!(poc["prestate"].as_object().unwrap().len() == 1);
     assert!(poc["replay"].as_str().unwrap().contains("loom-fuzz replay"));
     assert!(poc["replay"]

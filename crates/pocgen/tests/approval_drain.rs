@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use alloy_primitives::U256;
-use loom_fuzz_oracle::{bytes_hex, HitFamily, Poc, PocCall, PocTx};
+use loom_fuzz_oracle::{bytes_hex, HitFamily, Poc, PocCall};
 use loom_fuzz_pocgen::{generate_exploit, PocgenError};
 
 /// 最小 deputy 路由器（forge 编译的 DeputyRouter 运行时，717B）：
@@ -68,11 +68,13 @@ fn deputy_poc(input: Vec<u8>) -> Poc {
         step: 119,
         pc: 42,
         verdict: "confirmed".to_string(),
-        tx: PocTx {
+        steps: vec![loom_fuzz_oracle::PocStep {
+            target: bytes_hex(&ROUTER),
             caller: bytes_hex(&ATTACKER),
             value: "0x".to_string() + &"0".repeat(64),
             calldata: bytes_hex(&calldata),
-        },
+        }],
+        tx: None,
         prestate: BTreeMap::new(),
         responses: Vec::new(),
         seed: 42,

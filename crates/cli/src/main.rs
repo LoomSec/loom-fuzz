@@ -114,6 +114,11 @@ enum Cmd {
         /// 绕过）。缺省 = 直接 call 分析合约（单步默认不变）。
         #[arg(long)]
         entry: Option<String>,
+        /// 调用序列长度上限（issue #35）：1 = 单步默认（与旧行为
+        /// 完全等价）；>1 时搜索在步级提案之上机械组装多步序列
+        /// （append / splice / 步内变异），状态跨步持久。
+        #[arg(long, default_value_t = 1)]
+        max_steps: u32,
         /// 分析合约的链上真实地址：fork 态必须在真实地址上执行（否则
         /// 合约自身状态错位）——CLI 强制。
         #[arg(long)]
@@ -176,6 +181,7 @@ fn run() -> Result<ExitCode, String> {
             fork_block,
             deploy,
             entry,
+            max_steps,
             contract_addr,
         } => cmd_run(
             &shard,
@@ -194,6 +200,7 @@ fn run() -> Result<ExitCode, String> {
             &fork_block,
             &deploy,
             entry.as_deref(),
+            max_steps,
             contract_addr.as_deref(),
         ),
         Cmd::Exploit {
@@ -242,6 +249,7 @@ fn cmd_run(
     fork_block: &str,
     deploy_flags: &[String],
     entry_flag: Option<&str>,
+    max_steps: u32,
     contract_addr: Option<&str>,
 ) -> Result<ExitCode, String> {
     // 装载（模式 A 需 pack+loom-bin 成对；只给一个 = fail-closed）。
@@ -392,6 +400,7 @@ fn cmd_run(
             fork: fork.clone(),
             deployments: deployments.clone(),
             entry,
+            max_steps,
             // revert 归因上下文：支配 guard（装载端已渲染 cond）。
             guard_context: hit
                 .dominating_guards
@@ -440,18 +449,28 @@ fn cmd_run(
         }
         // 搜索（issue #25/#29）：DictionaryProposer 为唯一路线——字典
         // 基座 + 多槽协同变异，反馈窗（corpus 精英 + revert 归因）驱动
-        // 进化；判决独立，replay 不经搜索层。
+        // 进化；判决独立，replay 不经搜索层。种子包成单步调用序列
+        // （issue #35：step.target = 入口合约或 victim——entry 的生效
+        // 形态；max_steps > 1 时进化环的组装算子在步级提案之上机械
+        // 扩展多步序列）。
+        let seed_target = entry.unwrap_or(exec_address);
+        let seeds: Vec<loom_fuzz_fuzz::TxSequence> = seeds
+            .iter()
+            .map(|s| loom_fuzz_fuzz::TxSequence::single(seed_target, s.clone()))
+            .collect();
         let session = loom_fuzz_fuzz::run_targeted(&cfg, &target, &seeds, &seed_out.dict);
-        let calldata = loom_fuzz_oracle::calldata_of(
-            session
-                .best_input
-                .as_ref()
-                .ok_or("会话无 best_input（契约外：一 run 未执行）")?,
-        );
+        let calldatas: Vec<Vec<u8>> = session
+            .best_steps
+            .as_ref()
+            .ok_or("会话无 best_steps（契约外：一 run 未执行）")?
+            .steps
+            .iter()
+            .map(|s| loom_fuzz_oracle::calldata_of(&s.input))
+            .collect();
         let report = loom_fuzz_oracle::judge_with(
             hit,
             &session,
-            &calldata,
+            &calldatas,
             &loom_fuzz_oracle::JudgeInput {
                 view: Some(&view),
                 expected_evidence: None,

@@ -53,13 +53,23 @@ pub(crate) fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
 /// 单条 call 的 arbitrary_call 臂 3 证据判定：
 /// - kind ∈ {CALL, CALLCODE, DELEGATECALL}（STATICCALL 不收——
 ///   static 上下文不能传 value，语义上不是任意调用漏洞面）；
-/// - input 是**原始交易 calldata 的字节子串**（memcpy 级"裸转发"：
-///   转发器原样吐出 attacker 控制的 calldata 切片）；
+/// - input 是**该步原始交易 calldata 的字节子串**（memcpy 级"裸
+///   转发"：转发器原样吐出 attacker 控制的 calldata 切片；步号 =
+///   RecordedCall.step，issue #35 序列逐步各有一份 calldata）；
 /// - input 长度 ≥ 4（防 trivial 空/短匹配）。
-fn arm3_check(call: &RecordedCall, tx_calldata: &[u8]) -> bool {
+fn arm3_check(call: &RecordedCall, step_calldata: &[u8]) -> bool {
     matches!(call.kind.as_str(), "CALL" | "CALLCODE" | "DELEGATECALL")
         && call.input.len() >= 4
-        && memmem(tx_calldata, &call.input)
+        && memmem(step_calldata, &call.input)
+}
+
+/// 取 call 所属步的 calldata（缺省 = 空切片：子串判定恒不成立，
+/// fail-closed 不跨步误配）。
+fn step_calldata_of<'a>(call: &RecordedCall, calldatas: &'a [Vec<u8>]) -> &'a [u8] {
+    calldatas
+        .get(call.step as usize)
+        .map(|c| c.as_slice())
+        .unwrap_or(&[])
 }
 
 /// arbitrary_call 族 oracle（M0 = 臂 1 求值 + 臂 3 memcmp）。
@@ -92,7 +102,7 @@ pub struct CheckInput<'a> {
 pub fn check_arbitrary_call(
     hit: &Hit,
     calls: &[RecordedCall],
-    tx_calldata: &[u8],
+    calldatas: &[Vec<u8>],
     input: &CheckInput<'_>,
     contract: [u8; 20],
 ) -> CallCheck {
@@ -117,7 +127,7 @@ pub fn check_arbitrary_call(
     // 臂 3：memcmp（裸转发）。
     if !matches!(arm, Some(crate::CallArm::Arm1)) {
         for call in &candidates {
-            if arm3_check(call, tx_calldata) {
+            if arm3_check(call, step_calldata_of(call, calldatas)) {
                 arm3_note = Some((*call).clone());
                 break;
             }
@@ -126,7 +136,7 @@ pub fn check_arbitrary_call(
 
     // 臂 1：target == cast160(evidence)。
     if !matches!(arm, Some(crate::CallArm::Arm3)) {
-        arm1_note = arm1_check(hit, &candidates, tx_calldata, input);
+        arm1_note = arm1_check(hit, &candidates, calldatas, input);
     }
 
     match (arm3_note, arm1_note) {
@@ -148,22 +158,30 @@ pub fn check_arbitrary_call(
     }
 }
 
-/// 臂 1 求值定罪：逐候选 call 比 target 低位 160。
+/// 臂 1 求值定罪：逐候选 call 比 target 低位 160（evidence 在
+/// 该 call 所属步的 calldata 上求值）。
 fn arm1_check(
     hit: &Hit,
     candidates: &[&RecordedCall],
-    tx_calldata: &[u8],
+    calldatas: &[Vec<u8>],
     input: &CheckInput<'_>,
 ) -> Option<RecordedCall> {
     // view 在场：求值器算（需结构化 expr id）；replay 无视图：用
     // poc 内嵌的求值承诺（expr id 可缺——承诺自带）。
     let value = if let Some(view) = input.view {
         let expr = hit.evidence_expr?;
-        eval::eval_word(
-            view,
-            expr,
-            &eval::EvalEnv::new(tx_calldata.to_vec(), default_this()),
-        )?
+        // 逐候选求值：evidence 表达式的 calldata 环境随候选步而变。
+        // 候选间只按各自步的 calldata 判定，先中先用。
+        return candidates.iter().find_map(|call| {
+            let calldata = step_calldata_of(call, calldatas).to_vec();
+            let value = eval::eval_word(view, expr, &eval::EvalEnv::new(calldata, default_this()))?;
+            let low160 = value
+                & ((alloy_primitives::U256::from(1u64) << 160)
+                    - alloy_primitives::U256::from(1u64));
+            let mut target_bytes = [0u8; 32];
+            target_bytes[12..].copy_from_slice(&call.target);
+            (alloy_primitives::U256::from_be_bytes(target_bytes) == low160).then(|| (*call).clone())
+        });
     } else {
         input.expected_evidence?
     };
@@ -192,7 +210,7 @@ fn default_this() -> alloy_primitives::U256 {
 pub fn check_deputy_call(
     hit: &Hit,
     calls: &[RecordedCall],
-    tx_calldata: &[u8],
+    calldatas: &[Vec<u8>],
     input: &CheckInput<'_>,
     contract: [u8; 20],
 ) -> CallCheck {
@@ -208,7 +226,7 @@ pub fn check_deputy_call(
             "target pc {min_pc} 之后无 CALL 族效果（trace.calls 为空或都在 pc 之前）"
         ));
     }
-    match arm1_check(hit, &candidates, tx_calldata, input) {
+    match arm1_check(hit, &candidates, calldatas, input) {
         Some(call) => CallCheck::ConvictedArm1(call),
         None => CallCheck::Rejected(format!(
             "target pc {min_pc} 后 {} 条 call：deputy_call 目标求值不成立（call.target ≠ cast160(evidence)）",
@@ -232,7 +250,7 @@ pub fn check_deputy_call(
 pub fn check_drain_forward(
     hit: &Hit,
     calls: &[RecordedCall],
-    tx_calldata: &[u8],
+    calldatas: &[Vec<u8>],
     contract: [u8; 20],
 ) -> CallCheck {
     let Some(min_pc) = hit.target_pcs.iter().min().copied() else {
@@ -247,21 +265,22 @@ pub fn check_drain_forward(
             "target pc {min_pc} 之后无 CALL 族效果（trace.calls 为空或都在 pc 之前）"
         ));
     }
-    let words: Vec<&[u8]> = tx_calldata
-        .get(4..)
-        .map(|rest| {
-            let n = rest.len() / 32;
-            (0..n).map(|i| &rest[i * 32..i * 32 + 32]).collect()
-        })
-        .unwrap_or_default();
     for call in &candidates {
         if call.input.len() < 4 {
             continue;
         }
-        if memmem(tx_calldata, &call.input) {
+        let step_calldata = step_calldata_of(call, calldatas);
+        if memmem(step_calldata, &call.input) {
             return CallCheck::ConvictedDrain((*call).clone());
         }
-        // 词覆盖：任一完整 32B calldata 头词出现在 input 里。
+        // 词覆盖：该步 calldata 的任一完整 32B 头词出现在 input 里。
+        let words: Vec<&[u8]> = step_calldata
+            .get(4..)
+            .map(|rest| {
+                let n = rest.len() / 32;
+                (0..n).map(|i| &rest[i * 32..i * 32 + 32]).collect()
+            })
+            .unwrap_or_default();
         if words.iter().any(|w| memmem(&call.input, w)) {
             return CallCheck::ConvictedDrain((*call).clone());
         }
@@ -292,6 +311,7 @@ mod tests {
         RecordedCall {
             kind: kind.to_string(),
             from: [0x22; 20],
+            step: 0,
             target: [0x11; 20],
             value: U256::ZERO,
             input,
@@ -317,6 +337,12 @@ mod tests {
 
     const TX: &[u8] = b"\x90\xce\x82\xd4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabcd";
 
+    /// 单步 calldata 序列（各检查器的 calldatas 参数；多步形态见
+    /// multi_contract 集成测试）。
+    fn txs() -> Vec<Vec<u8>> {
+        vec![TX.to_vec()]
+    }
+
     /// 无视图/承诺的判定输入（臂 3 路径与 fail-closed 用）。
     fn no_ctx() -> CheckInput<'static> {
         CheckInput {
@@ -331,7 +357,7 @@ mod tests {
         let r = check_arbitrary_call(
             &hit(&[384]),
             &[call("CALL", b"abcd".to_vec(), Some(384))],
-            TX,
+            &txs(),
             &no_ctx(),
             CONTRACT,
         );
@@ -344,7 +370,7 @@ mod tests {
         let r = check_arbitrary_call(
             &hit(&[384]),
             &[call("STATICCALL", b"abcd".to_vec(), Some(384))],
-            TX,
+            &txs(),
             &no_ctx(),
             CONTRACT,
         );
@@ -353,7 +379,7 @@ mod tests {
         let r = check_arbitrary_call(
             &hit(&[384]),
             &[call("CALL", b"abc".to_vec(), Some(384))],
-            TX,
+            &txs(),
             &no_ctx(),
             CONTRACT,
         );
@@ -362,7 +388,7 @@ mod tests {
         let r = check_arbitrary_call(
             &hit(&[384]),
             &[call("CALL", b"zzzz".to_vec(), Some(384))],
-            TX,
+            &txs(),
             &no_ctx(),
             CONTRACT,
         );
@@ -376,7 +402,7 @@ mod tests {
             call("CALL", b"abcd".to_vec(), Some(100)),
             call("CALL", b"abcd".to_vec(), Some(390)),
         ];
-        let r = check_arbitrary_call(&hit(&[384]), &calls, TX, &no_ctx(), CONTRACT);
+        let r = check_arbitrary_call(&hit(&[384]), &calls, &txs(), &no_ctx(), CONTRACT);
         match r {
             CallCheck::ConvictedArm3(c) => assert_eq!(c.pc, Some(390)),
             other => panic!("应臂 3 定罪: {other:?}"),
@@ -384,7 +410,7 @@ mod tests {
         // target pc 本身不是 call：落到其后第一条。
         let calls = vec![call("CALL", b"abcd".to_vec(), Some(500))];
         assert!(matches!(
-            check_arbitrary_call(&hit(&[384]), &calls, TX, &no_ctx(), CONTRACT),
+            check_arbitrary_call(&hit(&[384]), &calls, &txs(), &no_ctx(), CONTRACT),
             CallCheck::ConvictedArm3(_)
         ));
     }
@@ -401,7 +427,7 @@ mod tests {
         let r = check_arbitrary_call(
             &hit(&[384]),
             &[proxy_call, victim_call],
-            TX,
+            &txs(),
             &no_ctx(),
             CONTRACT,
         );
@@ -412,7 +438,7 @@ mod tests {
         // 全是外帧 call → 拒绝（如实：到场但谓词不成立）。
         let mut foreign = call("CALL", b"abcd".to_vec(), Some(390));
         foreign.from = [0xaau8; 20];
-        let r = check_arbitrary_call(&hit(&[384]), &[foreign], TX, &no_ctx(), CONTRACT);
+        let r = check_arbitrary_call(&hit(&[384]), &[foreign], &txs(), &no_ctx(), CONTRACT);
         let msg = match r {
             CallCheck::Rejected(m) => m,
             other => panic!("应拒绝: {other:?}"),
@@ -445,7 +471,7 @@ mod tests {
             view: Some(&V),
             expected_evidence: None,
         };
-        match check_arbitrary_call(&h, &[c.clone()], TX, &ctx, CONTRACT) {
+        match check_arbitrary_call(&h, &[c.clone()], &txs(), &ctx, CONTRACT) {
             CallCheck::ConvictedArm1(got) => assert_eq!(got.target, target),
             other => panic!("应臂 1 定罪: {other:?}"),
         }
@@ -453,7 +479,7 @@ mod tests {
         let mut bad = c.clone();
         bad.target = [0x99; 20];
         assert!(matches!(
-            check_arbitrary_call(&h, &[bad], TX, &ctx, CONTRACT),
+            check_arbitrary_call(&h, &[bad], &txs(), &ctx, CONTRACT),
             CallCheck::Rejected(_)
         ));
         // replay 模式（无视图，有 poc 内嵌承诺）：同值应定罪。
@@ -468,7 +494,7 @@ mod tests {
             expected_evidence: Some(low160),
         };
         assert!(matches!(
-            check_arbitrary_call(&h, &[c], TX, &ctx_replay, CONTRACT),
+            check_arbitrary_call(&h, &[c], &txs(), &ctx_replay, CONTRACT),
             CallCheck::ConvictedArm1(_)
         ));
     }
@@ -510,7 +536,7 @@ mod tests {
             view: Some(&V),
             expected_evidence: None,
         };
-        match check_deputy_call(&h, &[c.clone()], TX, &ctx, CONTRACT) {
+        match check_deputy_call(&h, &[c.clone()], &txs(), &ctx, CONTRACT) {
             CallCheck::ConvictedArm1(got) => assert_eq!(got.target, target),
             other => panic!("应 deputy 定罪: {other:?}"),
         }
@@ -518,7 +544,7 @@ mod tests {
         let mut bad = c.clone();
         bad.target = [0x99; 20];
         assert!(matches!(
-            check_deputy_call(&h, &[bad], TX, &ctx, CONTRACT),
+            check_deputy_call(&h, &[bad], &txs(), &ctx, CONTRACT),
             CallCheck::Rejected(_)
         ));
         // replay 承诺路径：无视图 + expected_evidence 同值定罪。
@@ -532,7 +558,7 @@ mod tests {
             expected_evidence: Some(low160),
         };
         assert!(matches!(
-            check_deputy_call(&h, &[c], TX, &ctx_replay, CONTRACT),
+            check_deputy_call(&h, &[c], &txs(), &ctx_replay, CONTRACT),
             CallCheck::ConvictedArm1(_)
         ));
     }
@@ -550,7 +576,7 @@ mod tests {
         let r = check_drain_forward(
             &drain_hit(&[384]),
             &[call("CALL", b"abcd".to_vec(), Some(384))],
-            TX,
+            &txs(),
             CONTRACT,
         );
         assert!(matches!(r, CallCheck::ConvictedDrain(_)));
@@ -561,7 +587,7 @@ mod tests {
         let r = check_drain_forward(
             &drain_hit(&[384]),
             &[call("CALL", input, Some(384))],
-            TX,
+            &txs(),
             CONTRACT,
         );
         assert!(matches!(r, CallCheck::ConvictedDrain(_)));
@@ -573,7 +599,7 @@ mod tests {
         let r = check_drain_forward(
             &drain_hit(&[384]),
             &[call("CALL", b"zzzzzzzz".to_vec(), Some(384))],
-            TX,
+            &txs(),
             CONTRACT,
         );
         assert!(matches!(r, CallCheck::Rejected(_)));
@@ -581,7 +607,7 @@ mod tests {
         let r = check_drain_forward(
             &drain_hit(&[384]),
             &[call("CALL", b"abc".to_vec(), Some(384))],
-            TX,
+            &txs(),
             CONTRACT,
         );
         assert!(matches!(r, CallCheck::Rejected(_)));
@@ -592,7 +618,7 @@ mod tests {
         let r = check_drain_forward(
             &drain_hit(&[384]),
             &[call("CALL", fake_word.to_vec(), Some(384))],
-            TX,
+            &txs(),
             CONTRACT,
         );
         assert!(matches!(r, CallCheck::Rejected(_)));

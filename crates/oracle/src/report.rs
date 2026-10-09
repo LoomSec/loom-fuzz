@@ -136,13 +136,16 @@ mod tests {
         let mut a = report(&[1, 2]);
         a.witness = Some(crate::verdict::Witness {
             evidence_value: None,
-            input: loom_fuzz_fuzz::Input {
-                selector: 0,
-                caller: [0; 20],
-                value: alloy_primitives::U256::ZERO,
-                head: Vec::new(),
-                tail: loom_fuzz_fuzz::Tail::Empty,
-            },
+            steps: vec![loom_fuzz_fuzz::Step {
+                target: [0x22; 20],
+                input: loom_fuzz_fuzz::Input {
+                    selector: 0,
+                    caller: [0; 20],
+                    value: alloy_primitives::U256::ZERO,
+                    head: Vec::new(),
+                    tail: loom_fuzz_fuzz::Tail::Empty,
+                },
+            }],
             trace: loom_fuzz_fuzz::WitnessTrace {
                 contract: [0x22; 20],
                 deployments: Vec::new(),
@@ -151,11 +154,13 @@ mod tests {
                 outcome: loom_fuzz_fuzz::OutcomeKind::Stop,
                 gas_used: 0,
                 truncated: false,
+                step_outcomes: vec![loom_fuzz_fuzz::OutcomeKind::Stop],
             },
             pc: 1,
             evidence_call: loom_fuzz_fuzz::RecordedCall {
                 kind: "CALL".to_string(),
                 from: [0x22; 20],
+                step: 0,
                 target: [0; 20],
                 value: alloy_primitives::U256::ZERO,
                 input: Vec::new(),

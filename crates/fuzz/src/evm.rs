@@ -22,16 +22,16 @@ use revm::{
         CallInputs, CallScheme, CreateInputs, Interpreter, InterpreterAction, InterpreterResult,
     },
     primitives::{hardfork::SpecId, Address, Bytes, TxKind},
-    InspectEvm, MainBuilder, MainContext,
+    InspectCommitEvm, MainBuilder, MainContext,
 };
 
 use crate::exec::{ExecConfig, OutcomeKind, RecordedCall, WitnessTrace};
-use loom_fuzz_seed::{Input, Tail};
+use loom_fuzz_seed::{Input, Tail, TxSequence};
 
-/// 会话内单 run 的执行结果（内部表示，序列化形态见 WitnessTrace）。
+/// 单 run 的执行结果（内部表示，序列化形态见 WitnessTrace）。
 pub(crate) struct RunResult {
     pub trace: WitnessTrace,
-    /// fitness 计算所需的 visited pcs（有序去重）。
+    /// fitness 计算所需的 visited pcs（各步并集，有序去重）。
     pub visited_pcs: Vec<u32>,
     /// 本 run 观测到的比较操作数对（LT/GT/SLT/SGT/EQ，step 时栈顶
     /// 两元；ISZERO 不收——单操作数，无回灌价值）。
@@ -40,7 +40,7 @@ pub(crate) struct RunResult {
     /// 收值）。
     pub storage_observed: Vec<(U256, U256)>,
     /// revert 归因：最近经过的支配 guard（ExecConfig.guard_context
-    /// 非空且结局 Revert 时产出）。
+    /// 非空且某步 Revert 时产出——取最近 revert 步的归因）。
     pub feedback_guard: Option<crate::exec::GuardFeedback>,
 }
 
@@ -154,6 +154,7 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
         self.calls.push(RecordedCall {
             kind: kind.to_string(),
             from: inputs.caller.into_array(),
+            step: 0,
             target: inputs.target_address.into_array(),
             value: inputs.value.get(),
             input,
@@ -187,6 +188,7 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
         self.calls.push(RecordedCall {
             kind: kind.to_string(),
             from: inputs.caller().into_array(),
+            step: 0,
             target,
             value: inputs.value(),
             input: inputs.init_code().to_vec(),
@@ -199,6 +201,7 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
         self.calls.push(RecordedCall {
             kind: "SELFDESTRUCT".to_string(),
             from: contract.into_array(),
+            step: 0,
             target: target.0.into(),
             value,
             input: Vec::new(),
@@ -207,16 +210,28 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
     }
 }
 
-/// 单 run：布置世界状态 → 执行 → 收 witness。`input` 序列化为
+/// 单 run：布置世界状态 → **逐步执行调用序列**（同一 CacheDB
+/// overlay 续跑，`inspect_tx_commit` 逐步提交——状态跨步持久，
+/// revert 步只回滚自身效果）→ 收 witness。各步 input 序列化为
 /// calldata（selector 4B + head 原样拼接 + tail 原样拼接；执行器
-/// 不感知 ABI，指针槽正确性是种子/变异器的责任，见 lib.rs 职责边界）。
+/// 不感知 ABI，指针槽正确性是种子/变异器的责任，见 lib.rs 职责
+/// 边界）。
 ///
 /// fork 态（cfg.fork = Some）：世界 = CacheDB(远端 AlloyDB 读路径 +
 /// 共享缓存) 叠层——overlay（合约/prestate/deployments/caller）照旧
 /// 写 CacheDB 本地，miss 时按 pin block 远程读（on-demand，任何深度）。
-pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResult {
+///
+/// `targets` = 目标 pc 集合（排序）：定位**到达步**——trace.truncated
+/// 只计到达步及其之前的截断（之后的步不影响已成立的到场见证，如实
+/// 不夸大 inconclusive）。
+pub(crate) fn execute(
+    cfg: &ExecConfig,
+    seq: &TxSequence,
+    step_cap: u64,
+    targets: &[u32],
+) -> RunResult {
     match &cfg.fork {
-        None => execute_on(cfg, CacheDB::new(EmptyDB::new()), input, step_cap),
+        None => execute_on(cfg, CacheDB::new(EmptyDB::new()), seq, step_cap, targets),
         Some(fork) => {
             let key = std::env::var("BLOCKMACHINE_API_KEY").unwrap_or_default();
             let remote =
@@ -224,8 +239,9 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
             execute_on(
                 cfg,
                 CacheDB::new(revm::database_interface::WrapDatabaseRef(remote)),
-                input,
+                seq,
                 step_cap,
+                targets,
             )
         }
     }
@@ -235,8 +251,9 @@ pub(crate) fn execute(cfg: &ExecConfig, input: &Input, step_cap: u64) -> RunResu
 fn execute_on<DB: revm::DatabaseRef>(
     cfg: &ExecConfig,
     mut db: CacheDB<DB>,
-    input: &Input,
+    seq: &TxSequence,
     step_cap: u64,
+    targets: &[u32],
 ) -> RunResult {
     // 合约账户（固定布置，不走 create 交易）。
     db.insert_account_info(
@@ -266,15 +283,17 @@ fn execute_on<DB: revm::DatabaseRef>(
         );
     }
     // caller 账户：大额余额（余额敏感分支读到确定值）、nonce 0。
-    let caller = Address::from(input.caller);
-    db.insert_account_info(
-        caller,
-        revm::state::AccountInfo {
-            balance: U256::from(u128::MAX),
-            nonce: 0,
-            ..Default::default()
-        },
-    );
+    // 序列各步 caller 可能不同：逐一步布置（重复插入同值，幂等）。
+    for step in &seq.steps {
+        db.insert_account_info(
+            Address::from(step.input.caller),
+            revm::state::AccountInfo {
+                balance: U256::from(u128::MAX),
+                nonce: 0,
+                ..Default::default()
+            },
+        );
+    }
 
     let ctx: CtxFor<DB> =
         Context::mainnet()
@@ -285,84 +304,104 @@ fn execute_on<DB: revm::DatabaseRef>(
                 cfg_env.disable_balance_check = true;
             });
 
-    let calldata = calldata_of(input);
-    // 顶层交易目标：entry 模式（issue #34）指向表内入口合约（攻击
-    // 代理），缺省 = victim（单步默认现状）。
-    let tx_target = cfg.entry.map_or_else(
-        || Address::from(cfg.address),
-        |entry| {
-            debug_assert!(
-                entry == cfg.address || cfg.deployments.iter().any(|d| d.address == entry),
-                "entry 须在合约表内（装载层已 fail-closed 校验）"
-            );
-            Address::from(entry)
-        },
-    );
-    let tx = TxEnv::builder()
-        .caller(caller)
-        .kind(TxKind::Call(tx_target))
-        .value(input.value)
-        .data(Bytes::from(calldata))
-        .gas_limit(cfg.gas_per_tx)
-        .build()
-        .expect("Legacy 无签名域校验，TxEnv 构造不失败");
-
     let mut evm = ctx.build_mainnet_with_inspector(WitnessInspector::new(step_cap));
-    let result = match evm.inspect_tx(tx) {
-        Ok(result) => result,
-        // 交易验证失败（如 gas limit 低于 intrinsic gas——预算配置
-        // 过紧）：如实记截断（inconclusive 数据源），不 panic。
-        Err(_e) => {
-            return RunResult {
-                trace: WitnessTrace {
-                    contract: cfg.address,
-                    visited_pcs: Vec::new(),
-                    calls: Vec::new(),
-                    outcome: OutcomeKind::Invalid,
-                    gas_used: cfg.gas_per_tx,
-                    truncated: true,
-                    deployments: cfg.deployments.clone(),
-                },
-                visited_pcs: Vec::new(),
-                cmp_observed: Vec::new(),
-                storage_observed: Vec::new(),
-                feedback_guard: None,
-            };
+
+    // 逐步执行：inspector 每步换新（pc/call 记录不跨步混淆），状态
+    // 经 inspect_tx_commit 逐步提交进 overlay（revert 步提交的是
+    // 回滚后状态 = 无效果，EVM 语义自然正确）。
+    let mut visited: BTreeSet<u32> = BTreeSet::new();
+    let mut step_visited: Vec<Vec<u32>> = Vec::with_capacity(seq.steps.len());
+    let mut step_outcomes: Vec<OutcomeKind> = Vec::with_capacity(seq.steps.len());
+    let mut step_truncs: Vec<bool> = Vec::with_capacity(seq.steps.len());
+    let mut calls: Vec<RecordedCall> = Vec::new();
+    let mut cmp_observed: Vec<[U256; 2]> = Vec::new();
+    let mut storage_observed: Vec<(U256, U256)> = Vec::new();
+    let mut gas_used: u64 = 0;
+    let mut feedback_guard: Option<crate::exec::GuardFeedback> = None;
+
+    for (i, step) in seq.steps.iter().enumerate() {
+        debug_assert!(
+            step.target == cfg.address || cfg.deployments.iter().any(|d| d.address == step.target),
+            "step.target 须在合约表内（装载层已 fail-closed 校验）"
+        );
+        evm.inspector = WitnessInspector::new(step_cap);
+        let tx = TxEnv::builder()
+            .caller(Address::from(step.input.caller))
+            .kind(TxKind::Call(Address::from(step.target)))
+            .value(step.input.value)
+            .data(Bytes::from(calldata_of(&step.input)))
+            .gas_limit(cfg.gas_per_tx)
+            .build()
+            .expect("Legacy 无签名域校验，TxEnv 构造不失败");
+        let result = match evm.inspect_tx_commit(tx) {
+            Ok(result) => result,
+            // 交易验证失败（如 gas limit 低于 intrinsic gas——预算
+            // 配置过紧）：如实记该步截断（inconclusive 数据源），
+            // 不 panic；后续步照跑（状态未被污染）。
+            Err(_e) => {
+                step_visited.push(Vec::new());
+                step_outcomes.push(OutcomeKind::Invalid);
+                step_truncs.push(true);
+                gas_used += cfg.gas_per_tx;
+                continue;
+            }
+        };
+        // 合并本步 witness（call 的步号如实标注）。
+        for mut call in std::mem::take(&mut evm.inspector.calls) {
+            call.step = i as u32;
+            calls.push(call);
         }
-    };
+        let inspector = &evm.inspector;
+        let (outcome, gas, truncated_by_gas) = map_result(&result);
+        let truncated = inspector.step_capped || truncated_by_gas;
+        visited.extend(inspector.visited.iter().copied());
+        step_visited.push(inspector.visited.iter().copied().collect());
+        cmp_observed.extend(inspector.cmp_observed.iter().copied());
+        storage_observed.extend(inspector.storage_observed.iter().copied());
+        step_outcomes.push(outcome);
+        step_truncs.push(truncated);
+        gas_used += gas;
+        // revert 归因：最近 revert 步的 visited 序最后一个 guard pc。
+        if outcome == OutcomeKind::Revert && !cfg.guard_context.is_empty() {
+            feedback_guard = inspector.visited_order.iter().rev().find_map(|pc| {
+                cfg.guard_context
+                    .iter()
+                    .find(|g| g.pc == *pc)
+                    .map(|g| crate::exec::GuardFeedback {
+                        pc: g.pc,
+                        cond_rendered: g.cond.clone(),
+                        polarity_failed: true,
+                    })
+            });
+        }
+    }
 
-    let inspector = evm.inspector;
-    let (outcome, gas_used, truncated_by_gas) = map_result(&result.result);
-    let truncated = inspector.step_capped || truncated_by_gas;
-
-    // revert 归因：visited 序的最后一个 guard pc。
-    let feedback_guard = if outcome == OutcomeKind::Revert && !cfg.guard_context.is_empty() {
-        inspector.visited_order.iter().rev().find_map(|pc| {
-            cfg.guard_context
-                .iter()
-                .find(|g| g.pc == *pc)
-                .map(|g| crate::exec::GuardFeedback {
-                    pc: g.pc,
-                    cond_rendered: g.cond.clone(),
-                    polarity_failed: true,
-                })
-        })
-    } else {
-        None
+    // 到达步 = 首个 visited 含目标 pc 的步；截断如实只计到达步及
+    // 之前（之后步的截断不动摇已成立的到场见证）。
+    let arrival = step_visited
+        .iter()
+        .position(|pcs| pcs.iter().any(|pc| targets.contains(pc)));
+    let truncated = match arrival {
+        Some(k) => step_truncs[..=k].iter().any(|t| *t),
+        None => step_truncs.iter().any(|t| *t),
     };
     RunResult {
         trace: WitnessTrace {
             contract: cfg.address,
-            visited_pcs: inspector.visited.iter().copied().collect(),
-            calls: inspector.calls,
-            outcome,
+            visited_pcs: visited.iter().copied().collect(),
+            calls,
+            outcome: step_outcomes
+                .last()
+                .copied()
+                .unwrap_or(OutcomeKind::Invalid),
             gas_used,
             truncated,
             deployments: cfg.deployments.clone(),
+            step_outcomes,
         },
-        visited_pcs: inspector.visited.iter().copied().collect(),
-        cmp_observed: inspector.cmp_observed,
-        storage_observed: inspector.storage_observed,
+        visited_pcs: visited.iter().copied().collect(),
+        cmp_observed,
+        storage_observed,
         feedback_guard,
     }
 }
@@ -454,6 +493,7 @@ mod tests {
             fork: None,
             deployments: Vec::new(),
             entry: None,
+            max_steps: 1,
             guard_context: Vec::new(),
         };
         let input = Input {
@@ -463,7 +503,8 @@ mod tests {
             head: Vec::new(),
             tail: Tail::Empty,
         };
-        let run = execute(&cfg, &input, 1_000_000);
+        let seq = TxSequence::single([0x22; 20], input);
+        let run = execute(&cfg, &seq, 1_000_000, &[0]);
         assert_eq!(run.trace.calls.len(), 1);
         let call = &run.trace.calls[0];
         assert_eq!(call.kind, "CALL");
@@ -493,6 +534,7 @@ mod tests {
             fork: None,
             deployments: Vec::new(),
             entry: None,
+            max_steps: 1,
             guard_context: Vec::new(),
         };
         let input = Input {
@@ -502,7 +544,8 @@ mod tests {
             head: Vec::new(),
             tail: Tail::Empty,
         };
-        let run = execute(&cfg, &input, 100);
+        let seq = TxSequence::single([0x22; 20], input);
+        let run = execute(&cfg, &seq, 100, &[0]);
         assert!(run.trace.truncated);
         assert_eq!(run.trace.outcome, OutcomeKind::OutOfGas);
         assert!(run.trace.visited_pcs.len() <= 4);

@@ -46,7 +46,7 @@ pub use family::{
 pub use hit::{CallArm, GuardFact, Hit, HitFamily, SELECTOR_SENTINEL};
 pub use poc::{
     build_poc, bytes_hex, calldata_of, hex_bytes, hex_u256, input_from_calldata, replay, Poc,
-    PocCall, PocDeployment, PocFork, PocTx, POC_FORMAT,
+    PocCall, PocDeployment, PocFork, PocStep, PocTx, POC_FORMAT,
 };
 pub use report::{coverage, Budgets, Coverage, FuzzReport, Guidance, HitEntry, REPORT_FORMAT};
 pub use verdict::Family;

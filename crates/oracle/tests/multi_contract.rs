@@ -15,7 +15,7 @@ use std::time::Duration;
 use alloy_primitives::U256;
 use loom_fuzz_fuzz::{forwarder_runtime, run_targeted, Deployment, ExecConfig};
 use loom_fuzz_oracle::{build_poc, calldata_of, judge, replay, Hit, Verdict};
-use loom_fuzz_seed::{HitView, Input, Tail, Target, ValueDictionary};
+use loom_fuzz_seed::{HitView, Input, Tail, Target, TxSequence, ValueDictionary};
 
 const VICTIM: [u8; 20] = [0x22; 20];
 const PROXY: [u8; 20] = [0xaau8; 20];
@@ -93,6 +93,7 @@ fn exec_config(entry: Option<[u8; 20]>, deployments: Vec<Deployment>) -> ExecCon
         fork: None,
         deployments,
         entry,
+        max_steps: 1,
         guard_context: Vec::new(),
     }
 }
@@ -104,18 +105,22 @@ fn run_and_judge(cfg: &ExecConfig) -> loom_fuzz_oracle::HitReport {
         hit: &view,
         func: 0,
     };
+    // entry 的生效形态（issue #34/#35）：装载层把单步种子目标换为
+    // 入口合约；执行器只认 Step.target。
+    let seed_target = cfg.entry.unwrap_or(cfg.address);
     let session = run_targeted(
         cfg,
         &target,
-        &[seed_input()],
+        &[TxSequence::single(seed_target, seed_input())],
         &ValueDictionary { words: vec![] },
     );
     assert!(
         session.reached,
         "种子首 run 应直达 target pc 0: {session:?}"
     );
-    let calldata = calldata_of(session.best_input.as_ref().expect("reached 必有输入"));
-    judge(&hit, &session, &calldata)
+    let seq = session.best_steps.as_ref().expect("reached 必有见证");
+    let calldatas: Vec<Vec<u8>> = seq.steps.iter().map(|s| calldata_of(&s.input)).collect();
+    judge(&hit, &session, &calldatas)
 }
 
 /// 两合约在场：顶层交易进攻击代理，代理 CALL 转发 calldata 到
@@ -150,7 +155,7 @@ fn proxy_entry_confirms_via_victim_frame() {
     assert_eq!(evidence.target, SINK);
     assert_eq!(
         evidence.input,
-        calldata_of(&witness.input),
+        calldata_of(&witness.steps[0].input),
         "臂 3 裸转发：input = 原始交易 calldata"
     );
     assert_eq!(witness.pc, 0);

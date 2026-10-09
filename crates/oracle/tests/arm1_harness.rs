@@ -11,7 +11,7 @@ use alloy_primitives::U256;
 use loom_fuzz_fuzz::{run_targeted, ExecConfig};
 use loom_fuzz_oracle::eval::{EvalViewDyn, OwnedNode};
 use loom_fuzz_oracle::{judge_with, CallArm, Hit, JudgeInput, Verdict};
-use loom_fuzz_seed::{HitView, Input, Tail, Target, ValueDictionary};
+use loom_fuzz_seed::{HitView, Input, Tail, Target, TxSequence, ValueDictionary};
 
 /// 微型路由器字节码：CALLDATALOAD(4) 作 target，空 input CALL 之。
 /// 布局：5×PUSH1 0（out_size..value）+ PUSH1 4 CALLDATALOAD（to）
@@ -78,11 +78,17 @@ fn session() -> loom_fuzz_fuzz::SessionReport {
         fork: None,
         deployments: Vec::new(),
         entry: None,
+        max_steps: 1,
         guard_context: Vec::new(),
     };
     let hit = HarnessHit;
     let target = Target { hit: &hit, func: 0 };
-    let report = run_targeted(&cfg, &target, &[seed], &ValueDictionary { words: vec![] });
+    let report = run_targeted(
+        &cfg,
+        &target,
+        &[TxSequence::single([0x22; 20], seed)],
+        &ValueDictionary { words: vec![] },
+    );
     assert!(report.reached, "harness 应到场: {report:?}");
     assert_eq!(report.trace.calls.len(), 1);
     assert_eq!(report.trace.calls[0].target[19], 0x34);
@@ -106,11 +112,12 @@ fn hit() -> Hit {
 #[test]
 fn arm1_confirmed_on_router_harness() {
     let report = session();
-    let calldata = loom_fuzz_oracle::calldata_of(report.best_input.as_ref().unwrap());
+    let calldata =
+        loom_fuzz_oracle::calldata_of(&report.best_steps.as_ref().unwrap().steps[0].input);
     let r = judge_with(
         &hit(),
         &report,
-        &calldata,
+        &[calldata],
         &JudgeInput {
             view: Some(&HarnessView),
             expected_evidence: None,
@@ -128,11 +135,12 @@ fn arm1_confirmed_on_router_harness() {
 fn arm1_replay_via_expected_evidence() {
     // replay 形态：无视图，用 poc 内嵌 evidence_value 重放判定。
     let report = session();
-    let calldata = loom_fuzz_oracle::calldata_of(report.best_input.as_ref().unwrap());
+    let calldata =
+        loom_fuzz_oracle::calldata_of(&report.best_steps.as_ref().unwrap().steps[0].input);
     let r = judge_with(
         &hit(),
         &report,
-        &calldata,
+        std::slice::from_ref(&calldata),
         &JudgeInput {
             view: None,
             expected_evidence: Some(U256::from(0x1234u64)),
@@ -143,7 +151,7 @@ fn arm1_replay_via_expected_evidence() {
     let r_bad = judge_with(
         &hit(),
         &report,
-        &calldata,
+        &[calldata],
         &JudgeInput {
             view: None,
             expected_evidence: Some(U256::from(0x9999u64)),
@@ -162,11 +170,12 @@ fn arm1_eval_bottom_is_fail_closed() {
         }
     }
     let report = session();
-    let calldata = loom_fuzz_oracle::calldata_of(report.best_input.as_ref().unwrap());
+    let calldata =
+        loom_fuzz_oracle::calldata_of(&report.best_steps.as_ref().unwrap().steps[0].input);
     let r = judge_with(
         &hit(),
         &report,
-        &calldata,
+        &[calldata],
         &JudgeInput {
             view: Some(&EmptyView),
             expected_evidence: None,
