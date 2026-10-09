@@ -92,9 +92,23 @@ HitSet
   │     selector 头 / guard 常量 / 边界值 ±1 / caller / 存储槽(标 free)
   ▼
 定向执行（crates/fuzz）
-  │  ② revm 单合约会话，种子进场
+  │  ② revm 多交易 stateful 会话（issue #35）：witness = 调用序列
+  │     （Step = target + calldata + caller + value；steps.len()==1
+  │     与旧单步路径语义完全等价）——逐步执行于同一 CacheDB
+  │     overlay（inspect_tx_commit 逐步提交，状态跨步持久，revert
+  │     步只回滚自身效果，如实记 step_outcomes）；inspector 每步
+  │     换新（pc/call 不跨步混淆，call 记 step 号），fork 态与
+  │     Genesis 态同路径（#24 叠层）。截断如实只计到达步及之前。
   │  ③ --target 制导：CFG PC 距离表，距离缩小的输入保留进化
-  │  ④ 变异：比较操作数回灌 / 常量池整参覆盖 / 存储值入池 / 数值高斯缩放
+  │     （fitness = 各步 visited 的块距离最小）
+  │  ④ 变异：步内 = 既有五算子（原样复用）；序列级 = 组装算子
+  │     （issue #35，sequence 模块）：提案器仍产步级候选，执行环
+  │     按配比机械组装——60% 单步 / 20% append（素材序列 + 合约表
+  │     新目标一步）/ 20% splice（两素材拼接截断到 --max-steps），
+  │     多步序列 50% 再步内变异一轮。素材 = 反馈窗序列 ∪ 会话步级
+  │     池（step_pool：一切运行见过的步输入，去重 FIFO 上限 256
+  │     ——布置步等 fitness 死路在此留存，信用分配的关键）；
+  │     max_steps=1 时组装不耗随机数，逐位等价旧路径。
   ▼
 族 oracle + 三值判决（crates/oracle）
   │  ⑤ 到目标帧后在具体 trace 上求值证据表达式（按族定制检查器；
@@ -116,10 +130,18 @@ HitSet
   │     caller 绑定（宽松 memmem：input 是 calldata 子串 或 含完整
   │     32B calldata 头词——sound 近似，语义选择文档注明））
   │  ⑥ 判决真值表（fail-closed：无见证只降级不过滤）：
-  │        reached && !truncated && 证据成立 → confirmed → poc.json
-  │          （loom-fuzz-poc@1：tx/prestate/seed/max_runs + replay 命令串，
+  │        reached（序列任意步到达即 L1 到场）&& !truncated
+  │          && 证据成立 → confirmed → poc.json
+  │          （loom-fuzz-poc@1：steps（各步 target+caller+value+
+  │          calldata）/prestate/seed/max_runs + replay 命令串；旧单步
+  │          poc 的 legacy `tx` 由 normalized_steps 归一——向后兼容；
   │          replay 用确定性参数重建会话重跑，verdict 逐字节一致）
   │        未到达 → unreachable（FP 候选降级）｜truncated → inconclusive
+  │        revert 步如实记 WitnessTrace.step_outcomes（状态未变，序列
+  │        续跑），归因经 revert 守卫反馈（最近 revert 步的支配
+  │        guard）；定罪判语附 revert 步标注。族检查器的 calldata
+  │        环境逐步（RecordedCall.step 索引）——臂 3 子串/臂 1 求值
+  │        各归所属步。
   ▼
 fuzz_report.json（loom-fuzz-report@1：per-hit 判决 + 覆盖 + corpus 规模
   + seed 编译全量假设 + guided vs baseline 数据；空命中集也照落）
@@ -171,6 +193,8 @@ loom-fuzz run … --fork-url <url> --fork-block latest --contract-addr 0x… \
 # 多合约装载 + 攻击代理入口（issue #34，Genesis / fork 两态归一同规格）
 loom-fuzz run … --deploy 0xAA…:forwarder --deploy 0xBB…:responder \
   --entry 0xAA…   # 入口须 = 分析合约或某个 --deploy 地址（fail-closed）
+# 多交易 stateful 搜索（issue #35）：witness = 调用序列（状态跨步持久）
+loom-fuzz run … --max-steps 4   # 序列长度上限（默认 1 = 单步，语义同旧）
 # L2 exploit 影响层：confirmed poc.json → Foundry 工程 + forge test
 loom-fuzz exploit poc-….json --code bytecode.hex --out exploit/ [--fork]
 ```

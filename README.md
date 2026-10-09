@@ -59,6 +59,7 @@ loom-evm 反编译产出的静态事实直接编译成 fuzz 的输入空间：
 - **M0.8**：分层搜索——全槽字典基座 + 多槽协同变异（dictionary 为唯一搜索路线，#29 决策移除外部模型提案器）；revert 归因（loom 静态事实）辅助进化，判决独立（#25/#29）
 - **M0.9**：approval_drain 族（issue #20）——deputy_call（有 caller 守卫但目标可控 = confused deputy）/ drain_forward（input 含输入派生词且不与 caller 绑定）的装载（模式 A 双 pack 并集 / 模式 B 内置推导逐条对齐 loom packs）+ 族 oracle（deputy 复用臂 1 求值 / drain 宽松 memmem）+ L2 通用 ERC20 形状动作选择（不匹配如实报"无通用动作"）。签入 fixtures/real-world/（vvisr RewardsHypervisor / anyswap V4Router）。
 - **M1.0**：多合约装载（issue #34）——`--deploy` 多值（合约表 = victim + 各部署）+ 机械 `forwarder` 攻击代理规格 + `--entry` 入口（caller 轮换 ATTACKER → 攻击合约 → victim 的第一环）；witness 记 call 的 `from` 与目标帧 `contract`，oracle 按 victim 帧过滤（多合约 trace pc 数值跨代码库的正确性兜底）。Genesis / fork 两态、模式 A/B 归一不变；#35 序列搜索在合约表上扩展。
+- **M1.1**：多交易 stateful 搜索（issue #35）——witness = 调用序列（`Step = target + calldata + caller + value`，steps.len()==1 与单步路径逐位等价）：逐步执行于同一 CacheDB overlay（状态跨步持久，revert 步如实记 step_outcomes），oracle 任意步到达即 L1 到场、族检查器逐步 calldata；序列级组装算子（append / splice / 步内变异，素材 = 反馈窗 ∪ 会话步级池——布置步 fitness 死路的信用分配留存），`--max-steps` 机械约束（默认 1 = 单步）；poc.json `steps` 序列化，旧单步 poc 经 legacy `tx` 归一可 replay。
 
 ```sh
 loom-fuzz run --shard hit.lst --code bytecode.hex --prestate slots.json --out out/

@@ -113,6 +113,52 @@ pub enum Tail {
     Free,
 }
 
+/// 调用序列中的一步（issue #35）：call target（执行器合约表成员，
+/// 缺省 victim）+ 完整输入（selector/head/tail 即 calldata，外加
+/// caller / value）——即"target + calldata + caller + value"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Step {
+    pub target: [u8; 20],
+    pub input: Input,
+}
+
+/// witness = 调用序列（issue #35）：多步攻击的搜索与见证单位。
+/// 状态跨步持久（同一 CacheDB overlay 续跑）。**steps.len() == 1
+/// 与旧单步路径语义完全等价**（单步 = 单交易，默认现状）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxSequence {
+    pub steps: Vec<Step>,
+}
+
+impl TxSequence {
+    /// 单步序列（缺省形态）：target = victim，input 照给。
+    pub fn single(target: [u8; 20], input: Input) -> Self {
+        TxSequence {
+            steps: vec![Step { target, input }],
+        }
+    }
+
+    /// 字典序排序键（corpus/精英去重与父代选择的唯一依据）：
+    /// 各步 step.sort_key 依次拼接，确定性。
+    pub fn sort_key(&self) -> Vec<u8> {
+        let mut key = Vec::new();
+        for step in &self.steps {
+            key.extend_from_slice(&step.sort_key());
+        }
+        key
+    }
+}
+
+impl Step {
+    /// 步级排序键：target ++ input.sort_key——步级池去重的唯一依据。
+    pub fn sort_key(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(20 + 32);
+        key.extend_from_slice(&self.target);
+        key.extend_from_slice(&self.input.sort_key());
+        key
+    }
+}
+
 /// 值字典：guard 常量 ∪ 证据常量 ∪ 字节码 PUSH 立即数（∪ 白名单/
 /// registry 常量，shard 无此事实段故缺省）——去重升序，变异器的
 /// 常量池来源。

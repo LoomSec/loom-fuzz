@@ -126,6 +126,11 @@ impl DistanceTable {
         self.target_pcs.contains(&pc)
     }
 
+    /// 目标 pc 集合（排序 Vec）：序列执行的到达步定位用（issue #35）。
+    pub fn targets(&self) -> Vec<u32> {
+        self.target_pcs.iter().copied().collect()
+    }
+
     /// 单个 pc 的块距离（pc 不在任何块 = `u32::MAX`）。
     pub fn pc_distance(&self, pc: u32) -> u32 {
         match self.pc_to_block.get(pc as usize) {

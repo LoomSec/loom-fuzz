@@ -55,8 +55,20 @@
 //! [`RecordedCall.from`]（发 call 的合约）与 [`WitnessTrace.contract`]
 //! （目标帧所属合约），oracle 据两者过滤出 victim 帧的 call——
 //! 多合约 trace 里 pc 数值跨代码库不再可比的正确性兜底。
-//! 序列搜索（#35）在合约表上扩展 caller 轮换；本 crate 不预设
-//! 任何个案形态。
+//!
+//! # 调用序列 witness（issue #35）
+//!
+//! 搜索与见证单位升级为 [`TxSequence`]（`steps: Vec<Step>`，
+//! Step = target + calldata + caller + value）：每 run 逐步执行于
+//! 同一 CacheDB overlay（`inspect_tx_commit` 逐步提交——状态跨步
+//! 持久，revert 步只回滚自身并如实记 `step_outcomes`），inspector
+//! 每步换新，call 记 `step` 号；oracle 目标帧**任意步到达**即 L1
+//! 到场，族检查器按 `RecordedCall.step` 取该步 calldata 做子串/
+//! 求值。序列级搜索 = 执行环组装算子（[`sequence`] 模块：append /
+//! splice / 步内变异，素材 = 反馈窗 ∪ 会话步级池——信用分配关键），
+//! `max_steps == 1` 时组装不耗随机数、逐位等价旧单步路径。序列
+//! 搜索（#35）在合约表上扩展 caller 轮换；本 crate 不预设任何
+//! 个案形态。
 //!
 //! # CFG 距离表
 //!
@@ -129,6 +141,7 @@ mod mutate;
 mod mutators;
 pub mod propose;
 mod rng;
+mod sequence;
 
 pub use cfg::DistanceTable;
 pub use exec::{
@@ -139,6 +152,6 @@ pub use exec::{
 pub use fork::{
     forwarder_runtime, pin_block, responder_runtime, responder_runtime_sender, ForkConfig, ForkDb,
 };
-pub use loom_fuzz_seed::{HitView, Input, Tail, Target, ValueDictionary};
+pub use loom_fuzz_seed::{HitView, Input, Step, Tail, Target, TxSequence, ValueDictionary};
 pub use propose::DictionaryProposer;
 pub use rng::Rng;

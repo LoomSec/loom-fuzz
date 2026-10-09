@@ -493,6 +493,7 @@ mod tests {
             fork: None,
             deployments: Vec::new(),
             entry: None,
+            max_steps: 1,
             guard_context: Vec::new(),
         }
     }
@@ -508,7 +509,8 @@ mod tests {
     }
 
     fn run(code: &[u8], input: &Input, prestate: BTreeMap<U256, U256>) -> crate::evm::RunResult {
-        execute(&cfg_for(code.to_vec(), prestate), input, 1_000_000)
+        let seq = loom_fuzz_seed::TxSequence::single([0x22; 20], input.clone());
+        execute(&cfg_for(code.to_vec(), prestate), &seq, 1_000_000, &[0])
     }
 
     // -- 算子 1：比较回灌穿 EQ ------------------------------------------
@@ -767,7 +769,8 @@ mod tests {
     fn pools_dedup_and_cap() {
         let cfg = cfg_for(vec![0x5b, 0x00], BTreeMap::new());
         let input = input_with(U256::ZERO);
-        let mut run = execute(&cfg, &input, 1_000_000);
+        let seq = loom_fuzz_seed::TxSequence::single([0x22; 20], input.clone());
+        let mut run = execute(&cfg, &seq, 1_000_000, &[0]);
         run.cmp_observed = [[U256::from(1u64), U256::from(2u64)]].to_vec();
         run.storage_observed = vec![(U256::from(3u64), U256::from(4u64))];
         let mut pool = Pools::new();
@@ -777,7 +780,7 @@ mod tests {
         assert_eq!(pool.cmp().len(), 2);
         assert_eq!(pool.storage().len(), 1);
         // 上限：灌爆 cmp 池。
-        let mut run2 = execute(&cfg, &input, 1_000_000);
+        let mut run2 = execute(&cfg, &seq, 1_000_000, &[0]);
         run2.cmp_observed = (0..600u64)
             .map(|i| [U256::from(i), U256::from(i + 1000)])
             .collect();

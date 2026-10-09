@@ -58,6 +58,7 @@ fn cfg_for(code: Vec<u8>, guards: Vec<GuardContext>) -> ExecConfig {
         fork: None,
         deployments: Vec::new(),
         entry: None,
+        max_steps: 1,
         guard_context: guards,
     }
 }
@@ -131,10 +132,11 @@ fn revert_attribution_reports_last_passed_guard() {
     // word0 对（过 guard A），word1 错（guard B 失败 revert）。
     let seed = input(0xdeadbeef, &[0xaaaa, 0x1234]);
     let mut cap = CapturingProposer { seen: Vec::new() };
+    let seeds = [loom_fuzz_seed::TxSequence::single([0x22; 20], seed)];
     let report = run_targeted_with(
         &cfg,
         &target,
-        &[seed],
+        &seeds,
         &ValueDictionary { words: vec![] },
         &mut cap,
     );
@@ -144,8 +146,8 @@ fn revert_attribution_reports_last_passed_guard() {
         .iter()
         .find(|f| {
             f.outcome == OutcomeKind::Revert
-                && f.input.head[0] == U256::from(0xaaaau64).to_be_bytes::<32>()
-                && f.input.head[1] == U256::from(0x1234u64).to_be_bytes::<32>()
+                && f.seq.steps[0].input.head[0] == U256::from(0xaaaau64).to_be_bytes::<32>()
+                && f.seq.steps[0].input.head[1] == U256::from(0x1234u64).to_be_bytes::<32>()
         })
         .expect("失败输入应有反馈（word0 过守卫 A、word1 错Revert）");
     assert_eq!(bad.outcome, OutcomeKind::Revert);
@@ -179,12 +181,18 @@ fn coordinated_pierces_two_slot_constraint() {
     assert!(report.reached, "两槽协同应穿透同现约束: {report:?}");
 }
 
-// run_targeted 便捷引用（本测试文件顶部未导入）。
+// run_targeted 便捷引用（本测试文件顶部未导入；种子包成单步序列——
+// steps.len()==1 与旧单步路径语义等价）。
 fn run_targeted(
     cfg: &ExecConfig,
     target: &Target<'_>,
     seeds: &[Input],
     dict: &ValueDictionary,
 ) -> loom_fuzz_fuzz::SessionReport {
-    loom_fuzz_fuzz::run_targeted(cfg, target, seeds, dict)
+    let seeds: Vec<_> = seeds
+        .iter()
+        .cloned()
+        .map(|i| loom_fuzz_seed::TxSequence::single([0x22; 20], i))
+        .collect();
+    loom_fuzz_fuzz::run_targeted(cfg, target, &seeds, dict)
 }

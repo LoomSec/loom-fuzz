@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 
-use loom_fuzz_seed::{Input, Target, ValueDictionary};
+use loom_fuzz_seed::{Input, Target, TxSequence, ValueDictionary};
 
 use crate::cfg::DistanceTable;
 use crate::evm;
-use crate::mutate::{input_key, random_input};
+use crate::mutate::random_input;
 use crate::mutators::{const_pool, Pools};
 use crate::rng::Rng;
 
@@ -56,13 +56,18 @@ pub struct ExecConfig {
     #[serde(default)]
     pub deployments: Vec<Deployment>,
     /// 顶层交易入口（issue #34）：None = 直接 call victim（单步
-    /// 默认现状）；Some(addr) = 顶层 call 指向表内另一合约（如
-    /// 攻击代理合约）——caller 轮换 ATTACKER → 入口合约 → victim
-    /// 的第一环。装载选项（CLI `--entry`），地址须在场（victim
-    /// 或 deployments 成员），校验在装载层 fail-closed；执行器
-    /// 只按约定切换 TxEnv 目标。
+    /// 默认现状）；Some(addr) = 装载层把单步种子/见证的目标换为
+    /// 入口合约（攻击代理）——caller 轮换 ATTACKER → 入口合约 →
+    /// victim 的第一环。**执行器只认 Step.target**（#35 序列推广
+    /// 后 per-step 目标涵盖 entry 语义）；entry 保留为 poc.json
+    /// 记录与装载校验（须在合约表内，fail-closed）。
     #[serde(default)]
     pub entry: Option<[u8; 20]>,
+    /// 序列长度上限（issue #35）：1 = 单步默认（与旧行为完全等价
+    /// ——组装算子不触发，随机流逐位一致）；>1 时进化环在步级提案
+    /// 之上机械组装多步序列（append / splice / 步内变异）。
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u32,
     /// 支配 guard 上下文（revert 归因用；装载端经 xlayer 渲染 cond）。
     #[serde(default)]
     pub guard_context: Vec<GuardContext>,
@@ -86,6 +91,12 @@ mod duration_secs {
     }
 }
 
+/// max_steps 的 serde 缺省：1 = 单步（旧 ExecConfig 无此字段时
+/// 反序列化即单步，向后兼容）。
+fn default_max_steps() -> u32 {
+    1
+}
+
 /// 单条拦到的 CALL 族效果（含 SELFDESTRUCT）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedCall {
@@ -99,6 +110,9 @@ pub struct RecordedCall {
     pub from: [u8; 20],
     /// 目标地址（CREATE 系为创建出的合约地址）。
     pub target: [u8; 20],
+    /// 该效果所属的第几步（issue #35 序列执行；0 = 单步/旧产物）。
+    #[serde(default)]
+    pub step: u32,
     pub value: U256,
     /// call input 的内存内容（CREATE 系为 initcode）。
     pub input: Vec<u8>,
@@ -139,19 +153,26 @@ pub struct WitnessTrace {
     /// 本 run 生效的部署（witness 记录；poc.json 落盘）。
     #[serde(default)]
     pub deployments: Vec<Deployment>,
+    /// 各步结局（issue #35；长度 = 实际执行步数）。revert 步如实
+    /// 记 Revert（状态未变，序列续跑）——"inconclusive-step"的
+    /// 如实形态，归因经 RunFeedback.reverted_guard（最近 revert 步
+    /// 的支配 guard）。旧单步产物缺省 = 空 Vec。
+    #[serde(default)]
+    pub step_outcomes: Vec<OutcomeKind>,
 }
 
 /// 会话报告：全部 serde，poc.json 直接复用 best_input / trace。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionReport {
-    /// 是否到达 target_pcs。
+    /// 是否到达 target_pcs（issue #35：序列任意步到达即到场）。
     pub reached: bool,
     /// 到达所用 runs（未到达 = 本会话总 runs）。
     pub best_runs: u64,
-    /// 到达时即见证输入；未到达时为全程 fitness 最小的一次输入
-    /// （最接近的候选，非见证；消费方须先看 `reached`）。
-    pub best_input: Option<Input>,
-    /// `best_input` 对应那次 run 的 witness。
+    /// 到达时的见证序列（steps.len() 可能 >1）；未到达时为全程
+    /// fitness 最小的一次输入（最接近的候选，非见证；消费方须先看
+    /// `reached`）。
+    pub best_steps: Option<TxSequence>,
+    /// `best_steps` 对应那次 run 的 witness。
     pub trace: WitnessTrace,
     /// 报告所基于的 run 是否被截断（燃料/步数上限，诚实报告；
     /// inconclusive 判决的输入之一）。
@@ -189,12 +210,13 @@ pub struct GuardContext {
 /// 单 run 的提案反馈（喂给 Proposer）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFeedback {
-    pub input: Input,
-    /// 本 run 的结局。
+    pub seq: TxSequence,
+    /// 本 run 的结局（最后一步的结局；逐步形态见
+    /// WitnessTrace.step_outcomes）。
     pub outcome: OutcomeKind,
-    /// 本 run 的 CFG 距离（fitness）。
+    /// 本 run 的 CFG 距离（fitness，各步最小）。
     pub best_distance: u32,
-    /// revert 归因：最近经过的支配 guard（非 revert = None）。
+    /// revert 归因：最近 revert 步的支配 guard（无 revert = None）。
     pub reverted_guard: Option<GuardFeedback>,
 }
 
@@ -221,7 +243,9 @@ pub struct ProposerCtx<'a> {
 pub trait Proposer {
     /// 会话每代前刷新共享池（默认 no-op；dictionary 需要）。
     fn refresh(&mut self, _ctx: &ProposerCtx<'_>) {}
-    /// 给反馈与预算，产下一批候选。
+    /// 给反馈与预算，产下一批**步级**候选（issue #35：序列级
+    /// append/splice/步内变异由执行环在 `max_steps > 1` 时机械组装
+    /// ——提案器保持步级抽象，单步语义逐位不受影响）。
     fn propose(&mut self, feedback: &[RunFeedback], budget: ProposalBudget) -> Vec<Input>;
 }
 
@@ -239,6 +263,10 @@ fn default_contract_addr() -> [u8; 20] {
 /// corpus 上限（按 fitness 截断保留）。
 const CORPUS_CAP: usize = 64;
 
+/// 步级池上限（issue #35 序列组装的素材来源——布置步等 fitness
+/// 死路的步级输入在此留存，超上限丢最旧，保先收，确定性）。
+const STEP_POOL_CAP: usize = 256;
+
 /// 精英集上限（父代选择来源）。
 const ELITE_CAP: usize = 16;
 
@@ -246,11 +274,12 @@ const ELITE_CAP: usize = 16;
 const MIN_POPULATION: usize = 8;
 
 /// 定向执行入口：CFG 距离制导的进化环 + 基线对照（默认
-/// DictionaryProposer）。
+/// DictionaryProposer）。`seeds` 为调用序列（单步 = 单元素序列，
+/// 与旧单步路径语义完全等价）。
 pub fn run_targeted(
     cfg: &ExecConfig,
     target: &Target<'_>,
-    seeds: &[Input],
+    seeds: &[TxSequence],
     dict: &ValueDictionary,
 ) -> SessionReport {
     run_targeted_with(
@@ -263,12 +292,14 @@ pub fn run_targeted(
 }
 
 /// 定向执行入口（提案器可插拔版）：进化环由 `proposer` 驱动——
-/// 每代 refresh 池 → 取反馈窗 → 提案 → 评估。**判决独立**：
-/// oracle/judge 不感知提案器；replay 不经搜索层，verdict 一致。
+/// 每代 refresh 池 → 取反馈窗 → 提案 → **序列组装**（max_steps >
+/// 1 时 append/splice/步内变异，见 sequence 模块）→ 评估。
+/// **判决独立**：oracle/judge 不感知提案器；replay 不经搜索层，
+/// verdict 一致。
 pub fn run_targeted_with(
     cfg: &ExecConfig,
     target: &Target<'_>,
-    seeds: &[Input],
+    seeds: &[TxSequence],
     dict: &ValueDictionary,
     proposer: &mut dyn Proposer,
 ) -> SessionReport {
@@ -277,13 +308,20 @@ pub fn run_targeted_with(
     // 制导会话。常量池（字典 ∪ PUSH 立即数）会话级构建一次。
     let consts = const_pool(&cfg.code, dict);
     let mut session = Session::new(cfg, &table, cfg.seed_rng);
-    let head_len_hint = seeds.iter().map(|s| s.head.len()).max().unwrap_or(2).max(1);
+    let head_len_hint = seeds
+        .iter()
+        .flat_map(|s| s.steps.iter())
+        .map(|s| s.input.head.len())
+        .max()
+        .unwrap_or(2)
+        .max(1);
     for seed in seeds {
         if session.run_one(seed) {
             break;
         }
     }
-    // 种群不足补随机输入（保持多样性；不进 corpus 优先位）。
+    // 种群不足补随机输入（单步随机序列；保持多样性，不进 corpus
+    // 优先位）。
     while !session.reached && session.population_len() < MIN_POPULATION.min(cfg.max_runs as usize) {
         let filler = random_input(
             session.rng_mut(),
@@ -291,6 +329,7 @@ pub fn run_targeted_with(
             head_len_hint,
             Some(dict),
         );
+        let filler = TxSequence::single(cfg.address, filler);
         if session.run_one(&filler) {
             break;
         }
@@ -321,7 +360,26 @@ pub fn run_targeted_with(
             empty_gens = 0;
         }
         for child in candidates {
-            if session.run_one(&child) {
+            let table = session.contract_table.clone();
+            let step_pool = session.step_pool.clone();
+            let seq = crate::sequence::assemble(
+                session.rng_mut(),
+                child,
+                &feedback,
+                &crate::sequence::AssembleCtx {
+                    address: cfg.address,
+                    table: &table,
+                    step_pool: &step_pool,
+                    max_steps: cfg.max_steps,
+                    selector: target.hit.selector(),
+                    head_len_hint,
+                    dict,
+                    consts: &consts,
+                    cmp_pool: &cmp_pool,
+                    storage_pool: &storage_pool,
+                },
+            );
+            if session.run_one(&seq) {
                 break;
             }
         }
@@ -329,7 +387,8 @@ pub fn run_targeted_with(
     let mut report = session.into_report();
 
     // 基线：独立 RNG 流（与制导流不共享状态），同预算纯随机——
-    // 无种子、无制导、无字典（静态知识也不给，最严格对照）。
+    // 无种子、无制导、无字典（静态知识也不给，最严格对照）。基线
+    // 恒为单步随机序列（max_steps 只放开制导侧的序列组装）。
     if cfg.run_baseline {
         let mut baseline = Session::new(cfg, &table, cfg.seed_rng ^ 0x5DEE_CE66_1BAD_BEE5);
         while !baseline.reached && baseline.budget_left() {
@@ -339,6 +398,7 @@ pub fn run_targeted_with(
                 head_len_hint,
                 None,
             );
+            let input = TxSequence::single(cfg.address, input);
             baseline.run_one(&input);
         }
         report.baseline_runs_to_reach = baseline.reached.then_some(baseline.runs);
@@ -346,11 +406,11 @@ pub fn run_targeted_with(
     report
 }
 
-/// 一次评估的候选输入（种子直接进 corpus 优先位；变异/随机
+/// 一次评估的候选序列（种子直接进 corpus 优先位；变异/随机
 /// 子代按 fitness 竞争）。
 #[derive(Clone)]
 struct Evaluated {
-    input: Input,
+    seq: TxSequence,
     fitness: u32,
     trace: WitnessTrace,
     guard: Option<GuardFeedback>,
@@ -364,7 +424,7 @@ struct Session<'a> {
     deadline: Instant,
     runs: u64,
     reached: bool,
-    /// 命中那次的输入/trace/runs（reached 时即报告值）。
+    /// 命中那次的序列/trace/runs（reached 时即报告值）。
     hit: Option<Evaluated>,
     /// 全程 fitness 最小的一次（未命中时即报告值；并列取先到）。
     best: Option<Evaluated>,
@@ -377,10 +437,22 @@ struct Session<'a> {
     feedback: Vec<RunFeedback>,
     /// 精英集：全程 fitness 最优的前 ELITE_CAP（父代选择压力来源）。
     elite: Vec<Evaluated>,
+    /// 合约表（victim + 各部署）：序列组装的新步目标从中机械选取
+    /// （issue #34/#35）。
+    contract_table: Vec<[u8; 20]>,
+    /// 步级池（issue #35）：一切运行见过的步输入（target ++ input
+    /// 键去重，FIFO 上限 STEP_POOL_CAP）——序列组装（append/splice）
+    /// 的素材来源，专门解决多步信用分配（布置步 fitness 死路仍
+    /// 留存于此）。
+    step_pool: Vec<loom_fuzz_seed::Step>,
+    step_pool_keys: BTreeSet<Vec<u8>>,
 }
 
 impl<'a> Session<'a> {
     fn new(cfg: &'a ExecConfig, table: &'a DistanceTable, seed: u64) -> Self {
+        let contract_table = std::iter::once(cfg.address)
+            .chain(cfg.deployments.iter().map(|d| d.address))
+            .collect();
         Session {
             cfg,
             table,
@@ -395,6 +467,9 @@ impl<'a> Session<'a> {
             pools: Pools::new(),
             feedback: Vec::new(),
             elite: Vec::new(),
+            contract_table,
+            step_pool: Vec::new(),
+            step_pool_keys: BTreeSet::new(),
         }
     }
 
@@ -406,7 +481,7 @@ impl<'a> Session<'a> {
             .corpus
             .iter()
             .map(|e| RunFeedback {
-                input: e.input.clone(),
+                seq: e.seq.clone(),
                 outcome: e.trace.outcome,
                 best_distance: e.fitness,
                 reverted_guard: e.guard.clone(),
@@ -440,9 +515,9 @@ impl<'a> Session<'a> {
     }
 
     /// 记录一条 run 反馈（revert 归因经 RunResult.feedback_guard）。
-    fn push_feedback(&mut self, run: &crate::evm::RunResult, input: &Input, fitness: u32) {
+    fn push_feedback(&mut self, run: &crate::evm::RunResult, seq: &TxSequence, fitness: u32) {
         self.feedback.push(RunFeedback {
-            input: input.clone(),
+            seq: seq.clone(),
             outcome: run.trace.outcome,
             best_distance: fitness,
             reverted_guard: run.feedback_guard.clone(),
@@ -453,25 +528,27 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// 评估一个输入：执行 + fitness + 命中/最优/corpus 维护。
-    /// 返回 true = 命中（调用方应停止产生新候选）。
-    fn run_one(&mut self, input: &Input) -> bool {
+    /// 评估一个调用序列：逐步执行 + fitness（各步距离最小）+ 命中
+    /// （任意步到达即命中）/最优/corpus 维护。返回 true = 命中
+    /// （调用方应停止产生新候选）。
+    fn run_one(&mut self, seq: &TxSequence) -> bool {
         if !self.budget_left() {
             return self.reached;
         }
         self.runs += 1;
-        let result = evm::execute(self.cfg, input, STEP_CAP);
+        let targets = self.table.targets();
+        let result = evm::execute(self.cfg, seq, STEP_CAP, &targets);
         // 观测入池（去重有上限）：比较操作数 → 算子 1，SLOAD 键值
         // 对 → 算子 4。
         self.pools.absorb(&result);
         let fitness = self.table.fitness(result.visited_pcs.iter().copied());
-        self.push_feedback(&result, input, fitness);
+        self.push_feedback(&result, seq, fitness);
         let hit_now = result
             .visited_pcs
             .iter()
             .any(|&pc| self.table.is_target(pc));
         let evaluated = Evaluated {
-            input: input.clone(),
+            seq: seq.clone(),
             fitness,
             trace: result.trace,
             guard: result.feedback_guard.clone(),
@@ -484,32 +561,44 @@ impl<'a> Session<'a> {
         let better = self.best.as_ref().is_none_or(|b| fitness < b.fitness);
         if better {
             self.best = Some(Evaluated {
-                input: evaluated.input.clone(),
+                seq: evaluated.seq.clone(),
                 fitness,
                 trace: evaluated.trace.clone(),
                 guard: evaluated.guard.clone(),
             });
         }
-        // 精英集维护：按 fitness 插入截断（按输入去重）——父代选择
+        // 精英集维护：按 fitness 插入截断（按序列去重）——父代选择
         // 压力来源（反馈窗只有最近 N 条，全史最优会滚出窗口）。
-        if !self.elite.iter().any(|e| e.input == evaluated.input) {
+        if !self.elite.iter().any(|e| e.seq == evaluated.seq) {
             self.elite.push(evaluated.clone());
-            self.elite.sort_by_key(|e| (e.fitness, input_key(&e.input)));
+            self.elite.sort_by_key(|e| (e.fitness, e.seq.sort_key()));
             self.elite.truncate(ELITE_CAP);
         }
         // 距离创新低 → 入 corpus（去重，cap 按 fitness 截断）。
-        if self.corpus_keys.insert(input_key(&evaluated.input)) {
-            self.corpus.push(evaluated);
+        if self.corpus_keys.insert(evaluated.seq.sort_key()) {
+            self.corpus.push(evaluated.clone());
             self.corpus.sort_by_key(|e| e.fitness);
             self.corpus.truncate(CORPUS_CAP);
+        }
+        // 步级池（issue #35）：逐步步输入入池（target ++ input 键
+        // 去重，FIFO 上限）——布置步等 fitness 死路的素材留存。
+        for step in &seq.steps {
+            if self.step_pool_keys.insert(step.sort_key()) {
+                if self.step_pool.len() >= STEP_POOL_CAP {
+                    // 丢最旧（Vec 首）：键同步移除。
+                    let old = self.step_pool.remove(0);
+                    self.step_pool_keys.remove(&old.sort_key());
+                }
+                self.step_pool.push(step.clone());
+            }
         }
         false
     }
 
     fn into_report(self) -> SessionReport {
         let chosen = self.hit.clone().or(self.best);
-        let (best_input, trace) = match chosen {
-            Some(e) => (Some(e.input), e.trace),
+        let (best_steps, trace) = match chosen {
+            Some(e) => (Some(e.seq), e.trace),
             None => {
                 // 一 run 未执行（max_runs = 0 或时间预算为 0）：
                 // 无 witness 可报，如实给空 trace。
@@ -523,6 +612,7 @@ impl<'a> Session<'a> {
                         gas_used: 0,
                         truncated: false,
                         deployments: Vec::new(),
+                        step_outcomes: Vec::new(),
                     },
                 )
             }
@@ -532,7 +622,7 @@ impl<'a> Session<'a> {
             reached,
             // 命中即停：runs 即命中所用计数；未命中 = 总 runs。
             best_runs: self.runs,
-            best_input,
+            best_steps,
             truncated: trace.truncated,
             trace,
             runs_completed: self.runs,
@@ -576,20 +666,24 @@ mod tests {
             fork: None,
             deployments: Vec::new(),
             entry: None,
+            max_steps: 1,
             guard_context: Vec::new(),
         };
-        let seeds = vec![Input {
-            selector: 0,
-            caller: [0x33; 20],
-            value: U256::ZERO,
-            head: Vec::new(),
-            tail: loom_fuzz_seed::Tail::Empty,
-        }];
+        let seeds = vec![TxSequence::single(
+            [0x22; 20],
+            Input {
+                selector: 0,
+                caller: [0x33; 20],
+                value: U256::ZERO,
+                head: Vec::new(),
+                tail: loom_fuzz_seed::Tail::Empty,
+            },
+        )];
         let report = run_targeted(&cfg, &target, &seeds, &ValueDictionary { words: vec![] });
         assert!(report.reached);
         assert_eq!(report.best_runs, 1);
         assert_eq!(report.runs_completed, 1);
-        assert!(report.best_input.is_some());
+        assert!(report.best_steps.is_some());
         assert!(report.trace.visited_pcs.contains(&0));
     }
 
@@ -623,6 +717,7 @@ mod tests {
             fork: None,
             deployments: Vec::new(),
             entry: None,
+            max_steps: 1,
             guard_context: Vec::new(),
         };
         let report = run_targeted(&cfg, &target, &[], &ValueDictionary { words: vec![] });

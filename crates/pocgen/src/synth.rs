@@ -340,16 +340,23 @@ pub fn generate_exploit_with(
     {
         return Err(PocgenError::BadCode(code_hex.to_string()));
     }
-    let calldata = hex_bytes(&poc.tx.calldata).map_err(PocgenError::BadPoc)?;
+    // L2 合成输入 = 归一序列的**最后一步**（payload 步；issue #35
+    // 多步 poc 的逐步合成是 #36/L3 范围——此处机械取末步保持
+    // 单步 L2 行为不回归）。
+    let steps = poc.normalized_steps().map_err(PocgenError::BadPoc)?;
+    let payload = steps.last().expect("normalized_steps 非空");
+    let calldata = hex_bytes(&payload.calldata).map_err(PocgenError::BadPoc)?;
     let prestate: Vec<(U256, U256)> = poc
         .prestate
         .iter()
         .map(|(k, v)| Ok((hex_u256(k)?, hex_u256(v)?)))
         .collect::<Result<_, String>>()
         .map_err(PocgenError::BadPoc)?;
-    let caller = hex_bytes(&poc.tx.caller).map_err(PocgenError::BadPoc)?;
+    let caller = hex_bytes(&payload.caller).map_err(PocgenError::BadPoc)?;
     if caller.len() != 20 {
-        return Err(PocgenError::BadPoc("poc.tx.caller 非 20 字节".to_string()));
+        return Err(PocgenError::BadPoc(
+            "poc.step.caller 非 20 字节".to_string(),
+        ));
     }
     let mut caller_arr = [0u8; 20];
     caller_arr.copy_from_slice(&caller);

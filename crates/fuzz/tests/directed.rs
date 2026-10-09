@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::U256;
-use loom_fuzz_seed::{compile, locate, HitView, Input, SeedOutput, Tail, Target, ValueDictionary};
+use loom_fuzz_seed::{
+    compile, locate, HitView, Input, SeedOutput, Tail, Target, TxSequence, ValueDictionary,
+};
 use loom_fuzz_shard::Shard;
 use loom_fuzz_xlayer::Xlayer;
 use sha3::{Digest, Keccak256};
@@ -140,8 +142,18 @@ fn exec_config(
         fork: None,
         deployments: Vec::new(),
         entry: None,
+        max_steps: 1,
         guard_context: Vec::new(),
     }
+}
+
+/// 种子包成单步序列（steps.len()==1 与旧单步路径语义等价，issue #35）。
+fn wrap(seeds: &[Input]) -> Vec<TxSequence> {
+    seeds
+        .iter()
+        .cloned()
+        .map(|i| TxSequence::single([0x22; 20], i))
+        .collect()
 }
 
 /// prestate：registry 注册"值字典前 N 个常量 + 固定 0x7d"为 member
@@ -210,7 +222,7 @@ fn trv_like_reaches_target_frame() {
     seeds.push(crafted_seed(hit.selector, head_len, None));
 
     let cfg = exec_config(hitset.code.clone(), prestate, 4_000, false);
-    let report = run_targeted(&cfg, &target, &seeds, &dict);
+    let report = run_targeted(&cfg, &target, &wrap(&seeds), &dict);
 
     assert!(report.reached, "应到达目标帧：{report:?}");
     println!(
@@ -221,7 +233,12 @@ fn trv_like_reaches_target_frame() {
         report.trace.outcome
     );
     assert_eq!(report.best_runs, report.runs_completed);
-    let best = report.best_input.as_ref().expect("命中即有 witness 输入");
+    let best = &report
+        .best_steps
+        .as_ref()
+        .expect("命中即有 witness 输入")
+        .steps[0]
+        .input;
     assert_eq!(best.selector, 0x90ce82d4);
     assert!(
         !report.trace.calls.is_empty(),
@@ -278,8 +295,8 @@ fn same_seed_is_byte_identical() {
     seeds.push(crafted_seed(hit.selector, 2, None));
 
     let cfg = exec_config(hitset.code.clone(), prestate, 4_000, false);
-    let a = run_targeted(&cfg, &target, &seeds, &dict);
-    let b = run_targeted(&cfg, &target, &seeds, &dict);
+    let a = run_targeted(&cfg, &target, &wrap(&seeds), &dict);
+    let b = run_targeted(&cfg, &target, &wrap(&seeds), &dict);
     assert!(a.reached && b.reached);
     // 全报告逐字节一致（无时间戳字段，预算由 runs 耗尽，确定性）。
     let sa = serde_json::to_vec(&a).unwrap();
@@ -287,8 +304,8 @@ fn same_seed_is_byte_identical() {
     assert_eq!(sa, sb, "同 seed_rng 两次运行应逐字节一致");
     // 显式点 best_input / trace（poc.json 的复用对象）。
     assert_eq!(
-        serde_json::to_vec(&a.best_input).unwrap(),
-        serde_json::to_vec(&b.best_input).unwrap()
+        serde_json::to_vec(&a.best_steps).unwrap(),
+        serde_json::to_vec(&b.best_steps).unwrap()
     );
     assert_eq!(
         serde_json::to_vec(&a.trace).unwrap(),
@@ -322,7 +339,7 @@ fn guided_beats_pure_random_baseline() {
     seeds.push(crafted_seed(hit.selector, head_len, Some(0x42)));
 
     let cfg = exec_config(hitset.code.clone(), prestate, 2_000, true);
-    let report: SessionReport = run_targeted(&cfg, &target, &seeds, &dict);
+    let report: SessionReport = run_targeted(&cfg, &target, &wrap(&seeds), &dict);
 
     assert!(report.reached, "制导会话应到达：{report:?}");
     println!(
@@ -372,7 +389,7 @@ fn unreachable_target_reported_honestly() {
     let report = run_targeted(
         &cfg,
         &target,
-        &seeds_out.inputs,
+        &wrap(&seeds_out.inputs),
         &ValueDictionary { words: vec![] },
     );
 
@@ -380,5 +397,5 @@ fn unreachable_target_reported_honestly() {
     assert_eq!(report.runs_completed, 32, "未到达 = 跑满预算");
     assert!(!report.truncated, "gas 充足不应截断");
     // 未到达时如实给最接近的一次 witness（非见证，消费方看 reached）。
-    assert!(report.best_input.is_some());
+    assert!(report.best_steps.is_some());
 }

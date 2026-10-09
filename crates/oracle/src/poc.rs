@@ -17,7 +17,9 @@ use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
-use loom_fuzz_fuzz::{run_targeted, ExecConfig, Input, Tail, Target, ValueDictionary};
+use loom_fuzz_fuzz::{
+    run_targeted, ExecConfig, Input, Step, Tail, Target, TxSequence, ValueDictionary,
+};
 use loom_fuzz_seed::HitView;
 
 use crate::hit::{Hit, HitFamily};
@@ -39,7 +41,15 @@ pub struct Poc {
     pub pc: u32,
     /// 只写 "confirmed"（poc 仅在 confirmed 时落盘）。
     pub verdict: String,
-    pub tx: PocTx,
+    /// 调用序列（issue #35）：witness = steps（各步 target + caller +
+    /// value + calldata）。新 poc 恒写出；**旧单步 poc.json 无此
+    /// 字段，replay 经 legacy `tx` 归一为单步序列**（向后兼容）。
+    #[serde(default)]
+    pub steps: Vec<PocStep>,
+    /// 旧单步形态（只读兼容）：新 poc 恒 None 不写出。replay 时
+    /// steps 为空则以此 + `contract` 归一单步序列。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx: Option<PocTx>,
     /// 存储槽 → 值（hex → hex）。
     pub prestate: BTreeMap<String, String>,
     /// 外部响应注入（M0 恒空，未来多交易/族扩展位）。
@@ -99,6 +109,20 @@ pub struct PocDeployment {
     /// "0x" + 40 hex
     pub address: String,
     pub runtime_hex: String,
+}
+
+/// 序列步（poc.json 形态；与 seed crate 的 Step 同要素：target +
+/// calldata + caller + value）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PocStep {
+    /// "0x" + 40 hex
+    pub target: String,
+    /// "0x" + 40 hex
+    pub caller: String,
+    /// "0x" + 64 hex
+    pub value: String,
+    /// "0x" + hex（selector + head + tail 原始交易 calldata）
+    pub calldata: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,18 +225,21 @@ pub fn calldata_of(input: &Input) -> Vec<u8> {
     out
 }
 
-/// 见证要素的 keccak256 摘要（规范化拼接：selector|pc|calldata|
-/// prestate 对）。
+/// 见证要素的 keccak256 摘要（规范化拼接：selector|pc|各步
+/// target+calldata|prestate 对；issue #35 起 calldata 为全序列）。
 pub fn witness_digest(
     selector: u32,
     pc: u32,
-    calldata: &[u8],
+    steps: &[Step],
     prestate: &BTreeMap<U256, U256>,
 ) -> String {
     let mut h = Keccak256::new();
     h.update(selector.to_be_bytes());
     h.update(pc.to_be_bytes());
-    h.update(calldata);
+    for s in steps {
+        h.update(s.target);
+        h.update(calldata_of(&s.input));
+    }
     for (k, v) in prestate {
         h.update(k.to_be_bytes::<32>());
         h.update(v.to_be_bytes::<32>());
@@ -236,8 +263,9 @@ pub fn build_poc(
         .witness
         .as_ref()
         .ok_or("confirmed 必有 witness（契约）")?;
-    let calldata = calldata_of(&witness.input);
-    let caller = bytes_hex(&witness.input.caller);
+    if witness.steps.is_empty() {
+        return Err("confirmed 见证序列为空（契约外形态，如实报）".to_string());
+    }
 
     let prestate: BTreeMap<String, String> = cfg
         .prestate
@@ -247,7 +275,7 @@ pub fn build_poc(
     let digest = witness_digest(
         hit_report.hit.selector,
         witness.pc,
-        &calldata,
+        &witness.steps,
         &cfg.prestate,
     );
     let replay = if cfg.prestate.is_empty() {
@@ -262,11 +290,17 @@ pub fn build_poc(
         step: hit_report.hit.step,
         pc: witness.pc,
         verdict: Verdict::Confirmed.to_string(),
-        tx: PocTx {
-            caller,
-            value: u256_hex(witness.input.value),
-            calldata: bytes_hex(&calldata),
-        },
+        steps: witness
+            .steps
+            .iter()
+            .map(|s| PocStep {
+                target: bytes_hex(&s.target),
+                caller: bytes_hex(&s.input.caller),
+                value: u256_hex(s.input.value),
+                calldata: bytes_hex(&calldata_of(&s.input)),
+            })
+            .collect(),
+        tx: None,
         prestate,
         responses: Vec::new(),
         seed,
@@ -296,9 +330,34 @@ pub fn build_poc(
     })
 }
 
+impl Poc {
+    /// 归一化调用序列（issue #35）：`steps` 优先；空则按 legacy
+    /// `tx` + `contract`（缺省 0x2222…22）归一单步序列——**旧单步
+    /// poc.json 由此保持可 replay**。两者皆空 = fail-closed 报错。
+    pub fn normalized_steps(&self) -> Result<Vec<PocStep>, String> {
+        if !self.steps.is_empty() {
+            return Ok(self.steps.clone());
+        }
+        let Some(tx) = &self.tx else {
+            return Err("poc 无 steps 且无 legacy tx（形态不认，fail-closed）".to_string());
+        };
+        let target = self
+            .contract
+            .clone()
+            .unwrap_or_else(|| bytes_hex(&[0x22u8; 20]));
+        Ok(vec![PocStep {
+            target,
+            caller: tx.caller.clone(),
+            value: tx.value.clone(),
+            calldata: tx.calldata.clone(),
+        }])
+    }
+}
+
 /// 重放：poc.json + 运行时字节码（--code）→ 重新判决。
 /// `prestate_override` = `--prestate <file>` 显式覆盖（缺省用 poc 内
-/// 嵌的 prestate）。
+/// 嵌的 prestate）。见证序列经 `normalized_steps` 重建（issue #35；
+/// 旧单步 poc 的 legacy `tx` 归一为单步序列——向后兼容）。
 pub fn replay(
     poc: &Poc,
     code: &[u8],
@@ -318,15 +377,35 @@ pub fn replay(
             .map(|(k, v)| Ok((hex_u256(k)?, hex_u256(v)?)))
             .collect::<Result<BTreeMap<_, _>, String>>()?,
     };
-    let calldata = hex_bytes(&poc.tx.calldata)?;
-    let value = hex_u256(&poc.tx.value)?;
-    let caller_b = hex_bytes(&poc.tx.caller)?;
-    if caller_b.len() != 20 {
-        return Err("poc.tx.caller 非 20 字节".to_string());
+    // 序列重建：逐步规范化（calldata → Input 的切分与原始 witness
+    // 可能不同，但序列化回 calldata 逐字节相同 → 执行等价）。
+    let mut steps: Vec<Step> = Vec::new();
+    let mut calldatas: Vec<Vec<u8>> = Vec::new();
+    for s in poc.normalized_steps()? {
+        let target_b = hex_bytes(&s.target)?;
+        if target_b.len() != 20 {
+            return Err("poc.step.target 非 20 字节".to_string());
+        }
+        let mut target = [0u8; 20];
+        target.copy_from_slice(&target_b);
+        let calldata = hex_bytes(&s.calldata)?;
+        let value = hex_u256(&s.value)?;
+        let caller_b = hex_bytes(&s.caller)?;
+        if caller_b.len() != 20 {
+            return Err("poc.step.caller 非 20 字节".to_string());
+        }
+        let mut caller = [0u8; 20];
+        caller.copy_from_slice(&caller_b);
+        calldatas.push(calldata.clone());
+        steps.push(Step {
+            target,
+            input: input_from_calldata(caller, value, &calldata)?,
+        });
     }
-    let mut caller = [0u8; 20];
-    caller.copy_from_slice(&caller_b);
-    let witness_input = input_from_calldata(caller, value, &calldata)?;
+    if steps.is_empty() {
+        return Err("poc 序列归一后为空（契约外形态，fail-closed）".to_string());
+    }
+    let witness_seq = TxSequence { steps };
 
     let cfg = ExecConfig {
         code: code.to_vec(),
@@ -380,6 +459,8 @@ pub fn replay(
             }
             None => None,
         },
+        // replay 的序列长度上限 = 见证序列长度（机械约束，不扩搜）。
+        max_steps: witness_seq.steps.len() as u32,
         // replay 不经搜索层（判决独立）；guard 上下文不参与重放。
         guard_context: Vec::new(),
     };
@@ -421,7 +502,7 @@ pub fn replay(
     let report = run_targeted(
         &cfg,
         &target,
-        &[witness_input],
+        &[witness_seq],
         &ValueDictionary { words: Vec::new() },
     );
     // replay：无 shard——臂 1 用 poc 内嵌的求值承诺重放判定。
@@ -434,7 +515,7 @@ pub fn replay(
     Ok(judge_with(
         &hit,
         &report,
-        &calldata,
+        &calldatas,
         &JudgeInput {
             view: None,
             expected_evidence,
@@ -477,6 +558,7 @@ mod tests {
                     calls: vec![RecordedCall {
                         kind: "CALL".to_string(),
                         from: [0x22; 20],
+                        step: 0,
                         target: [0x7d; 20],
                         value: U256::ZERO,
                         input: vec![1, 2, 3, 4],
@@ -485,12 +567,17 @@ mod tests {
                     outcome: OutcomeKind::Stop,
                     gas_used: 1,
                     truncated: false,
+                    step_outcomes: vec![OutcomeKind::Stop],
                 },
-                input,
+                steps: vec![Step {
+                    target: [0x22; 20],
+                    input,
+                }],
                 pc: 384,
                 evidence_call: RecordedCall {
                     kind: "CALL".to_string(),
                     from: [0x22; 20],
+                    step: 0,
                     target: [0x7d; 20],
                     value: U256::ZERO,
                     input: vec![1, 2, 3, 4],
@@ -511,6 +598,7 @@ mod tests {
             fork: None,
             deployments: Vec::new(),
             entry: None,
+            max_steps: 1,
             guard_context: Vec::new(),
         };
         (report, cfg)
@@ -526,7 +614,10 @@ mod tests {
         assert_eq!(poc.step, 19);
         assert_eq!(poc.verdict, "confirmed");
         assert!(!poc.digest.is_empty());
-        assert!(poc.tx.calldata.starts_with("0x90ce82d4"));
+        assert_eq!(poc.steps.len(), 1);
+        assert!(poc.steps[0].calldata.starts_with("0x90ce82d4"));
+        assert_eq!(poc.steps[0].target, bytes_hex(&[0x22; 20]));
+        assert!(poc.tx.is_none(), "新 poc 不写出 legacy tx");
         assert_eq!(poc.prestate.len(), 1);
         assert!(poc.replay.contains("loom-fuzz replay poc-test.json"));
         assert!(poc.replay.contains("--code <bytecode.hex>"));
