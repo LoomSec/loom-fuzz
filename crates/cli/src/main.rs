@@ -84,6 +84,14 @@ enum Cmd {
         /// 语义补充（docs/architecture.md 值字典定义）。
         #[arg(long = "dict-word")]
         dict_word: Vec<String>,
+        /// 种子语料（完整 calldata 0x-hex，可重复）——AFL 种子语料
+        /// 同款概念：calldata 原形态直接进初始种子群体（与
+        /// --dict-word 的单槽填充互补；已知攻击/合法形态的通用
+        /// 注入点，引擎零个案）。规范化：selector + 全 32B 头词 +
+        /// 余字节尾；形态正确的语料 run 1 即到场，并经同一路径
+        /// mutate/判决。
+        #[arg(long = "seed-calldata")]
+        seed_calldata: Vec<String>,
         /// 产物目录（fuzz_report.json / poc-*.json）
         #[arg(long, default_value = ".")]
         out: PathBuf,
@@ -175,6 +183,7 @@ fn run() -> Result<ExitCode, String> {
             time_budget_secs,
             gas_per_tx,
             dict_word,
+            seed_calldata,
             out,
             emit_poc,
             fork_url,
@@ -194,6 +203,7 @@ fn run() -> Result<ExitCode, String> {
             time_budget_secs,
             gas_per_tx,
             &dict_word,
+            &seed_calldata,
             &out,
             emit_poc.as_deref(),
             fork_url.as_deref(),
@@ -243,6 +253,7 @@ fn cmd_run(
     time_budget_secs: u64,
     gas_per_tx: u64,
     dict_words: &[String],
+    seed_calldatas: &[String],
     out_dir: &Path,
     emit_poc: Option<&Path>,
     fork_url: Option<&str>,
@@ -447,6 +458,15 @@ fn cmd_run(
                 seed_out.assumptions.push(note);
             }
         }
+        // 种子语料（issue #41，--seed-calldata）：完整 calldata 原形态
+        // 直接进种子群体——规范化（selector + 全 32B 头词 + 余字节
+        // 尾）后与编译/字典种子同一路径进场（mutate/判决无特判）。
+        // 与 --dict-word 的分工：字典词填单槽（形态靠搜索拼），语料
+        // 给完整形态（已知攻击/合法笔的通用注入点）。
+        for (i, sc) in seed_calldatas.iter().enumerate() {
+            let input = seed_calldata_input(sc).map_err(|e| format!("--seed-calldata[{i}] {e}"))?;
+            seeds.push(input);
+        }
         // 搜索（issue #25/#29）：DictionaryProposer 为唯一路线——字典
         // 基座 + 多槽协同变异，反馈窗（corpus 精英 + revert 归因）驱动
         // 进化；判决独立，replay 不经搜索层。种子包成单步调用序列
@@ -619,6 +639,18 @@ fn registry_candidate_seed(selector: u32, word: U256) -> SeedInput {
     }
 }
 
+/// --seed-calldata 规范化（issue #41）：完整 calldata → 种子 Input
+/// （selector 4B + 全 32B 头词 + 余字节尾；caller/value 取管线缺省
+/// 形——与编译/字典种子同基座）。fail-closed：非法 hex / 不足 4 字节。
+fn seed_calldata_input(sc: &str) -> Result<SeedInput, String> {
+    let bytes = loom_fuzz_oracle::hex_bytes(sc).map_err(|e| format!("非合法 hex: {e}"))?;
+    if bytes.len() < 4 {
+        return Err("不足 4 字节 selector".to_string());
+    }
+    loom_fuzz_oracle::input_from_calldata([0x33; 20], U256::ZERO, &bytes)
+        .map_err(|e| format!("规范化失败: {e}"))
+}
+
 /// 定长动态尾（len=4 + "loom" 前缀 32B 块，≥4 字节满足 oracle
 /// trivial 长度下限）。
 fn abi_tail() -> Tail {
@@ -765,6 +797,36 @@ fn full_dict_base(
 #[cfg(test)]
 mod seed_base_tests {
     use super::*;
+
+    #[test]
+    fn seed_calldata_input_normalizes_and_validates() {
+        // 规范化：selector + 全 32B 头词 + 余字节尾原样保留。
+        let mut cd = vec![0xde, 0xad, 0xbe, 0xef];
+        cd.extend_from_slice(&[0xaau8; 64]);
+        cd.extend_from_slice(&[1, 2, 3]);
+        let input = seed_calldata_input(&format!(
+            "0x{}",
+            cd.iter().fold(String::new(), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            })
+        ))
+        .unwrap();
+        assert_eq!(input.selector, 0xdeadbeef);
+        assert_eq!(input.caller, [0x33; 20]);
+        assert_eq!(input.head.len(), 2);
+        assert_eq!(input.head[0], [0xaau8; 32]);
+        match &input.tail {
+            Tail::Bytes(t) => assert_eq!(t, &vec![1, 2, 3]),
+            _ => panic!("尾应 Bytes"),
+        }
+        // 序列化回 calldata 逐字节一致（原形态保留）。
+        assert_eq!(loom_fuzz_oracle::calldata_of(&input), cd);
+        // fail-closed：非法 hex / 短 calldata。
+        assert!(seed_calldata_input("0xzz").is_err());
+        assert!(seed_calldata_input("0x0102").is_err());
+    }
 
     #[test]
     fn full_dict_base_caps_at_64_with_assumption() {
