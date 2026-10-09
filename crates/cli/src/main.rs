@@ -563,7 +563,7 @@ fn cmd_run(
     Ok(ExitCode::SUCCESS)
 }
 
-/// 补充常量的槽位扫描变体：n ∈ 1..=9 词头、第 k 槽 = 常量、其余
+/// 补充常量的槽位扫描变体：n ∈ 1..=12 词头、第 k 槽 = 常量、其余
 /// 零、无尾——"哪个槽该填哪个常量"由执行验证（不假设 ABI 形参
 /// 位置；如 anyswap 的 code-size 守卫要求某槽 = 带码地址）。
 /// 种子的字典序键（去重/截断用；与 seed crate 的 sort_key 同形）。
@@ -589,7 +589,7 @@ fn seed_sort_key(s: &SeedInput) -> Vec<u8> {
 
 fn dict_slot_variants(selector: u32, word: U256) -> Vec<SeedInput> {
     let mut out = Vec::new();
-    for n in 1..=9usize {
+    for n in 1..=12usize {
         for k in 0..n {
             let mut head = vec![[0u8; 32]; n];
             head[k] = word.to_be_bytes::<32>();
@@ -631,14 +631,17 @@ fn abi_tail() -> Tail {
 
 /// ABI 形态基座种子（见调用点注释）。tail = len 字（=4）+ 32B 块
 /// 含 "loom" 前缀——≥4 字节，满足 oracle 的 trivial 长度下限。
-/// n 到 9：真实函数头宽可达 0x120（9 槽，如 anySwapOut*WithPermit
-/// 的 msg.data.length ≥ 4+0x120 守卫）。
+/// n 到 12：真实函数头宽可达 9 槽（anyswap anySwapOut*WithPermit
+/// 的 msg.data.length ≥ 4+0x120 守卫）；#41 实测再扩——LiFi
+/// swapAndStartBridgeTokensViaCBridge（8 LiFiData + 2 偏移 = 10 槽）
+/// 与 Rubic routerCall（8 元组 + router + 偏移 = 10 槽）都是 10 槽头，
+/// 9 槽上限会让这类函数的头词永远缺一词（指针槽落进尾区）不可解。
 fn abi_base_seeds(selector: u32) -> Vec<SeedInput> {
     let tail_bytes = match abi_tail() {
         Tail::Bytes(b) => b,
         _ => unreachable!("abi_tail 恒 Bytes"),
     };
-    (1..=9)
+    (1..=12)
         .flat_map(|n| {
             // 双假设：指针槽 = 头宽（ABI 标准形）**或全零**（动态形参
             // 偏移 0/未用形——vvisr deposit 实测 winning witness 是
