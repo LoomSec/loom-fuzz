@@ -429,7 +429,7 @@ struct Evaluated {
 /// CALL 族效果）。到场后继续至多 POST_HIT_RUNS 个 runs（或预算
 /// /空代耗尽），按 `best_hit` 的丰富度择优。**判决独立**：会话内
 /// 的丰富度只是搜索层信用代理，族 oracle 判定不变。
-const POST_HIT_RUNS: u64 = 512;
+const POST_HIT_RUNS: u64 = 1536;
 
 /// 会话（制导与基线共用）：预算控制 + corpus + 最优记录。
 struct Session<'a> {

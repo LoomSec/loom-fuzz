@@ -68,28 +68,34 @@ fn minimal_segment(rng: &mut Rng) -> Vec<[u8; 32]> {
     vec![len, rng.word()]
 }
 
-/// 对段内容做一层内层偏移修复（单元素数组段；其余 verbatim）。
-/// 返回修复后的段（可能因追加最小 bytes 块而变长）。
+fn word_one() -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[31] = 1;
+    w
+}
+
+/// 对段内容做一层内层偏移修复。基数（偏移相对的起点）按段形判定：
+/// 单元素数组段（首词 = 1 且 ≥ 2 词）→ 元素基 = 词 1（元组内偏移
+/// 相对元素头）；否则 → 段基 = 词 0（结构体内偏移相对段头）。无效
+/// 内层偏移（目标越界/长度字非法）在段尾追加最小 bytes 块并重指向。
 fn fix_segment(seg_words: &[[u8; 32]], rng: &mut Rng) -> Vec<[u8; 32]> {
     let mut out = seg_words.to_vec();
     if out.is_empty() {
         return out;
     }
-    // 单元素数组段：首词 = 1 且剩余词数恰为元素宽。
-    let Some(l) = to_u64(&out[0]) else { return out };
-    if l != 1 || out.len() < 2 {
-        return out;
-    }
-    let elem_w = out.len() - 1;
-    for j in 0..elem_w {
-        let idx = 1 + j;
-        let Some(v) = to_u64(&out[idx]) else { continue };
+    let base = if to_u64(&out[0]) == Some(1) && out.len() >= 2 {
+        1
+    } else {
+        0
+    };
+    for j in base..out.len() {
+        let Some(v) = to_u64(&out[j]) else { continue };
         if v < 0x20 || !v.is_multiple_of(32) {
             continue;
         }
-        // 元素相对偏移：目标词 = 元素头（词 1）+ v/32，须落在段内
-        // 且该处有合法长度字（≤ 上限、内容在界内）。
-        let target = 1usize + (v / 32) as usize;
+        // 相对 base 的目标词 = base + v/32，须落在段内且该处有
+        // 合法长度字（≤ 上限、内容在界内）。
+        let target = base + (v / 32) as usize;
         let coherent = target < out.len() && {
             match to_u64(&out[target]) {
                 Some(l) if l <= SEG_LEN_CAP => target + 1 + (l as usize).div_ceil(32) <= out.len(),
@@ -97,11 +103,9 @@ fn fix_segment(seg_words: &[[u8; 32]], rng: &mut Rng) -> Vec<[u8; 32]> {
             }
         };
         if !coherent {
-            // 段尾追加最小 bytes 块并重指向（元素相对：块在词 1
-            // 之后 (out.len()-2-1) 个词处）。
             out.extend(minimal_segment(rng));
-            let new_rel = (out.len() - 3) * 32;
-            out[idx] = U256::from(new_rel as u64).to_be_bytes::<32>();
+            let new_rel = (out.len() - 2 - base) * 32;
+            out[j] = U256::from(new_rel as u64).to_be_bytes::<32>();
         }
     }
     out
@@ -146,9 +150,11 @@ pub(crate) fn abi_coherence_fix(input: &Input, rng: &mut Rng) -> Input {
     // 越界起点（退化值）滤除，按零槽处理。
     nonzero.retain(|&(_, start)| start < n_tail_words);
 
+    // 有界材料：原尾全词（供退化零槽复制共享）。
+    let material: Vec<[u8; 32]> = tail_words.clone();
+
     let mut segments: Vec<(usize, Vec<[u8; 32]>)> = Vec::new();
-    let mut residual_tail: Option<Vec<[u8; 32]>> = Some(tail_words.clone());
-    for (i, &k) in dyn_slots.iter().enumerate() {
+    for &k in &dyn_slots {
         let content = match nonzero.iter().position(|&(slot, _)| slot == k) {
             Some(pos) => {
                 let start = nonzero[pos].1;
@@ -157,32 +163,32 @@ pub(crate) fn abi_coherence_fix(input: &Input, rng: &mut Rng) -> Input {
                     .map(|&(_, s)| s)
                     .unwrap_or(n_tail_words);
                 let end = end.clamp(start, n_tail_words);
-                if start < n_tail_words {
-                    // 该段占用的原尾词从残余中剔除（近似：首个零槽前的
-                    // 残余留给零槽——见下）。
-                    residual_tail = None;
-                }
                 tail_words[start..end].to_vec()
             }
-            None => {
-                if i == 0 {
-                    // 首个零槽继承残余原尾词（内容材料不丢）。
-                    residual_tail.take().unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-            }
+            // 退化零槽 → 合成段（见 rebuild）。
+            None => Vec::new(),
         };
         segments.push((k, content));
     }
 
     // 3. 段内递归 + 4. 重编码。偏移相对 args 区头（含头词）——
-    // 与 Solidity ABI 编码约定一致。
+    // 与 Solidity ABI 编码约定一致。退化零槽合成段：材料 = 原尾
+    // 复制共享（每个零槽得一份——段内容是什么类型无从得知， verbatim
+    // 与单元素数组两形都进搜索空间，执行验证选择）；有界 32 词防
+    // calldata 膨胀。
     let mut new_tail: Vec<[u8; 32]> = Vec::new();
     let mut new_head = input.head.clone();
     for (k, content) in &segments {
         let fixed = if content.is_empty() {
-            minimal_segment(rng)
+            let mat: Vec<[u8; 32]> = material.iter().take(32).copied().collect();
+            let seg = if rng.below(2) == 0 {
+                mat.clone() // 结构体猜测：verbatim
+            } else {
+                let mut s = vec![word_one()];
+                s.extend(mat);
+                s // 单元素数组猜测：[len=1] ++ 材料
+            };
+            fix_segment(&seg, rng)
         } else {
             fix_segment(content, rng)
         };
@@ -236,13 +242,6 @@ mod tests {
         (base..words.len()).contains(&target)
     }
 
-    /// 合成最小段（len=4 + 内容词）的合法性：len 字 ≤ 上限且内容
-    /// 在界内。
-    fn minimal_segment_coherent(words: &[[u8; 32]], at: usize) -> bool {
-        matches!(to_u64(&words[at]), Some(l) if l <= SEG_LEN_CAP
-            && at + 1 + (l as usize).div_ceil(32) <= words.len())
-    }
-
     #[test]
     fn degenerate_three_layer_head_gets_coherent_segments() {
         // LiFi 形退化输入：3 零槽头 + 残余尾词。修复后每个头槽
@@ -267,17 +266,10 @@ mod tests {
         }
         // 偏移相对 args 头：槽 0 = n_head*32。
         assert_eq!(to_u64(&fixed.head[0]), Some(n_head * 32));
-        // 首槽继承残余原尾词（内容材料不丢）。
-        assert_eq!(to_u64(&tail_words[0]), Some(0xAAAA));
-        // 合成段（槽 1/2 的零槽补段）是合法最小动态段。
-        assert!(
-            minimal_segment_coherent(&full, n_head_us + 2),
-            "槽 1 合成段合法"
-        );
-        assert!(
-            minimal_segment_coherent(&full, n_head_us + 4),
-            "槽 2 合成段合法"
-        );
+        // 材料复制共享：原尾词出现在新尾中（verbatim 或数组形
+        // 前置 len=1——两种形状都保留材料）。
+        let has_material = tail_words.iter().any(|w| *w == word(0xAAAA));
+        assert!(has_material, "材料不丢: {tail_words:?}");
         // 幂等：再修不变。
         let fixed2 = abi_coherence_fix(&fixed, &mut Rng::new(7));
         assert_eq!(fixed.clone(), fixed2, "自洽化幂等");
