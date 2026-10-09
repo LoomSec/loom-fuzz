@@ -396,6 +396,13 @@ pub(crate) fn mutate(parent: &Input, ctx: &mut MutCtx<'_>) -> Input {
                 }
             }
         }
+        // ABI 自洽化算子（issue #46：嵌套动态尾装配）：候选 calldata
+        // 的偏移结构系统性重编码（头偏移重绑定 + 段内层偏移修复，
+        // 退化零槽合成最小动态段）。有头有尾才适用；否则回落
+        // legacy。与五算子同权重路径，判决独立。
+        80..=83 if !child.head.is_empty() && matches!(child.tail, Tail::Bytes(_)) => {
+            child = crate::abifix::abi_coherence_fix(&child, rng);
+        }
         // legacy 兜底（#5 基础变异）。
         _ => legacy(rng, &mut child),
     }

@@ -70,6 +70,36 @@ loom-fuzz run \
   --out /tmp/out-lifi
 ```
 
+## 盲搜第三阶段记录（issue #46 ABI 自洽化算子，如实）
+
+引擎新增**通用 ABI 自洽化变异算子**（`crates/fuzz/src/abifix.rs`）：
+结构感知重编码（头偏移槽重绑定 + 段内层偏移递归修复 + 退化零槽
+材料复制共享/形状双假设合成），配比 4%（变异环 80..=83 带）；配合
+**命中后择优继续**（到场后继续 ≤1536 runs，按目标 pc 后 CALL 族
+效果数择优——语义自洽到场 vs 退化到场的进化信用代理，判决独立）。
+
+单会话探针（fork 态直跑算子产物）证明**路径存在**：全零 16 词尾的
+退化父代经 verbatim 形修复后 **reached=true**（pc 1413 CALL 执行，
+evidence 与 decoder 读同一槽位——臂 1 可判）。但全管线盲搜 2 轮
+× 3 seeds（42/2024/7 × 60k runs × 300s，与 #41 同量级预算）未在
+到场后窗口内命中该父代形态——corpus 缺少"≥8 词近零尾"的父代
+（尾词靠 extend 算子零词累积，谱系还要保零头），joint 概率在窗口
+内不足：
+
+```
+===== seed 42 / 2024 / 7（同形态）=====
+29401882: unreachable — 到场但证据谓词不成立：target pc 1413 后 1 条 call（CALL）：
+          臂 3 input 非 calldata 子串；臂 1 target ≠ cast160(evidence)
+29401882: unreachable — 预算耗尽未到达目标帧（60000 runs）
+```
+
+结论：算子按设计工作（探针钉死），搜索动力学未在预算内走到自洽
+谱系——**盲搜 confirmed 未达成**（诚实报告）。嵌套 ABI 盲搜的已知
+剩余缺口：尾材料结构化（零偏置 extend / 段材料池注入）。回归基线
+对照：anyswap genesis 命令在 main（d283021）复跑同样全部
+unreachable（环境与记录漂移，与本算子无关）；vvisr fork 态复跑
+confirmed 473 runs（健康）。
+
 ## 种子语料确认（issue #41 第二阶段，--seed-calldata）
 
 通用种子语料注入 `--seed-calldata <0x-hex>`（PR #45）：完整

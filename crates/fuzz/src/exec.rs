@@ -316,13 +316,16 @@ pub fn run_targeted_with(
         .unwrap_or(2)
         .max(1);
     for seed in seeds {
-        if session.run_one(seed) {
+        let _ = session.run_one(seed);
+        if session.satisfied() {
             break;
         }
     }
     // 种群不足补随机输入（单步随机序列；保持多样性，不进 corpus
     // 优先位）。
-    while !session.reached && session.population_len() < MIN_POPULATION.min(cfg.max_runs as usize) {
+    while !session.satisfied()
+        && session.population_len() < MIN_POPULATION.min(cfg.max_runs as usize)
+    {
         let filler = random_input(
             session.rng_mut(),
             target.hit.selector(),
@@ -330,7 +333,8 @@ pub fn run_targeted_with(
             Some(dict),
         );
         let filler = TxSequence::single(cfg.address, filler);
-        if session.run_one(&filler) {
+        let _ = session.run_one(&filler);
+        if session.satisfied() {
             break;
         }
     }
@@ -338,7 +342,7 @@ pub fn run_targeted_with(
     // 连续空代（提案器不产候选）三代即停——防零候选提案器把
     // 时间预算烧光（fail-closed：无候选 = 搜索无法继续）。
     let mut empty_gens = 0u32;
-    while !session.reached && session.budget_left() && empty_gens < 3 {
+    while !session.satisfied() && session.budget_left() && empty_gens < 3 {
         let cmp_pool = session.pools.cmp();
         let storage_pool = session.pools.storage();
         proposer.refresh(&ProposerCtx {
@@ -379,7 +383,8 @@ pub fn run_targeted_with(
                     storage_pool: &storage_pool,
                 },
             );
-            if session.run_one(&seq) {
+            let _ = session.run_one(&seq);
+            if session.satisfied() {
                 break;
             }
         }
@@ -407,14 +412,24 @@ pub fn run_targeted_with(
 }
 
 /// 一次评估的候选序列（种子直接进 corpus 优先位；变异/随机
-/// 子代按 fitness 竞争）。
+/// 子代按 fitness 竞争）。`runs_at` = 该次评估时的会话 runs 计数
+/// （命中择优的并列决胜与 best_runs 报告值）。
 #[derive(Clone)]
 struct Evaluated {
     seq: TxSequence,
     fitness: u32,
     trace: WitnessTrace,
     guard: Option<GuardFeedback>,
+    runs_at: u64,
 }
+
+/// 命中后择优继续的额外 runs 上限（issue #46 进化信用）：到场
+/// 不即停——退化形态（全零指针被 decoder 宽容接受）与语义自洽
+/// 形态同为"到场"，但后者的 witness 更丰富（目标 pc 后更多
+/// CALL 族效果）。到场后继续至多 POST_HIT_RUNS 个 runs（或预算
+/// /空代耗尽），按 `best_hit` 的丰富度择优。**判决独立**：会话内
+/// 的丰富度只是搜索层信用代理，族 oracle 判定不变。
+const POST_HIT_RUNS: u64 = 1536;
 
 /// 会话（制导与基线共用）：预算控制 + corpus + 最优记录。
 struct Session<'a> {
@@ -424,8 +439,10 @@ struct Session<'a> {
     deadline: Instant,
     runs: u64,
     reached: bool,
-    /// 命中那次的序列/trace/runs（reached 时即报告值）。
-    hit: Option<Evaluated>,
+    /// 到场那次的 runs 计数（首次到场；择优继续的计时起点）。
+    hit_run: Option<u64>,
+    /// 全部到场 run 的择优池（`best_hit` 的候选）。
+    hits: Vec<Evaluated>,
     /// 全程 fitness 最小的一次（未命中时即报告值；并列取先到）。
     best: Option<Evaluated>,
     corpus: Vec<Evaluated>,
@@ -460,7 +477,8 @@ impl<'a> Session<'a> {
             deadline: Instant::now() + cfg.time_budget,
             runs: 0,
             reached: false,
-            hit: None,
+            hit_run: None,
+            hits: Vec::new(),
             best: None,
             corpus: Vec::new(),
             corpus_keys: BTreeSet::new(),
@@ -514,6 +532,36 @@ impl<'a> Session<'a> {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
+    /// 命中即停 → 命中后择优继续（issue #46）：到场后继续至多
+    /// [`POST_HIT_RUNS`] 个 runs（或预算/空代耗尽），让语义自洽的
+    /// 到场（目标 pc 后 CALL 族效果更丰富）有机会反超退化形态。
+    fn satisfied(&self) -> bool {
+        match self.hit_run {
+            Some(h) => self.runs >= h + POST_HIT_RUNS,
+            None => false,
+        }
+    }
+
+    /// 到场择优：目标 pc 之后 CALL/CALLCODE/DELEGATECALL 数（族
+    /// 无关的丰富度代理——语义自洽 witness 携带真实呼出链），并列
+    /// 取先到（runs_at 最小）。**判决独立**：只决定报告哪次到场，
+    /// 族 oracle 判定不变。
+    fn best_hit(&self) -> Option<Evaluated> {
+        let min_pc = self.table.min_target()?;
+        self.hits
+            .iter()
+            .max_by_key(|e| {
+                let calls = e
+                    .trace
+                    .calls
+                    .iter()
+                    .filter(|c| c.kind != "STATICCALL" && c.pc.is_some_and(|pc| pc >= min_pc))
+                    .count();
+                (calls, std::cmp::Reverse(e.runs_at))
+            })
+            .cloned()
+    }
+
     /// 记录一条 run 反馈（revert 归因经 RunResult.feedback_guard）。
     fn push_feedback(&mut self, run: &crate::evm::RunResult, seq: &TxSequence, fitness: u32) {
         self.feedback.push(RunFeedback {
@@ -529,11 +577,12 @@ impl<'a> Session<'a> {
     }
 
     /// 评估一个调用序列：逐步执行 + fitness（各步距离最小）+ 命中
-    /// （任意步到达即命中）/最优/corpus 维护。返回 true = 命中
-    /// （调用方应停止产生新候选）。
+    /// （任意步到达即命中）/最优/corpus 维护。返回 true = 本次命中
+    /// （命中不即停——issue #46 命中后择优继续，调用方以
+    /// [`Session::satisfied`] 判定搜索终点）。
     fn run_one(&mut self, seq: &TxSequence) -> bool {
         if !self.budget_left() {
-            return self.reached;
+            return self.satisfied();
         }
         self.runs += 1;
         let targets = self.table.targets();
@@ -552,20 +601,20 @@ impl<'a> Session<'a> {
             fitness,
             trace: result.trace,
             guard: result.feedback_guard.clone(),
+            runs_at: self.runs,
         };
         if hit_now {
             self.reached = true;
-            self.hit = Some(evaluated);
-            return true;
-        }
-        let better = self.best.as_ref().is_none_or(|b| fitness < b.fitness);
-        if better {
-            self.best = Some(Evaluated {
-                seq: evaluated.seq.clone(),
-                fitness,
-                trace: evaluated.trace.clone(),
-                guard: evaluated.guard.clone(),
-            });
+            if self.hit_run.is_none() {
+                self.hit_run = Some(self.runs);
+            }
+            // 到场 run 也进择优池与父代池（语义自洽形态的进化信用）。
+            self.hits.push(evaluated.clone());
+        } else {
+            let better = self.best.as_ref().is_none_or(|b| fitness < b.fitness);
+            if better {
+                self.best = Some(evaluated.clone());
+            }
         }
         // 精英集维护：按 fitness 插入截断（按序列去重）——父代选择
         // 压力来源（反馈窗只有最近 N 条，全史最优会滚出窗口）。
@@ -592,18 +641,21 @@ impl<'a> Session<'a> {
                 self.step_pool.push(step.clone());
             }
         }
-        false
+        hit_now
     }
 
     fn into_report(self) -> SessionReport {
-        let chosen = self.hit.clone().or(self.best);
-        let (best_steps, trace) = match chosen {
-            Some(e) => (Some(e.seq), e.trace),
+        // 到场择优（issue #46）：丰富度最高的那次到场作报告 witness；
+        // 未到场退化为全程 fitness 最小的一次（如实，是最接近的候选）。
+        let chosen = self.best_hit().or(self.best);
+        let (best_steps, best_runs, trace) = match chosen {
+            Some(e) => (Some(e.seq), e.runs_at, e.trace),
             None => {
                 // 一 run 未执行（max_runs = 0 或时间预算为 0）：
                 // 无 witness 可报，如实给空 trace。
                 (
                     None,
+                    self.runs,
                     WitnessTrace {
                         contract: self.cfg.address,
                         visited_pcs: Vec::new(),
@@ -620,8 +672,7 @@ impl<'a> Session<'a> {
         let reached = self.reached;
         SessionReport {
             reached,
-            // 命中即停：runs 即命中所用计数；未命中 = 总 runs。
-            best_runs: self.runs,
+            best_runs,
             best_steps,
             truncated: trace.truncated,
             trace,
@@ -682,7 +733,10 @@ mod tests {
         let report = run_targeted(&cfg, &target, &seeds, &ValueDictionary { words: vec![] });
         assert!(report.reached);
         assert_eq!(report.best_runs, 1);
-        assert_eq!(report.runs_completed, 1);
+        // 命中后择优继续（issue #46）：到场不即停，跑满预算；
+        // best_runs 仍 = 那次到场的计数。
+        assert_eq!(report.runs_completed, 10);
+        assert!(report.best_steps.is_some());
         assert!(report.best_steps.is_some());
         assert!(report.trace.visited_pcs.contains(&0));
     }

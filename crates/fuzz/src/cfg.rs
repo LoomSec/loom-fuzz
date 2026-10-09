@@ -131,6 +131,11 @@ impl DistanceTable {
         self.target_pcs.iter().copied().collect()
     }
 
+    /// 最小目标 pc（到场择优的丰富度计分起点，issue #46）。
+    pub fn min_target(&self) -> Option<u32> {
+        self.target_pcs.iter().next().copied()
+    }
+
     /// 单个 pc 的块距离（pc 不在任何块 = `u32::MAX`）。
     pub fn pc_distance(&self, pc: u32) -> u32 {
         match self.pc_to_block.get(pc as usize) {
