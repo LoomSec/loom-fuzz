@@ -28,7 +28,7 @@ pub const ROUTER_ADDRESS: [u8; 20] = [0x22; 20];
 
 /// forge-std 的 Vm cheatcode 地址（hevm cheat code 的 keccak 后
 /// 160 位，foundry 惯例常量）。
-const VM_ADDRESS: &str = "0x7109709ECfa91a80626fF3989D68f67F5b1DD12D";
+pub(crate) const VM_ADDRESS: &str = "0x7109709ECfa91a80626fF3989D68f67F5b1DD12D";
 
 /// 默认缴获全额：1_000_000e18（mint 给路由器的受害者资产量）。
 pub fn default_balance() -> U256 {
@@ -200,16 +200,25 @@ pub fn select_action(poc: &Poc) -> Result<HarmfulAction, PocgenError> {
 /// 必然 BadShape）。"槽 0 地址洁净"从解析前提降为臂 3 模板过滤项
 /// （`arm3_eligible`）：不洁净仍可解析，只是该候选在臂 3 语境被过滤。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HeadShape {
-    selector: u32,
+pub(crate) struct HeadShape {
+    pub(crate) selector: u32,
     /// 头区完整 32B 词（含动态头的尾内容词；渲染时按尾偏移值截到
     /// 头宽——偏移值即头宽）。
-    words: Vec<U256>,
+    pub(crate) words: Vec<U256>,
     /// 动态尾偏移槽号（Some(k) = 槽 k 的值指向 calldata 内合法 ABI
     /// bytes/string 段）；None = 纯定长头（无动态段）。
-    tail_slot: Option<usize>,
+    pub(crate) tail_slot: Option<usize>,
     /// 臂 3 过滤项：槽 0 地址洁净（值 < 2^160）。
-    arm3_eligible: bool,
+    pub(crate) arm3_eligible: bool,
+}
+
+/// 头形截断后的头词（动态头按尾偏移值 = 头宽截断）。
+pub(crate) fn head_words_of(shape: &HeadShape) -> &[U256] {
+    let head_len = match shape.tail_slot {
+        Some(k) => shape.words[k].to::<u64>() as usize / 32,
+        None => shape.words.len(),
+    };
+    &shape.words[..head_len]
 }
 
 /// 头槽扫描上限（保持旧解析的上限风格：头形推断只在有限前缀上做；
@@ -226,7 +235,7 @@ fn word(rest: &[u8], idx: usize) -> U256 {
     U256::from_be_bytes(w)
 }
 
-fn parse_head_shape(calldata: &[u8]) -> Result<HeadShape, PocgenError> {
+pub(crate) fn parse_head_shape(calldata: &[u8]) -> Result<HeadShape, PocgenError> {
     if calldata.len() < 4 + 32 {
         return Err(PocgenError::BadShape(format!(
             "calldata 不足一个头槽: {} 字节",
@@ -294,13 +303,13 @@ fn parse_head_shape(calldata: &[u8]) -> Result<HeadShape, PocgenError> {
 ///   通用探针形（Anyswap 系）。token = 入口对象（underlying() 自指
 ///   价值资产），underlyingAsset = 价值资产。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VictimModel {
+pub(crate) enum VictimModel {
     Single,
     Pegged,
 }
 
 /// `underlying()` selector（keccak 现算，与 erc20_selectors 同风格）。
-fn underlying_selector() -> u32 {
+pub(crate) fn underlying_selector() -> u32 {
     use sha3::{Digest, Keccak256};
     let mut h = Keccak256::new();
     h.update(b"underlying()");
@@ -375,6 +384,26 @@ pub fn generate_exploit_with(
         }
         None => ROUTER_ADDRESS,
     };
+    // 多步 witness（issue #36/L3）：steps.len() > 1 走攻击合约 +
+    // 序列驱动合成（arbitrary_call 族）；其余族如实降级（fail-closed
+    // 不硬套）。单步 = 原 L2 路径（回归保证，下方不变）。
+    if steps.len() > 1 {
+        return match poc.family {
+            loom_fuzz_oracle::HitFamily::ArbitraryCall => crate::l3::generate_l3(
+                poc,
+                &steps,
+                code,
+                out_dir,
+                fork_mode,
+                &prestate,
+                contract,
+                params,
+            ),
+            other => Err(PocgenError::NoGenericAction(format!(
+                "多步 L3 目前只支持 arbitrary_call 族（payload 头形注入）；族 {other:?} 的多步合成未实现，如实降级"
+            ))),
+        };
+    }
     // 族分发（#20）：approval_drain 族走通用 ERC20 形状动作选择
     //（形状不匹配即 NoGenericAction 诚实降级）；arbitrary_call 族走
     // 广义头形合成（issue #28：目标槽经定罪呼出交叉定位，零词角色
@@ -624,7 +653,7 @@ impl ProjectArtifacts {
         ProjectArtifacts { files }
     }
 
-    fn write(&self, out_dir: &Path) -> std::io::Result<()> {
+    pub(crate) fn write(&self, out_dir: &Path) -> std::io::Result<()> {
         for (name, content) in &self.files {
             let path = out_dir.join(name);
             if let Some(parent) = path.parent() {
@@ -639,7 +668,7 @@ impl ProjectArtifacts {
 /// 任意地址的 Solidity 表达式（hex 串字面量经 bytes20 转换，避开
 /// address 字面量 checksum 启发——0x+40hex 字面量在任何整型上下文
 /// 都会触发该校验）。
-fn addr_expr(a: [u8; 20]) -> String {
+pub(crate) fn addr_expr(a: [u8; 20]) -> String {
     let mut s = String::with_capacity(40);
     for b in a {
         let _ = write!(s, "{b:02x}");
@@ -661,7 +690,7 @@ fn attacker_expr(a: [u8; 20]) -> String {
     )
 }
 
-fn u256_hex64(v: U256) -> String {
+pub(crate) fn u256_hex64(v: U256) -> String {
     let mut s = String::with_capacity(64);
     for b in v.to_be_bytes::<32>() {
         let _ = write!(s, "{b:02x}");
@@ -669,7 +698,65 @@ fn u256_hex64(v: U256) -> String {
     s
 }
 
-fn mock_erc20_sol() -> String {
+/// registry/prestate 槽布置渲染（机械：每条一个 vm.store，L2/L3 共用）。
+pub(crate) fn render_prestate_stores(prestate: &[(U256, U256)]) -> String {
+    let mut stores = String::new();
+    for (slot, value) in prestate {
+        let _ = writeln!(
+            stores,
+            "        vm.store(ROUTER, 0x{}, bytes32(uint256(0x{})));",
+            u256_hex64(*slot),
+            u256_hex64(*value)
+        );
+    }
+    stores
+}
+
+/// 在场合约表布置渲染（poc.json deployments 逐字 etch，L2/L3 共用）。
+pub(crate) fn render_deploy_etches(deployments: &[PocDeployment]) -> String {
+    let mut out = String::new();
+    for d in deployments {
+        let _ = writeln!(
+            out,
+            "        vm.etch({}, hex\"{}\"); // on-session contract",
+            addr_expr(deploy_addr(d)),
+            d.runtime_hex.trim_start_matches("0x")
+        );
+    }
+    out
+}
+
+/// 头词 → calldata 参数表达式（L2/L3 共用，零个案）：
+/// 目标槽 = 受害资产表达式（`token_expr`，如 `address(token)` /
+/// `address(asset)`）；尾偏移槽 = `request`（动态头形注入对象，调用
+/// 方先渲染 request 声明）；零词按 debit/recipient/amount 角色序注入
+/// （router_expr / ATTACKER / BALANCE——ERC20 标准形）；其余逐字保留。
+pub(crate) fn head_arg_exprs(
+    head_words: &[U256],
+    target_slot: usize,
+    tail_slot: Option<usize>,
+    token_expr: &str,
+    router_expr: &str,
+) -> Vec<String> {
+    let mut roles = [router_expr, "ATTACKER", "BALANCE"].into_iter();
+    head_words
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            if i == target_slot {
+                token_expr.to_string()
+            } else if tail_slot == Some(i) {
+                "request".to_string()
+            } else if *w == U256::ZERO {
+                roles.next().unwrap_or("uint256(0)").to_string()
+            } else {
+                format!("uint256(0x{})", u256_hex64(*w))
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn mock_erc20_sol() -> String {
     r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
@@ -773,7 +860,7 @@ contract MockERC20 {
     .to_string()
 }
 
-fn ierc20_sol() -> String {
+pub(crate) fn ierc20_sol() -> String {
     r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
@@ -787,16 +874,17 @@ interface IERC20 {
     .to_string()
 }
 
-fn vm_sol() -> String {
+pub(crate) fn vm_sol() -> String {
     r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 /// @dev 最小 Vm cheatcode 接口（pocgen 自带，免 forge-std 依赖；
-/// 自写 interface Vm 是 foundry 惯例）。只要 etch/store/prank。
+/// 自写 interface Vm 是 foundry 惯例）。只要 etch/store/prank/deal。
 interface Vm {
     function etch(address target, bytes calldata code) external;
     function store(address target, bytes32 slot, bytes32 value) external;
     function prank(address msgSender) external;
+    function deal(address account, uint256 balance) external;
     function expectRevert(bytes calldata revertData) external;
 }
 "#
@@ -826,30 +914,14 @@ fn poc_test_sol(
     // 注入（ERC20 标准形角色——与 select_action 同类的 ABI 形状知识）；
     // 其余非零词逐字保留（deadline/v/r/s 类参数随 witness）。动态头形
     // 的头词截到头宽（偏移值 = 头宽），尾内容重新编码。
-    let head_len = match shape.tail_slot {
-        Some(k) => shape.words[k].to::<u64>() as usize / 32,
-        None => shape.words.len(),
-    };
-    let head_words = &shape.words[..head_len];
-    let mut roles = ["ROUTER", "ATTACKER", "BALANCE"].iter();
-    let arg_exprs: Vec<String> = head_words
-        .iter()
-        .enumerate()
-        .map(|(i, w)| {
-            if i == target_slot {
-                "address(token)".to_string()
-            } else if shape.tail_slot == Some(i) {
-                "request".to_string()
-            } else if *w == U256::ZERO {
-                roles
-                    .next()
-                    .map(|r| (*r).to_string())
-                    .unwrap_or_else(|| "uint256(0)".to_string())
-            } else {
-                format!("uint256(0x{})", u256_hex64(*w))
-            }
-        })
-        .collect();
+    let head_words = head_words_of(shape);
+    let arg_exprs = head_arg_exprs(
+        head_words,
+        target_slot,
+        shape.tail_slot,
+        "address(token)",
+        "ROUTER",
+    );
     let data_expr = format!(
         "abi.encodeWithSelector({}, {})",
         selector,
@@ -888,32 +960,18 @@ fn poc_test_sol(
         );
     }
 
-    // registry/prestate 布置：每条一个 vm.store。
-    let mut stores = String::new();
-    for (slot, value) in prestate {
-        let _ = writeln!(
-            stores,
-            "        vm.store(ROUTER, 0x{}, bytes32(uint256(0x{})));",
-            u256_hex64(*slot),
-            u256_hex64(*value)
-        );
-    }
-    // VICTIM_ASSET 的 registry 成员布置：价值影响前提（router 的
-    // registry 接受该资产为 service——与 poc.json 的 registry
-    // prestate 同形，机械推导槽 = keccak(abi.encode(token, 0))）。
+    // registry/prestate 布置（L2/L3 共用渲染）+ VICTIM_ASSET 的
+    // registry 成员布置：价值影响前提（router 的 registry 接受该资产
+    // 为 service——与 poc.json 的 registry prestate 同形，机械推导槽
+    // = keccak(abi.encode(token, 0))）。
+    let mut stores = render_prestate_stores(prestate);
     stores
         .push_str("        // VICTIM_ASSET 作为 service 的 registry 成员布置（价值影响前提）。\n");
     stores.push_str(
         "        vm.store(ROUTER, keccak256(abi.encode(address(token), uint256(0))), bytes32(uint256(1)));\n",
     );
-    // fork 后部署（通用：逐字 etch poc.json 记录的 runtime）。
-    for d in deployments {
-        stores.push_str(&format!(
-            "        vm.etch({}, hex\"{}\"); // fork deployment\n",
-            addr_expr(deploy_addr(d)),
-            d.runtime_hex.trim_start_matches("0x")
-        ));
-    }
+    // 在场合约表（poc.json deployments：逐字 etch runtime）。
+    stores.push_str(&render_deploy_etches(deployments));
 
     format!(
         r#"// SPDX-License-Identifier: MIT
@@ -1010,23 +1068,8 @@ fn drain_test_sol(action: HarmfulAction, ctx: &DrainCtx<'_>) -> String {
     let router = addr_expr(ctx.contract);
     let victim = addr_expr(ctx.victim_token);
     let attacker = addr_expr(ctx.caller);
-    let mut stores = String::new();
-    for (slot, value) in ctx.prestate {
-        let _ = writeln!(
-            stores,
-            "        vm.store(ROUTER, 0x{}, bytes32(uint256(0x{})));",
-            u256_hex64(*slot),
-            u256_hex64(*value)
-        );
-    }
-    for d in ctx.deployments {
-        let _ = writeln!(
-            stores,
-            "        vm.etch({}, hex\"{}\"); // fork deployment",
-            addr_expr(deploy_addr(d)),
-            d.runtime_hex.trim_start_matches("0x")
-        );
-    }
+    let mut stores = render_prestate_stores(ctx.prestate);
+    stores.push_str(&render_deploy_etches(ctx.deployments));
     // 有害动作前提：victim 余额 +（transferFrom 形）allowance。
     let (capture_to, amount, victim_stores) = match action {
         HarmfulAction::Erc20TransferFrom { from, to, amount } => {
@@ -1181,7 +1224,7 @@ export BLOCKMACHINE_API_KEY=...    # 空 = 直接无 key 连接（免费档）
     s
 }
 
-fn foundry_toml(fork: bool) -> String {
+pub(crate) fn foundry_toml(fork: bool) -> String {
     let mut s = String::new();
     s.push_str(
         r#"[profile.default]
@@ -1256,7 +1299,7 @@ foundry.toml 不能带头）。
     s
 }
 
-fn run_sh() -> String {
+pub(crate) fn run_sh() -> String {
     r#"#!/usr/bin/env bash
 # BlockMachine fork 模式（pocgen 生成）：
 #   BLOCKMACHINE_API_KEY 为空 = 直接无 key 连接（免费档）；
@@ -1286,7 +1329,7 @@ forge test --fork-url "http://127.0.0.1:$PORT" "$@"
 }
 
 /// poc.json 部署地址解析（渲染期）。
-fn deploy_addr(d: &PocDeployment) -> [u8; 20] {
+pub(crate) fn deploy_addr(d: &PocDeployment) -> [u8; 20] {
     let b = hex_bytes(&d.address).unwrap_or_default();
     if b.len() != 20 {
         return [0u8; 20];
@@ -1310,15 +1353,7 @@ fn replay_test_sol(
 ) -> String {
     let router = addr_expr(contract);
     let attacker = addr_expr(caller);
-    let mut stores = String::new();
-    for (slot, value) in prestate {
-        let _ = writeln!(
-            stores,
-            "        vm.store(ROUTER, 0x{}, bytes32(uint256(0x{})));",
-            u256_hex64(*slot),
-            u256_hex64(*value)
-        );
-    }
+    let mut stores = render_prestate_stores(prestate);
     for d in deployments {
         let _ = writeln!(
             stores,

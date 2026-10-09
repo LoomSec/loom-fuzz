@@ -1,13 +1,25 @@
-//! L2 exploit 影响层（issue #10）：L1 witness（到场 + 控制呼出）→
-//! L2 价值影响 PoC——**forge test 绿灯 = 终判**。
+//! L2/L3 exploit 影响层（issue #10/#36）：L1 witness → L2 价值影响
+//! PoC / L3 多步攻击 PoC——**forge test 绿灯 = 终判**。
 //!
 //! # 两层模型
 //!
 //! - **L1**（M0 已完，`crates/oracle`）：到场 target pc + 控制呼出
 //!   （arbitrary_call 臂 3 = 任意目标 + 任意 calldata，msg.sender =
 //!   路由器）。
-//! - **L2**（本 crate）：把 primitive 组装成盗窃——选有害动作、布置
-//!   受害者资产、断言缴获。机械合成，不手写个案 calldata。
+//! - **L2**（issue #10/#20/#28，单步 witness）：把 primitive 组装成
+//!   盗窃——选有害动作、布置受害者资产、断言缴获。机械合成，不手写
+//!   个案 calldata。
+//! - **L3**（issue #36，多步 witness = 调用序列 #35）：DeFiHackLabs
+//!   式**攻击合约 + 序列驱动**——`src/Attacker.sol` 机械合成（构造器
+//!   收 victim 地址 + 受害资产 mock + 在场合约表 #34；`attack()` 按
+//!   `Poc.steps` 依次 `target.call{value: v}(data)`，逐步独立头形
+//!   解析后经 abi 编码重新表达——非硬编码裸字节串）。payload 步
+//!   （末步，与 L2 同锚）复用 L2 的全套注入（目标槽经定罪呼出目标
+//!   交叉定位 = 受害资产、动态尾 = transferFrom 请求、定长头零词
+//!   角色序）；布置步头形原样重编码（逐字保留 + 动态尾 verbatim）。
+//!   终点断言与 L2 同锚：每个受害资产的 ROUTER 持仓严格归零。
+//!   steps.len()==1 走原 L2 路径（回归保证）；多步非 arbitrary_call
+//!   族 / payload 头形不可机械组装 → 诚实降级（fail-closed）。
 //!
 //! # 合成三要素（arbitrary_call 的 L2 形状）
 //!
@@ -59,6 +71,7 @@
 //! 自带断言 helper，不依赖 forge-std）。绿灯 → 返回工程路径；
 //! 红灯 / forge 缺失 → typed error 带输出（fail-closed）。
 
+mod l3;
 mod project;
 mod synth;
 

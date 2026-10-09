@@ -152,7 +152,8 @@ fuzz_report.json（loom-fuzz-report@1：per-hit 判决 + 覆盖 + corpus 规模
   │    （loom 特色）：执行器记录最近经过的支配 guard（pc +
   │    xlayer 渲染 cond），随 RunFeedback 喂提案器。**判决独立**：
   │    judge/oracle 不感知提案器；replay 不经搜索层，verdict 一致。
-  │  L2（issue #10/#20）：confirmed 的 poc.json 进 exploit 影响层——
+  │  L2（issue #10/#20/#28，steps.len()==1）/ L3（issue #36，多步
+  │  witness = 调用序列 #35）：confirmed 的 poc.json 进 exploit 影响层——
   ▼
 Foundry 工程（crates/pocgen 机械合成，forge test 绿灯 = 终判）
   │  资产模型：MockERC20（工程自带，含路由面探针词汇 underlying /
@@ -170,10 +171,17 @@ Foundry 工程（crates/pocgen 机械合成，forge test 绿灯 = 终判）
   │    allowance keccak 槽布置 + verbatim 重放 + 缴获断言；形状不
   │    匹配 / 无可机械组装路径 = typed error 诚实降级（不硬套个案；
   │    run --emit-poc 遇降级如实标注并继续）
-  │  双断言：L1 require(ok)（路由器调用成功）+ L2 require(
+  │  L3 多步（issue #36）：`src/Attacker.sol` 机械合成（构造器收
+  │    victim + 受害资产 + 在场合约表 #34；attack() 按 Poc.steps
+  │    依次 target.call{value}(calldata)——逐步独立头形解析后 abi
+  │    编码重新表达，非硬编码裸字节串；payload 末步复用 L2 同锚
+  │    注入，布置步 witness 原样重编码）→ testExploit：布置 →
+  │    部署 Attacker → attack() → 终点断言（与 L2 同锚）；多步非
+  │    arbitrary_call 族 / payload 头形不可组装 = 诚实降级
+  │  双断言：L1 require(ok)（路由器/攻击步调用成功）+ L2/L3 require(
   │    balanceOf(ROUTER) == 0)（每个受害资产的路由器持仓严格归零
   │    ——终点断言，缴获路径因 router 逻辑而异）
-  │  ｜非 confirmed 不进 L2（typed error 诚实降级）
+  │  ｜非 confirmed 不进 L2/L3（typed error 诚实降级）
   ▼
 forge test 绿灯（`loom-fuzz exploit <poc.json> --code … [--fork]`
   或 `run --emit-poc <dir>`；fork 模式 = BlockMachine，见工程 README）
