@@ -60,6 +60,7 @@ loom-evm 反编译产出的静态事实直接编译成 fuzz 的输入空间：
 - **M0.9**：approval_drain 族（issue #20）——deputy_call（有 caller 守卫但目标可控 = confused deputy）/ drain_forward（input 含输入派生词且不与 caller 绑定）的装载（模式 A 双 pack 并集 / 模式 B 内置推导逐条对齐 loom packs）+ 族 oracle（deputy 复用臂 1 求值 / drain 宽松 memmem）+ L2 通用 ERC20 形状动作选择（不匹配如实报"无通用动作"）。签入 fixtures/real-world/（vvisr RewardsHypervisor / anyswap V4Router）。
 - **M1.0**：多合约装载（issue #34）——`--deploy` 多值（合约表 = victim + 各部署）+ 机械 `forwarder` 攻击代理规格 + `--entry` 入口（caller 轮换 ATTACKER → 攻击合约 → victim 的第一环）；witness 记 call 的 `from` 与目标帧 `contract`，oracle 按 victim 帧过滤（多合约 trace pc 数值跨代码库的正确性兜底）。Genesis / fork 两态、模式 A/B 归一不变；#35 序列搜索在合约表上扩展。
 - **M1.1**：多交易 stateful 搜索（issue #35）——witness = 调用序列（`Step = target + calldata + caller + value`，steps.len()==1 与单步路径逐位等价）：逐步执行于同一 CacheDB overlay（状态跨步持久，revert 步如实记 step_outcomes），oracle 任意步到达即 L1 到场、族检查器逐步 calldata；序列级组装算子（append / splice / 步内变异，素材 = 反馈窗 ∪ 会话步级池——布置步 fitness 死路的信用分配留存），`--max-steps` 机械约束（默认 1 = 单步）；poc.json `steps` 序列化，旧单步 poc 经 legacy `tx` 归一可 replay。
+- **M1.2**：pocgen L3 多步攻击 PoC 机械合成（issue #36）——`src/Attacker.sol` 攻击合约（构造器收 victim + 受害资产 + 在场合约表；attack() 按 Poc.steps 依次 `target.call{value}(calldata)`，逐步独立头形解析后 abi 编码重新表达）+ testExploit（布置 → 部署 Attacker → attack() → 终点断言与 L2 同锚：受害资产 ROUTER 持仓归零）；steps.len()==1 走原 L2 路径（回归保证）；多步非 arbitrary_call 族 / payload 头形不可组装 = 诚实降级（fail-closed）。验收：两步 fixture（布置存储 → TRV 形裸转发）forge test 绿灯。
 
 ```sh
 loom-fuzz run --shard hit.lst --code bytecode.hex --prestate slots.json --out out/
