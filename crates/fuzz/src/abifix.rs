@@ -130,11 +130,20 @@ pub(crate) fn abi_coherence_fix(input: &Input, rng: &mut Rng) -> Input {
     let tail_words: Vec<[u8; 32]> = tail_bytes[..n_tail_words * 32].as_chunks::<32>().0.to_vec();
 
     // 1. 动态槽识别。
-    let dyn_slots: Vec<usize> = (0..n_head)
+    let mut dyn_slots: Vec<usize> = (0..n_head)
         .filter(|&k| input.head[k] == [0u8; 32] || offset_shaped(&input.head[k], k, n_head, total))
         .collect();
     if dyn_slots.is_empty() {
         return input.clone();
+    }
+    // 宽头保护（回归红线）：头宽 > 4 时零槽视为数据（anyswap permit
+    // 形 9 槽定长头全是参数数据，零值合法）——零槽合成只在小头
+    // （嵌套 ABI 的偏移头形态 ≤ 4 槽）启用；非零偏移形词不受此限。
+    if n_head > 4 {
+        dyn_slots.retain(|&k| input.head[k] != [0u8; 32]);
+        if dyn_slots.is_empty() {
+            return input.clone();
+        }
     }
 
     // 2. 原段切分：非零槽按偏移排序，相邻段首为界；零槽无原段。
@@ -184,9 +193,15 @@ pub(crate) fn abi_coherence_fix(input: &Input, rng: &mut Rng) -> Input {
             let seg = if rng.below(2) == 0 {
                 mat.clone() // 结构体猜测：verbatim
             } else {
+                // 单元素数组猜测：[len=1] ++ 材料 ++ 填充——最小
+                // 元素宽 8 词（覆盖常见元组宽；材料短时 rng 补，
+                // 仍由执行验证裁定）。
                 let mut s = vec![word_one()];
                 s.extend(mat);
-                s // 单元素数组猜测：[len=1] ++ 材料
+                while s.len() < 9 {
+                    s.push(rng.word());
+                }
+                s
             };
             fix_segment(&seg, rng)
         } else {
