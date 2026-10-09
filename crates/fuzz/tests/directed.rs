@@ -232,7 +232,9 @@ fn trv_like_reaches_target_frame() {
         report.trace.calls.len(),
         report.trace.outcome
     );
-    assert_eq!(report.best_runs, report.runs_completed);
+    // 命中后择优继续（issue #46）：到场不即停——best_runs = 到场那次
+    // 的计数，runs_completed = 总会话 runs（≥ best_runs）。
+    assert!(report.best_runs <= report.runs_completed);
     let best = &report
         .best_steps
         .as_ref()
