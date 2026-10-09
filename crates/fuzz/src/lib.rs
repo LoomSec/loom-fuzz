@@ -133,6 +133,7 @@
 //! 字节序；revm 本身确定性。report 的 best_input / WitnessTrace 逐
 //! 字节一致（测试断言）。
 
+mod abifix;
 mod cfg;
 mod evm;
 mod exec;
