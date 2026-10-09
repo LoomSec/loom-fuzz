@@ -101,10 +101,19 @@ enum Cmd {
         #[arg(long, default_value = "latest")]
         fork_block: String,
         /// fork 后部署攻击合约（可多次）：`<addr>:<runtime-hex 或
-        /// responder 或 responder-sender>`（responder = 任何 call 返回
-        /// 0x01…，responder-sender = 返回 msg.sender，ABI 右对齐）。
+        /// responder 或 responder-sender 或 forwarder>`（responder =
+        /// 任何 call 返回 0x01…，responder-sender = 返回 msg.sender，
+        /// ABI 右对齐；forwarder = 攻击代理入口——fallback 原样 CALL
+        /// 转发 calldata 到分析合约，机械模板零个案，#34）。多值 =
+        /// 多合约在场（合约表 = victim + 各部署）。
         #[arg(long = "deploy")]
         deploy: Vec<String>,
+        /// 顶层交易入口合约地址（issue #34）：须在合约表内（分析
+        /// 合约地址或某个 --deploy 地址）——caller 轮换 ATTACKER →
+        /// 入口合约 → victim 的装载形态（deputy 场景 caller 守卫
+        /// 绕过）。缺省 = 直接 call 分析合约（单步默认不变）。
+        #[arg(long)]
+        entry: Option<String>,
         /// 分析合约的链上真实地址：fork 态必须在真实地址上执行（否则
         /// 合约自身状态错位）——CLI 强制。
         #[arg(long)]
@@ -166,6 +175,7 @@ fn run() -> Result<ExitCode, String> {
             fork_url,
             fork_block,
             deploy,
+            entry,
             contract_addr,
         } => cmd_run(
             &shard,
@@ -183,6 +193,7 @@ fn run() -> Result<ExitCode, String> {
             fork_url.as_deref(),
             &fork_block,
             &deploy,
+            entry.as_deref(),
             contract_addr.as_deref(),
         ),
         Cmd::Exploit {
@@ -230,6 +241,7 @@ fn cmd_run(
     fork_url: Option<&str>,
     fork_block: &str,
     deploy_flags: &[String],
+    entry_flag: Option<&str>,
     contract_addr: Option<&str>,
 ) -> Result<ExitCode, String> {
     // 装载（模式 A 需 pack+loom-bin 成对；只给一个 = fail-closed）。
@@ -282,11 +294,14 @@ fn cmd_run(
         }
         None => CONTRACT_ADDRESS,
     };
-    // fork 后部署：`<addr>:<runtime-hex|responder|responder-sender>`。
+    // fork 后部署：`<addr>:<runtime-hex|responder|responder-sender|
+    // forwarder>`。多值 = 合约表多成员（#34）；forwarder = 机械攻击
+    // 代理入口（fallback 原样 CALL 转发 calldata 到分析合约，victim
+    // 帧 msg.sender = 代理合约）。
     let mut deployments: Vec<loom_fuzz_fuzz::Deployment> = Vec::new();
     for d in deploy_flags {
         let (addr, spec) = d.split_once(':').ok_or_else(|| {
-            format!("--deploy 形态应为 <addr>:<runtime-hex|responder|responder-sender>: {d:?}")
+            format!("--deploy 形态应为 <addr>:<runtime-hex|responder|responder-sender|forwarder>: {d:?}")
         })?;
         let address_bytes = loom_fuzz_oracle::hex_bytes(addr)?;
         if address_bytes.len() != 20 {
@@ -301,10 +316,30 @@ fn cmd_run(
                 w
             }),
             "responder-sender" => loom_fuzz_fuzz::responder_runtime_sender(),
+            "forwarder" => loom_fuzz_fuzz::forwarder_runtime(exec_address),
             hex => loom_fuzz_oracle::hex_bytes(hex)?,
         };
         deployments.push(loom_fuzz_fuzz::Deployment { address, runtime });
     }
+    // 入口合约（issue #34）：须在合约表内——victim 或某个部署地址，
+    // 否则 fail-closed（不硬猜目标）。缺省 None = 直接 call victim。
+    let entry: Option<[u8; 20]> = match entry_flag {
+        Some(a) => {
+            let b = loom_fuzz_oracle::hex_bytes(a)?;
+            if b.len() != 20 {
+                return Err(format!("--entry 非 20 字节地址: {a:?}"));
+            }
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&b);
+            if addr != exec_address && !deployments.iter().any(|d| d.address == addr) {
+                return Err(format!(
+                    "--entry 地址 {a} 不在合约表内（须 = --contract-addr 或某个 --deploy 地址）"
+                ));
+            }
+            Some(addr)
+        }
+        None => None,
+    };
     let dict_extra: Vec<U256> = dict_words
         .iter()
         .map(|w| hex_u256(w))
@@ -356,6 +391,7 @@ fn cmd_run(
             run_baseline: !baseline_seen,
             fork: fork.clone(),
             deployments: deployments.clone(),
+            entry,
             // revert 归因上下文：支配 guard（装载端已渲染 cond）。
             guard_context: hit
                 .dominating_guards

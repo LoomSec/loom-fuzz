@@ -184,6 +184,48 @@ pub fn responder_runtime_sender() -> Vec<u8> {
     ]
 }
 
+/// 攻击代理入口 runtime（issue #34，机械模板、零个案）：fallback 把
+/// 收到的 calldata **原样经 CALL 转发**到 `victim`，再把 returndata
+/// 原样返回。CALL（非 DELEGATECALL）语义下 victim 帧的 msg.sender =
+/// 本合约——caller 轮换 ATTACKER → 攻击合约 → victim 的第一环
+/// （多步攻击 deputy 场景的 caller 守卫绕过的装载形态；#35 序列
+/// 搜索在此合约表上扩展）。
+///
+/// 逐指令：`CALLDATASIZE; PUSH1 0; PUSH1 0; CALLDATACOPY`（calldata
+/// → mem[0..size]）→ `PUSH1 0; PUSH1 0; CALLDATASIZE; PUSH1 0;
+/// PUSH1 0; PUSH20 victim; GAS; CALL`（outSize/outOffset/inOffset/
+/// value = 0，inSize = calldatasize，target = victim）→
+/// `RETURNDATASIZE; PUSH1 0; PUSH1 0; RETURNDATACOPY; RETURNDATASIZE;
+/// PUSH1 0; RETURN`。
+pub fn forwarder_runtime(victim: [u8; 20]) -> Vec<u8> {
+    let mut code = Vec::with_capacity(48);
+    code.extend_from_slice(&[
+        0x36, // CALLDATASIZE（copy size）
+        0x60, 0x00, // PUSH1 0（calldata offset）
+        0x60, 0x00, // PUSH1 0（mem destOffset）
+        0x37, // CALLDATACOPY：mem[0..size] = calldata
+        0x60, 0x00, // PUSH1 0（out size）
+        0x60, 0x00, // PUSH1 0（out offset）
+        0x36, // CALLDATASIZE（in size）
+        0x60, 0x00, // PUSH1 0（in offset）
+        0x60, 0x00, // PUSH1 0（value）
+    ]);
+    code.push(0x73); // PUSH20 victim
+    code.extend_from_slice(&victim);
+    code.extend_from_slice(&[
+        0x5a, // GAS
+        0xf1, // CALL
+        0x3d, // RETURNDATASIZE
+        0x60, 0x00, // PUSH1 0
+        0x60, 0x00, // PUSH1 0
+        0x3e, // RETURNDATACOPY
+        0x3d, // RETURNDATASIZE
+        0x60, 0x00, // PUSH1 0
+        0xf3, // RETURN
+    ]);
+    code
+}
+
 /// CLI 解析 --fork-block：数字原样；"latest" 经一次 RPC 解析成具体
 /// 块号（pin block = 确定性前提）。
 pub fn pin_block(rpc_url: &str, api_key: &str, block: &str) -> Result<u64, String> {
@@ -216,6 +258,25 @@ mod tests {
             sender,
             vec![0x33, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]
         );
+    }
+
+    /// 攻击代理模板（issue #34）：CALLDATACOPY → CALL(victim) →
+    /// returndata 原样返回；victim 地址烧在 PUSH20 里。
+    #[test]
+    fn forwarder_runtime_forwards_to_victim() {
+        let victim = [0x22u8; 20];
+        let code = forwarder_runtime(victim);
+        // CALLDATACOPY 序（6B）+ CALL 序（9B + PUSH20 + 2B）+ 返回序（10B）。
+        assert_eq!(code.len(), 48);
+        assert_eq!(&code[..6], &[0x36, 0x60, 0x00, 0x60, 0x00, 0x37]);
+        assert_eq!(code[15], 0x73);
+        assert_eq!(&code[16..36], &victim);
+        assert_eq!(
+            &code[36..],
+            &[0x5a, 0xf1, 0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e, 0x3d, 0x60, 0x00, 0xf3]
+        );
+        // 确定性：同 victim 同码。
+        assert_eq!(code, forwarder_runtime(victim));
     }
 
     /// fork plumbing 最小验证（LOOM_FUZZ_FORK_TEST=1 才跑）：keyless

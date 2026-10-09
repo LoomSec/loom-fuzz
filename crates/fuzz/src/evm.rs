@@ -1,7 +1,8 @@
 //! revm 42 集成：单合约会话执行 + witness inspector。
 //!
 //! 部署不走 create 交易：`CacheDB` 直接布置合约账户与 prestate 槽；
-//! `TxEnv` = call(address) + caller/value/calldata。每 run 新建 EVM
+//! `TxEnv` = call(entry 或 address) + caller/value/calldata（多合约
+//! 在场时 entry 为表内入口合约，issue #34）。每 run 新建 EVM
 //! （CacheDB 从 `ExecConfig` 原始布置重建，journal 无跨 run 泄漏），
 //! 保证确定性。详见 lib.rs 的 revm 集成方式文档注释。
 
@@ -152,6 +153,7 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
         self.last_pc?;
         self.calls.push(RecordedCall {
             kind: kind.to_string(),
+            from: inputs.caller.into_array(),
             target: inputs.target_address.into_array(),
             value: inputs.value.get(),
             input,
@@ -184,6 +186,7 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
         let target = inputs.created_address(nonce).into_array();
         self.calls.push(RecordedCall {
             kind: kind.to_string(),
+            from: inputs.caller().into_array(),
             target,
             value: inputs.value(),
             input: inputs.init_code().to_vec(),
@@ -192,9 +195,10 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
         None
     }
 
-    fn selfdestruct(&mut self, _contract: Address, target: Address, value: revm::primitives::U256) {
+    fn selfdestruct(&mut self, contract: Address, target: Address, value: revm::primitives::U256) {
         self.calls.push(RecordedCall {
             kind: "SELFDESTRUCT".to_string(),
+            from: contract.into_array(),
             target: target.0.into(),
             value,
             input: Vec::new(),
@@ -282,9 +286,21 @@ fn execute_on<DB: revm::DatabaseRef>(
             });
 
     let calldata = calldata_of(input);
+    // 顶层交易目标：entry 模式（issue #34）指向表内入口合约（攻击
+    // 代理），缺省 = victim（单步默认现状）。
+    let tx_target = cfg.entry.map_or_else(
+        || Address::from(cfg.address),
+        |entry| {
+            debug_assert!(
+                entry == cfg.address || cfg.deployments.iter().any(|d| d.address == entry),
+                "entry 须在合约表内（装载层已 fail-closed 校验）"
+            );
+            Address::from(entry)
+        },
+    );
     let tx = TxEnv::builder()
         .caller(caller)
-        .kind(TxKind::Call(Address::from(cfg.address)))
+        .kind(TxKind::Call(tx_target))
         .value(input.value)
         .data(Bytes::from(calldata))
         .gas_limit(cfg.gas_per_tx)
@@ -299,6 +315,7 @@ fn execute_on<DB: revm::DatabaseRef>(
         Err(_e) => {
             return RunResult {
                 trace: WitnessTrace {
+                    contract: cfg.address,
                     visited_pcs: Vec::new(),
                     calls: Vec::new(),
                     outcome: OutcomeKind::Invalid,
@@ -335,6 +352,7 @@ fn execute_on<DB: revm::DatabaseRef>(
     };
     RunResult {
         trace: WitnessTrace {
+            contract: cfg.address,
             visited_pcs: inspector.visited.iter().copied().collect(),
             calls: inspector.calls,
             outcome,
@@ -435,6 +453,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            entry: None,
             guard_context: Vec::new(),
         };
         let input = Input {
@@ -473,6 +492,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            entry: None,
             guard_context: Vec::new(),
         };
         let input = Input {

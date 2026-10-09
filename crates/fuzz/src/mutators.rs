@@ -492,6 +492,7 @@ mod tests {
             run_baseline: false,
             fork: None,
             deployments: Vec::new(),
+            entry: None,
             guard_context: Vec::new(),
         }
     }

@@ -84,18 +84,24 @@ pub struct CheckInput<'a> {
 }
 
 /// 判定入口：`input.arm` 选择/兜底手臂，跑对应证据检查。
+/// `contract` = 目标帧所属合约（trace.contract）——多合约在场时
+/// 候选 call 必须是 victim 帧发出的（RecordedCall.from ==
+/// contract）：pc 数值跨代码库不再可比，from 过滤是帧归属的
+/// 正确性兜底（issue #34）。单合约会话下全部 call 的 from 均 =
+/// victim，过滤恒过（默认行为不变）。
 pub fn check_arbitrary_call(
     hit: &Hit,
     calls: &[RecordedCall],
     tx_calldata: &[u8],
     input: &CheckInput<'_>,
+    contract: [u8; 20],
 ) -> CallCheck {
     let Some(min_pc) = hit.target_pcs.iter().min().copied() else {
         return CallCheck::Rejected("命中无 target pc（契约外输入）".to_string());
     };
     let candidates: Vec<&RecordedCall> = calls
         .iter()
-        .filter(|c| c.pc.is_some_and(|pc| pc >= min_pc))
+        .filter(|c| c.pc.is_some_and(|pc| pc >= min_pc) && c.from == contract)
         .collect();
     if candidates.is_empty() {
         return CallCheck::Rejected(format!(
@@ -188,13 +194,14 @@ pub fn check_deputy_call(
     calls: &[RecordedCall],
     tx_calldata: &[u8],
     input: &CheckInput<'_>,
+    contract: [u8; 20],
 ) -> CallCheck {
     let Some(min_pc) = hit.target_pcs.iter().min().copied() else {
         return CallCheck::Rejected("命中无 target pc（契约外输入）".to_string());
     };
     let candidates: Vec<&RecordedCall> = calls
         .iter()
-        .filter(|c| c.pc.is_some_and(|pc| pc >= min_pc))
+        .filter(|c| c.pc.is_some_and(|pc| pc >= min_pc) && c.from == contract)
         .collect();
     if candidates.is_empty() {
         return CallCheck::Rejected(format!(
@@ -222,13 +229,18 @@ pub fn check_deputy_call(
 /// 符号映射（M0 无）；宽松 memmem 是其 sound 近似——子串/整词覆盖
 /// 必蕴含"含输入派生内容"，反之不保证（残留 FP 由三值判决的
 /// unreachable 臂如实降级）。
-pub fn check_drain_forward(hit: &Hit, calls: &[RecordedCall], tx_calldata: &[u8]) -> CallCheck {
+pub fn check_drain_forward(
+    hit: &Hit,
+    calls: &[RecordedCall],
+    tx_calldata: &[u8],
+    contract: [u8; 20],
+) -> CallCheck {
     let Some(min_pc) = hit.target_pcs.iter().min().copied() else {
         return CallCheck::Rejected("命中无 target pc（契约外输入）".to_string());
     };
     let candidates: Vec<&RecordedCall> = calls
         .iter()
-        .filter(|c| c.pc.is_some_and(|pc| pc >= min_pc))
+        .filter(|c| c.pc.is_some_and(|pc| pc >= min_pc) && c.from == contract)
         .collect();
     if candidates.is_empty() {
         return CallCheck::Rejected(format!(
@@ -279,12 +291,16 @@ mod tests {
     fn call(kind: &str, input: Vec<u8>, pc: Option<u32>) -> RecordedCall {
         RecordedCall {
             kind: kind.to_string(),
+            from: [0x22; 20],
             target: [0x11; 20],
             value: U256::ZERO,
             input,
             pc,
         }
     }
+
+    /// 单合约会话的合约表约定：victim = [0x22; 20]。
+    const CONTRACT: [u8; 20] = [0x22; 20];
 
     fn hit(pcs: &[u32]) -> Hit {
         Hit {
@@ -317,6 +333,7 @@ mod tests {
             &[call("CALL", b"abcd".to_vec(), Some(384))],
             TX,
             &no_ctx(),
+            CONTRACT,
         );
         assert!(matches!(r, CallCheck::ConvictedArm3(_)));
     }
@@ -329,6 +346,7 @@ mod tests {
             &[call("STATICCALL", b"abcd".to_vec(), Some(384))],
             TX,
             &no_ctx(),
+            CONTRACT,
         );
         assert!(matches!(r, CallCheck::Rejected(_)));
         // 长度 < 4 不收（trivial 防空匹配）。
@@ -337,6 +355,7 @@ mod tests {
             &[call("CALL", b"abc".to_vec(), Some(384))],
             TX,
             &no_ctx(),
+            CONTRACT,
         );
         assert!(matches!(r, CallCheck::Rejected(_)));
         // 非 calldata 子串不收。
@@ -345,6 +364,7 @@ mod tests {
             &[call("CALL", b"zzzz".to_vec(), Some(384))],
             TX,
             &no_ctx(),
+            CONTRACT,
         );
         assert!(matches!(r, CallCheck::Rejected(_)));
     }
@@ -356,7 +376,7 @@ mod tests {
             call("CALL", b"abcd".to_vec(), Some(100)),
             call("CALL", b"abcd".to_vec(), Some(390)),
         ];
-        let r = check_arbitrary_call(&hit(&[384]), &calls, TX, &no_ctx());
+        let r = check_arbitrary_call(&hit(&[384]), &calls, TX, &no_ctx(), CONTRACT);
         match r {
             CallCheck::ConvictedArm3(c) => assert_eq!(c.pc, Some(390)),
             other => panic!("应臂 3 定罪: {other:?}"),
@@ -364,9 +384,43 @@ mod tests {
         // target pc 本身不是 call：落到其后第一条。
         let calls = vec![call("CALL", b"abcd".to_vec(), Some(500))];
         assert!(matches!(
-            check_arbitrary_call(&hit(&[384]), &calls, TX, &no_ctx()),
+            check_arbitrary_call(&hit(&[384]), &calls, TX, &no_ctx(), CONTRACT),
             CallCheck::ConvictedArm3(_)
         ));
+    }
+
+    #[test]
+    fn candidates_are_limited_to_victim_frame() {
+        // issue #34：多合约在场时 from ≠ victim 的 call（攻击代理
+        // 转发帧等）不作候选——即使其 input 是 calldata 子串、pc
+        // 数值 ≥ min_pc（pc 跨代码库不可比的正确性兜底）。
+        let mut proxy_call = call("CALL", b"abcd".to_vec(), Some(390));
+        proxy_call.from = [0xaau8; 20];
+        let victim_call = call("CALL", b"abcd".to_vec(), Some(390));
+        // 代理帧在前：旧数值语义会先命中它（input 子串成立）。
+        let r = check_arbitrary_call(
+            &hit(&[384]),
+            &[proxy_call, victim_call],
+            TX,
+            &no_ctx(),
+            CONTRACT,
+        );
+        match r {
+            CallCheck::ConvictedArm3(c) => assert_eq!(c.from, CONTRACT),
+            other => panic!("应定罪 victim 帧的 call: {other:?}"),
+        }
+        // 全是外帧 call → 拒绝（如实：到场但谓词不成立）。
+        let mut foreign = call("CALL", b"abcd".to_vec(), Some(390));
+        foreign.from = [0xaau8; 20];
+        let r = check_arbitrary_call(&hit(&[384]), &[foreign], TX, &no_ctx(), CONTRACT);
+        let msg = match r {
+            CallCheck::Rejected(m) => m,
+            other => panic!("应拒绝: {other:?}"),
+        };
+        assert!(
+            msg.contains("无 CALL 族效果"),
+            "外帧 call 不计入候选: {msg}"
+        );
     }
 
     #[test]
@@ -391,7 +445,7 @@ mod tests {
             view: Some(&V),
             expected_evidence: None,
         };
-        match check_arbitrary_call(&h, &[c.clone()], TX, &ctx) {
+        match check_arbitrary_call(&h, &[c.clone()], TX, &ctx, CONTRACT) {
             CallCheck::ConvictedArm1(got) => assert_eq!(got.target, target),
             other => panic!("应臂 1 定罪: {other:?}"),
         }
@@ -399,7 +453,7 @@ mod tests {
         let mut bad = c.clone();
         bad.target = [0x99; 20];
         assert!(matches!(
-            check_arbitrary_call(&h, &[bad], TX, &ctx),
+            check_arbitrary_call(&h, &[bad], TX, &ctx, CONTRACT),
             CallCheck::Rejected(_)
         ));
         // replay 模式（无视图，有 poc 内嵌承诺）：同值应定罪。
@@ -414,7 +468,7 @@ mod tests {
             expected_evidence: Some(low160),
         };
         assert!(matches!(
-            check_arbitrary_call(&h, &[c], TX, &ctx_replay),
+            check_arbitrary_call(&h, &[c], TX, &ctx_replay, CONTRACT),
             CallCheck::ConvictedArm1(_)
         ));
     }
@@ -456,7 +510,7 @@ mod tests {
             view: Some(&V),
             expected_evidence: None,
         };
-        match check_deputy_call(&h, &[c.clone()], TX, &ctx) {
+        match check_deputy_call(&h, &[c.clone()], TX, &ctx, CONTRACT) {
             CallCheck::ConvictedArm1(got) => assert_eq!(got.target, target),
             other => panic!("应 deputy 定罪: {other:?}"),
         }
@@ -464,7 +518,7 @@ mod tests {
         let mut bad = c.clone();
         bad.target = [0x99; 20];
         assert!(matches!(
-            check_deputy_call(&h, &[bad], TX, &ctx),
+            check_deputy_call(&h, &[bad], TX, &ctx, CONTRACT),
             CallCheck::Rejected(_)
         ));
         // replay 承诺路径：无视图 + expected_evidence 同值定罪。
@@ -478,7 +532,7 @@ mod tests {
             expected_evidence: Some(low160),
         };
         assert!(matches!(
-            check_deputy_call(&h, &[c], TX, &ctx_replay),
+            check_deputy_call(&h, &[c], TX, &ctx_replay, CONTRACT),
             CallCheck::ConvictedArm1(_)
         ));
     }
@@ -497,13 +551,19 @@ mod tests {
             &drain_hit(&[384]),
             &[call("CALL", b"abcd".to_vec(), Some(384))],
             TX,
+            CONTRACT,
         );
         assert!(matches!(r, CallCheck::ConvictedDrain(_)));
         // 臂 2：input 非子串但含完整 32B calldata 头词（词覆盖——组装形）。
         // TX = selector + "aaaa…"(32B) + "bcd"。input = 0xbbbb + word0。
         let mut input = vec![0xbb, 0xbb, 0xbb, 0xbb];
         input.extend_from_slice(&[0x61u8; 32]);
-        let r = check_drain_forward(&drain_hit(&[384]), &[call("CALL", input, Some(384))], TX);
+        let r = check_drain_forward(
+            &drain_hit(&[384]),
+            &[call("CALL", input, Some(384))],
+            TX,
+            CONTRACT,
+        );
         assert!(matches!(r, CallCheck::ConvictedDrain(_)));
     }
 
@@ -514,6 +574,7 @@ mod tests {
             &drain_hit(&[384]),
             &[call("CALL", b"zzzzzzzz".to_vec(), Some(384))],
             TX,
+            CONTRACT,
         );
         assert!(matches!(r, CallCheck::Rejected(_)));
         // 长度 < 4 → 拒绝（trivial 防空匹配）。
@@ -521,6 +582,7 @@ mod tests {
             &drain_hit(&[384]),
             &[call("CALL", b"abc".to_vec(), Some(384))],
             TX,
+            CONTRACT,
         );
         assert!(matches!(r, CallCheck::Rejected(_)));
         // 改造词（中段异值，非完整 32B 头词也非子串——TX 的 0x62 只
@@ -531,6 +593,7 @@ mod tests {
             &drain_hit(&[384]),
             &[call("CALL", fake_word.to_vec(), Some(384))],
             TX,
+            CONTRACT,
         );
         assert!(matches!(r, CallCheck::Rejected(_)));
     }

@@ -144,6 +144,7 @@ mod tests {
                 tail: loom_fuzz_fuzz::Tail::Empty,
             },
             trace: loom_fuzz_fuzz::WitnessTrace {
+                contract: [0x22; 20],
                 deployments: Vec::new(),
                 visited_pcs: vec![1, 2, 3],
                 calls: Vec::new(),
@@ -154,6 +155,7 @@ mod tests {
             pc: 1,
             evidence_call: loom_fuzz_fuzz::RecordedCall {
                 kind: "CALL".to_string(),
+                from: [0x22; 20],
                 target: [0; 20],
                 value: alloy_primitives::U256::ZERO,
                 input: Vec::new(),
