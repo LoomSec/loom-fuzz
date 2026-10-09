@@ -101,6 +101,10 @@ loom-fuzz run --shard fixtures/real-world/anyswap-v4router/anyswapv4router.lst \
 
 实测：4 条命中 confirmed（58/20/58/20 runs）；其中 2 条（`0x1b91a934` / `0x8d7d3eea` 形）L2 PoC `forge test` 绿灯（`[PASS] testExploit()`），另 2 条如实"L2 诚实降级"（定长头零词注入点不足，fail-closed 不硬生成）。
 
+### anyswap V4Router——fork 态 + 攻击代理入口（多合约组合，`fixtures/real-world/anyswap-v4router-fork/`）
+
+真实链上状态（pin 块 26151585）+ caller 链 = ATTACKER → forwarder 代理 → router。完整命令与实测输出见该目录 README；核心链路：fuzz confirmed（`0x1b91a934` @58 runs，seed 2024）→ `replay` 判决一致 → `exploit --fork` 生成 fork profile 工程 → `bash run.sh`（anvil Bearer 代理）`[PASS] testExploit()` 绿灯。
+
 ## License
 
 MIT OR Apache-2.0（首个代码提交时附带）。
