@@ -70,7 +70,54 @@ loom-fuzz run \
   --out /tmp/out-lifi
 ```
 
-## 实测记录（issue #41，如实）
+## 种子语料确认（issue #41 第二阶段，--seed-calldata）
+
+通用种子语料注入 `--seed-calldata <0x-hex>`（PR #45）：完整
+calldata 原形态直接进初始种子群体（AFL 种子语料同款概念，与
+`--dict-word` 单槽填词互补，引擎零个案）。LiFi 攻击 calldata 经
+`cast calldata` 按真实函数签名编码（**LiFiData 是含 string 的元组
+→ 整体动态编码头**，三层偏移：头 3 偏移词 → LiFiData → swapData
+数组 → 元组内层 callData），`_swapData[0]` =
+`(callTo=USDT, sendingAssetId=0(native 免 pull), fromAmount=0,
+callData=transferFrom(victim 0x8de133…fd7d1, caller, 0x2a3c4547b2))`——
+victim/额度取 DeFiHackLabs PoC 的 USDT 项（pin 块 allowance 真实）。
+
+```sh
+loom-fuzz run \
+  --shard fixtures/real-world/lifi-diamond/lifi-cbridge-facet.lst \
+  --code fixtures/real-world/lifi-diamond/lifi-cbridge-facet.bin-runtime \
+  --pack <loom-evm>/packs/detect/arbitrary_call.lq \
+  --loom-bin "$LOOM_BIN" \
+  --contract-addr 0x5A9Fd7c39a6C488E715437D7b1f3C823d5596eD1 \
+  --seed 42 --max-runs 20000 --time-budget 120 \
+  --dict-word 0x0000000000000000000000002222222222222222222222222222222222222222 \
+  --seed-calldata "$(cat fixtures/real-world/lifi-diamond/seed-swapAndStartBridgeViaCBridge.hex)" \
+  --fork-url "$BLOCKMACHINE_RPC_URL" --fork-block 14420686 \
+  --out /tmp/out-lifi
+```
+
+实测（第二阶段）：
+
+- **confirmed**：`29401882 (267 runs) → poc-29401882-339.json`——
+  arbitrary_call **臂 3**（`callTo.call(callData)` 的 input = calldata
+  子串）+ drain_forward 族同证据（双 pack 跑时同 selector+step 的
+  poc 文件名相抵，签入的 poc 为 arbitrary 族）。
+- **replay 一致**：`{"verdict":"confirmed",…}` exit 0。
+- **L2 fork 绿灯**：`exploit --fork` → 头形解析对三层嵌套尾判
+  BadShape（头词无定罪目标交叉）→ fork 态通用 replay 模板 →
+  `bash run.sh` → `[PASS] testExploit()`。整笔 witness 在 drain 后的
+  bridge 步按原路径 revert（到场证据不受整笔结局影响；replay 模板
+  已改低层 call + `require(!ok)` 断言——既绕过 forge 对内存形
+  revert 载荷的解码崩溃，又保持 fail-closed：整笔成功 = 红灯）。
+- drain_forward 族的 drain 模板 L2（`require(ok)` 绑整笔成功）对
+  本案例如实不适用（witness 同形必 revert）——用 arbitrary 族的
+  replay 模板达成绿灯，drain poc 不再签入。
+
+对比第一阶段（无种子语料）：7 轮 fuzz 到场但退化形态（callTo=0）
+定罪失败；第二阶段种子进场后 **267 runs 确认**（前 266 runs 为排
+队中的编译/基座种子，语料自身第 1 次执行即到场）。
+
+## 实测记录（issue #41 第一阶段，如实）
 
 **检测与到场达成，confirmed 未达成**——7 轮 fork 态 fuzz（seed
 42/2024 × 字典词组合 × 60k–200k runs）的结果稳定可复现：

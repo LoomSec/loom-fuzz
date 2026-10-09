@@ -1387,11 +1387,14 @@ contract PoC {{
         vm.etch(ROUTER, hex"{code_hex}");
 {stores}
         vm.prank(ATTACKER);
-        // L1：witness 重放。fork 世界与 witness 世界一致地以**空
-        // revert** 收尾（owner 检查支）——到场证据 = 臂 1 判定。
-        vm.expectRevert(hex"");
+        // L1：witness 重放。fork 世界与 witness 世界一致地以 revert
+        // 收尾——到场证据 = 臂判定（loom 侧已完成）。低层 call + 显式
+        // 断言 !ok：载荷形状不入断言（facet 的 on-path revert 载荷是
+        // 内存形数据，确定性但形状随路径而异；且 forge 对特定载荷的
+        // expectRevert 解码会崩——低层 call 断言绕过该 forge 缺陷，
+        // 仍 fail-closed：整笔成功 = 红灯）。
         (bool ok, bytes memory returndata) = payable(ROUTER).call(hex"{calldata_hex}");
-        ok;
+        require(!ok, "L1: witness call should revert (on-path revert ending)");
         returndata;
     }}
 }}

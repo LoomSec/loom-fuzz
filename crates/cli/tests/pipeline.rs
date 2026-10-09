@@ -19,6 +19,10 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_loom-fuzz")
 }
 
+/// TRV fixture 的 confirmed 见证 calldata（seed 42 标准配置；
+/// --seed-calldata 语料种子测试用——完整形态 run 1 即到场）。
+const TRV_WINNING_CALDATA: &str = "0x90ce82d4000000000000000000000000000000000000000000000000000000000000007d000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000046c6f6f6d00000000000000000000000000000000000000000000000000000000";
+
 fn out_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("loom-fuzz-pipe-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -194,6 +198,55 @@ fn truncated_session_is_inconclusive() {
         .as_str()
         .unwrap()
         .contains("截断"));
+}
+
+#[test]
+fn seed_calldata_confirms_immediately() {
+    // issue #41：--seed-calldata 语料种子——完整 calldata 形态 run 1
+    // 即到场 confirmed（与原样重放同语义），不需要搜索拼形态。
+    // TRV_WINNING_CALDATA = 该 fixture 在标准配置下的 confirmed 见证
+    // calldata（seed 42；语料种子让它零搜索到场）。
+    let dir = out_dir("seed-calldata");
+    let fx = fixtures();
+    let output = run_cli(&[
+        "run".into(),
+        "--shard".into(),
+        fx.join("fixtures/trv-like/trv-like.lst")
+            .to_string_lossy()
+            .into(),
+        "--code".into(),
+        fx.join("fixtures/trv-like/TrvLikeRouter.bin-runtime")
+            .to_string_lossy()
+            .into(),
+        "--prestate".into(),
+        fx.join("fixtures/trv-like/prestate.json")
+            .to_string_lossy()
+            .into(),
+        "--seed-calldata".into(),
+        TRV_WINNING_CALDATA.into(),
+        "--out".into(),
+        dir.to_string_lossy().into(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("fuzz_report.json")).expect("fuzz_report.json 落盘"),
+    )
+    .unwrap();
+    assert_eq!(report["hits"][0]["verdict"], "confirmed");
+    // 语料种子零搜索到场：poc 的 calldata 与 --seed-calldata 原值
+    // 逐字节一致（形态被原样重放定罪，非变异后代）。
+    let poc_path = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("poc-"))
+        .expect("poc 落盘");
+    let poc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&poc_path).unwrap()).unwrap();
+    assert_eq!(poc["steps"][0]["calldata"], TRV_WINNING_CALDATA);
 }
 
 #[test]

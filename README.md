@@ -105,6 +105,10 @@ loom-fuzz run --shard fixtures/real-world/anyswap-v4router/anyswapv4router.lst \
 
 真实链上状态（pin 块 26151585）+ caller 链 = ATTACKER → forwarder 代理 → router。完整命令与实测输出见该目录 README；核心链路：fuzz confirmed（`0x1b91a934` @58 runs，seed 2024）→ `replay` 判决一致 → `exploit --fork` 生成 fork profile 工程 → `bash run.sh`（anvil Bearer 代理）`[PASS] testExploit()` 绿灯。
 
+### LiFi Diamond（eth `0x5A9Fd7c39a6C488E715437D7b1f3C823d5596eD1`，pin 块 14420686）
+
+fork 态 + **种子语料确认**（`--seed-calldata`，issue #41 第二阶段）：Diamond 是 EIP-2535 proxy——分析/执行对象是攻击 trace 定位的 **CBridge facet**（在 diamond 地址上执行，facet 存储本就在 diamond 上）。`swapAndStartBridgeTokensViaCBridge` 的 `_swapData[0] = (callTo=USDT, callData=transferFrom(victim, caller, amount))` 单条即 drain（native `sendingAssetId` 免 pull）。实测：confirmed（arbitrary_call 臂 3，267 runs，seed 42）→ replay 一致 → `exploit --fork` 头形外 → replay 模板 → `bash run.sh` `[PASS] testExploit()` 绿灯。完整命令与两阶段记录见 `fixtures/real-world/lifi-diamond/README.md`。
+
 ## License
 
 MIT OR Apache-2.0（首个代码提交时附带）。
