@@ -143,6 +143,7 @@ mod mutators;
 pub mod propose;
 mod rng;
 mod sequence;
+mod tuning;
 
 pub use cfg::DistanceTable;
 pub use exec::{

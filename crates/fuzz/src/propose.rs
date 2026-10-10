@@ -11,11 +11,12 @@ use crate::rng::Rng;
 
 use super::exec::{ProposalBudget, Proposer, ProposerCtx, RunFeedback};
 
-/// 反馈窗口（每代喂给提案器的最近 N 条 run 反馈）。
-pub const FEEDBACK_WINDOW: usize = 32;
+/// 反馈窗口（每代喂给提案器的最近 N 条 run 反馈）——值在
+/// [`crate::tuning::TUNING`]（issue #49 集中配置）。
+pub const FEEDBACK_WINDOW: usize = crate::tuning::TUNING.feedback_window;
 
-/// 每代候选上限（与旧 select_parents 的前一半同量级）。
-pub const DEFAULT_MAX_CANDIDATES: usize = 32;
+/// 每代候选上限——值在 [`crate::tuning::TUNING`]。
+pub const DEFAULT_MAX_CANDIDATES: usize = crate::tuning::TUNING.max_candidates;
 
 /// 字典提案器（默认）：反馈前一半的父代各经一轮变异（既有五算子
 /// + 多槽协同的封装；池经 `refresh` 每代刷新）。

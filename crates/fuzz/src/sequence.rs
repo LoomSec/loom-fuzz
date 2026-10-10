@@ -136,13 +136,15 @@ pub(crate) fn assemble(
         step_pool: ctx.step_pool,
     };
     let roll = rng.below(100);
-    let mut seq = match roll {
-        0..=59 => TxSequence::single(ctx.address, proposed),
-        60..=79 => append(rng, &proposed, &src, ctx),
-        _ => splice(rng, &proposed, &src, ctx),
+    let mut seq = if roll < crate::tuning::TUNING.seq_single_band {
+        TxSequence::single(ctx.address, proposed)
+    } else if roll < crate::tuning::TUNING.seq_append_band {
+        append(rng, &proposed, &src, ctx)
+    } else {
+        splice(rng, &proposed, &src, ctx)
     };
     // 步内变异：多步序列 50% 挑一步跑既有五算子。
-    if seq.steps.len() > 1 && rng.below(2) == 0 {
+    if seq.steps.len() > 1 && rng.below(crate::tuning::TUNING.seq_step_mutate_denom) == 0 {
         let idx = rng.below(seq.steps.len() as u64) as usize;
         let mut mctx = MutCtx::new(rng, ctx.consts, ctx.cmp_pool, ctx.storage_pool);
         mctx.dynamic_head = ctx.dynamic_head;
