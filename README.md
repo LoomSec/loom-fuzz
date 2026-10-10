@@ -105,6 +105,10 @@ loom-fuzz run --shard fixtures/real-world/anyswap-v4router/anyswapv4router.lst \
 
 真实链上状态（pin 块 26151585）+ caller 链 = ATTACKER → forwarder 代理 → router。完整命令与实测输出见该目录 README；核心链路：fuzz confirmed（`0x1b91a934` @58 runs，seed 2024）→ `replay` 判决一致 → `exploit --fork` 生成 fork profile 工程 → `bash run.sh`（anvil Bearer 代理）`[PASS] testExploit()` 绿灯。
 
+### TeamFinance LockToken（eth proxy `0xE2fE530C047f2d85298b07D9333C05737f1435fB`，pin 块 15837893）——真实多步案例探索
+
+fork 态多步 witness 探索（issue #41 最终目标）：漏洞在实现合约（transparent proxy，同 LiFi 教训）；`migrate` 的 arm1 命中（族可容纳），3 步 witness `[lockToken{value} → extendLockDuration → migrate]` 探针逐步验证到场，**但 migrate 的搜索组装未在预算内拼出（pc 数值跨函数重叠的假到场吸住择优窗口）——≥2 步 confirmed 未达成，探索记录如实签入**。期间通用补齐：`--seed-calldata` 支持 `@<wei>` 后缀（payable 前置步）。详见 `fixtures/real-world/teamfinance-locktoken/README.md`。
+
 ### LiFi Diamond（eth `0x5A9Fd7c39a6C488E715437D7b1f3C823d5596eD1`，pin 块 14420686）
 
 fork 态 + **种子语料确认**（`--seed-calldata`，issue #41 第二阶段）：Diamond 是 EIP-2535 proxy——分析/执行对象是攻击 trace 定位的 **CBridge facet**（在 diamond 地址上执行，facet 存储本就在 diamond 上）。`swapAndStartBridgeTokensViaCBridge` 的 `_swapData[0] = (callTo=USDT, callData=transferFrom(victim, caller, amount))` 单条即 drain（native `sendingAssetId` 免 pull）。实测：confirmed（arbitrary_call 臂 3，267 runs，seed 42）→ replay 一致 → `exploit --fork` 头形外 → replay 模板 → `bash run.sh` `[PASS] testExploit()` 绿灯。完整命令与两阶段记录见 `fixtures/real-world/lifi-diamond/README.md`。
