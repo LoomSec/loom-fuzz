@@ -191,7 +191,11 @@ pub(crate) fn abi_coherence_fix(input: &Input, rng: &mut Rng, dynamic_head: bool
     let mut new_head = input.head.clone();
     for (k, content) in &segments {
         let fixed = if content.is_empty() {
-            let mat: Vec<[u8; 32]> = material.iter().take(32).copied().collect();
+            let mat: Vec<[u8; 32]> = material
+                .iter()
+                .take(crate::tuning::TUNING.abifix_material_cap)
+                .copied()
+                .collect();
             let seg = if rng.below(2) == 0 {
                 mat.clone() // 结构体猜测：verbatim
             } else {

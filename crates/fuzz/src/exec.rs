@@ -257,30 +257,14 @@ pub trait Proposer {
     fn propose(&mut self, feedback: &[RunFeedback], budget: ProposalBudget) -> Vec<Input>;
 }
 
-/// 步数上限（每 run）：gas 之外的硬兜（min gas/opcode ≥ 2，
-/// 正常执行到不了这个量级；防 gas_per_tx 被设成天文数字时单
-/// run 拖死会话）。
-const STEP_CAP: u64 = 10_000_000;
-
+/// 每 run 步数硬兜见 [`crate::tuning::TUNING`]。
 /// witness trace 的 serde 缺省合约地址（旧产物无该字段；与管线
 /// CONTRACT_ADDRESS 同约定）。
 fn default_contract_addr() -> [u8; 20] {
     [0x22; 20]
 }
 
-/// corpus 上限（按 fitness 截断保留）。
-const CORPUS_CAP: usize = 64;
-
-/// 步级池上限（issue #35 序列组装的素材来源——布置步等 fitness
-/// 死路的步级输入在此留存，超上限丢最旧，保先收，确定性）。
-const STEP_POOL_CAP: usize = 256;
-
-/// 精英集上限（父代选择来源）。
-const ELITE_CAP: usize = 16;
-
-/// 种群下限：种子不足时用随机输入补到该数（多样性）。
-const MIN_POPULATION: usize = 8;
-
+/// corpus/精英/种群/步级池容量见 [`crate::tuning::TUNING`]。
 /// 定向执行入口：CFG 距离制导的进化环 + 基线对照（默认
 /// DictionaryProposer）。`seeds` 为调用序列（单步 = 单元素序列，
 /// 与旧单步路径语义完全等价）。
@@ -332,7 +316,10 @@ pub fn run_targeted_with(
     // 种群不足补随机输入（单步随机序列；保持多样性，不进 corpus
     // 优先位）。
     while !session.satisfied()
-        && session.population_len() < MIN_POPULATION.min(cfg.max_runs as usize)
+        && session.population_len()
+            < crate::tuning::TUNING
+                .min_population
+                .min(cfg.max_runs as usize)
     {
         let filler = random_input(
             session.rng_mut(),
@@ -433,14 +420,9 @@ struct Evaluated {
     runs_at: u64,
 }
 
-/// 命中后择优继续的额外 runs 上限（issue #46 进化信用）：到场
-/// 不即停——退化形态（全零指针被 decoder 宽容接受）与语义自洽
-/// 形态同为"到场"，但后者的 witness 更丰富（目标 pc 后更多
-/// CALL 族效果）。到场后继续至多 POST_HIT_RUNS 个 runs（或预算
-/// /空代耗尽），按 `best_hit` 的丰富度择优。**判决独立**：会话内
-/// 的丰富度只是搜索层信用代理，族 oracle 判定不变。
-const POST_HIT_RUNS: u64 = 1536;
-
+/// 命中后择优继续的窗口与池/集容量见 [`crate::tuning::TUNING`]
+/// （issue #49 集中配置；择优语义见 `Session::best_hit`）——
+/// **判决独立**：丰富度只是搜索层信用代理，族 oracle 判定不变。
 /// 会话（制导与基线共用）：预算控制 + corpus + 最优记录。
 struct Session<'a> {
     cfg: &'a ExecConfig,
@@ -547,7 +529,7 @@ impl<'a> Session<'a> {
     /// 到场（目标 pc 后 CALL 族效果更丰富）有机会反超退化形态。
     fn satisfied(&self) -> bool {
         match self.hit_run {
-            Some(h) => self.runs >= h + POST_HIT_RUNS,
+            Some(h) => self.runs >= h + crate::tuning::TUNING.post_hit_runs,
             None => false,
         }
     }
@@ -596,7 +578,7 @@ impl<'a> Session<'a> {
         }
         self.runs += 1;
         let targets = self.table.targets();
-        let result = evm::execute(self.cfg, seq, STEP_CAP, &targets);
+        let result = evm::execute(self.cfg, seq, crate::tuning::TUNING.step_cap, &targets);
         // 观测入池（去重有上限）：比较操作数 → 算子 1，SLOAD 键值
         // 对 → 算子 4。
         self.pools.absorb(&result);
@@ -631,19 +613,19 @@ impl<'a> Session<'a> {
         if !self.elite.iter().any(|e| e.seq == evaluated.seq) {
             self.elite.push(evaluated.clone());
             self.elite.sort_by_key(|e| (e.fitness, e.seq.sort_key()));
-            self.elite.truncate(ELITE_CAP);
+            self.elite.truncate(crate::tuning::TUNING.elite_cap);
         }
         // 距离创新低 → 入 corpus（去重，cap 按 fitness 截断）。
         if self.corpus_keys.insert(evaluated.seq.sort_key()) {
             self.corpus.push(evaluated.clone());
             self.corpus.sort_by_key(|e| e.fitness);
-            self.corpus.truncate(CORPUS_CAP);
+            self.corpus.truncate(crate::tuning::TUNING.corpus_cap);
         }
         // 步级池（issue #35）：逐步步输入入池（target ++ input 键
         // 去重，FIFO 上限）——布置步等 fitness 死路的素材留存。
         for step in &seq.steps {
             if self.step_pool_keys.insert(step.sort_key()) {
-                if self.step_pool.len() >= STEP_POOL_CAP {
+                if self.step_pool.len() >= crate::tuning::TUNING.step_pool_cap {
                     // 丢最旧（Vec 首）：键同步移除。
                     let old = self.step_pool.remove(0);
                     self.step_pool_keys.remove(&old.sort_key());

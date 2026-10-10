@@ -671,8 +671,10 @@ fn seed_calldata_input(sc: &str) -> Result<SeedInput, String> {
         .map_err(|e| format!("规范化失败: {e}"))
 }
 
-/// 定长动态尾（len=4 + "loom" 前缀 32B 块，≥4 字节满足 oracle
-/// trivial 长度下限）。
+/// 定长动态尾（len=4 + "loom" 前缀 32B 块）。**长度 = oracle
+/// trivial 下限的推导值**：臂 3/臂 1 的证据 input 判定要求 ≥4B
+/// 防空匹配——尾内容长度 4 是下限推导，"loom" 前缀本身无语义
+/// （issue #49 保留并注明依据）。
 fn abi_tail() -> Tail {
     let mut tail = U256::from(4u64).to_be_bytes::<32>().to_vec();
     let mut block = [0u8; 32];

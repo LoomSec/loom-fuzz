@@ -51,14 +51,7 @@ use loom_fuzz_seed::{Input, Tail, ValueDictionary};
 use crate::evm::RunResult;
 use crate::rng::Rng;
 
-/// 比较池上限（观测值去重后保留量）。
-const CMP_POOL_CAP: usize = 256;
-/// 存储观测池上限（键值对去重后保留量）。
-const STORAGE_POOL_CAP: usize = 128;
-
-/// 高斯缩放比例集（百分数，固定）。
-const SCALES: [u64; 7] = [10, 25, 50, 100, 200, 500, 1000];
-
+/// 池容量与比例集见 [`crate::tuning::TUNING`]（issue #49 集中配置）。
 /// 会话级运行时池：比较操作数 + 存储键值对。去重用 BTreeSet（天然
 /// 排序，确定性：迭代序 = 排序序，与插入序无关）；超上限丢弃新项
 /// （保先收，避免 LRU 状态引入非确定性）。
@@ -77,13 +70,13 @@ impl Pools {
     pub(crate) fn absorb(&mut self, run: &RunResult) {
         for pair in &run.cmp_observed {
             for v in pair {
-                if self.cmp.len() < CMP_POOL_CAP {
+                if self.cmp.len() < crate::tuning::TUNING.cmp_pool_cap {
                     self.cmp.insert(*v);
                 }
             }
         }
         for kv in &run.storage_observed {
-            if self.storage.len() < STORAGE_POOL_CAP {
+            if self.storage.len() < crate::tuning::TUNING.storage_pool_cap {
                 self.storage.insert(*kv);
             }
         }
@@ -262,6 +255,11 @@ pub(crate) fn tail_block_replace(tail: &mut [u8], word_idx: usize, word: [u8; 32
 /// storage 16 / gaussian 10 / coordinated 8——低权重专科：同现
 /// 约束场景才赚，常规单槽约束下破坏兄弟槽）。池可用性作为参数
 /// 传入（避开与 rng 的借用冲突）。
+/// 定长算子按 [`crate::tuning::TUNING`] 权重表随机选一（绝对区间
+/// 底 = 前项累计；投掷 rng.below(100) 后取第一个累计值 > roll 的
+/// 可用算子；算子不可用或 roll 落权重表外（满百缺二）→ 重投 8
+/// 次——与 #6/#25 旧表逐区间等价）。池可用性作为参数传入（避开
+/// 与 rng 的借用冲突）。
 fn pick_head_op(
     rng: &mut Rng,
     has_cmp: bool,
@@ -272,18 +270,28 @@ fn pick_head_op(
         return None;
     }
     for _ in 0..8 {
-        match rng.below(100) {
-            0..=22 if has_cmp => return Some(HeadOp::CmpFeedback),
-            23..=45 if has_const => return Some(HeadOp::ConstOverwrite),
-            46..=63 => return Some(HeadOp::BoundaryIncDec), // 无池依赖
-            64..=79 if has_storage => return Some(HeadOp::StorageReplay),
-            80..=89 => return Some(HeadOp::GaussianScale), // 无池依赖
-            // 协同 = 同现约束专科（低权重：多槽同时覆写常破坏兄弟槽
-            // 的脆弱等值约束——guard-boundary 的 nonce 实测）；需要
-            // 至少一个词池（字典/比较）。
-            90..=97 if has_cmp || has_const => return Some(HeadOp::Coordinated),
-            _ => continue,
+        let roll = rng.below(100);
+        let mut cum = 0u64;
+        for (op, w) in crate::tuning::TUNING.head_op_weights {
+            cum += w;
+            if roll < cum {
+                let enabled = match op {
+                    HeadOp::CmpFeedback => has_cmp,
+                    HeadOp::ConstOverwrite => has_const,
+                    HeadOp::StorageReplay => has_storage,
+                    // 协同 = 同现约束专科（低权重：多槽同时覆写常破坏
+                    // 兄弟槽的脆弱等值约束——guard-boundary 的 nonce
+                    // 实测）；需要至少一个词池（字典/比较）。
+                    HeadOp::Coordinated => has_cmp || has_const,
+                    _ => true,
+                };
+                if enabled {
+                    return Some(*op);
+                }
+                break; // 该区间算子不可用 → 重投（同旧 _ => continue）
+            }
         }
+        // roll ≥ 权重表累计（98）→ 重投。
     }
     None
 }
@@ -302,113 +310,114 @@ pub(crate) fn mutate(parent: &Input, ctx: &mut MutCtx<'_>) -> Input {
     let rng = &mut *ctx.rng;
     let mut child = parent.clone();
     let roll = rng.below(100);
-    match roll {
-        // 定长算子（head 非空；head 空回落 legacy）。
-        0..=59 if !child.head.is_empty() => {
-            let slot = rng.below(child.head.len() as u64) as usize;
-            match pick_head_op(
-                rng,
-                !ctx.cmp_pool.is_empty(),
-                !ctx.consts.is_empty(),
-                !ctx.storage_pool.is_empty(),
-            ) {
-                Some(HeadOp::CmpFeedback) => {
-                    let v = ctx.cmp_pool[rng.below(ctx.cmp_pool.len() as u64) as usize];
-                    op_cmp_feedback(&mut child, slot, v);
-                }
-                Some(HeadOp::ConstOverwrite) => {
-                    let v = ctx.consts[rng.below(ctx.consts.len() as u64) as usize];
-                    op_const_overwrite(&mut child, slot, v);
-                }
-                Some(HeadOp::BoundaryIncDec) => {
-                    let inc = rng.below(2) == 0;
-                    child.head[slot] = op_boundary(child.head[slot], inc);
-                }
-                Some(HeadOp::StorageReplay) => {
-                    let kv = ctx.storage_pool[rng.below(ctx.storage_pool.len() as u64) as usize];
-                    let use_key = rng.below(10) == 0; // 10% 键
-                    op_storage_replay(&mut child, slot, kv, use_key);
-                }
-                Some(HeadOp::GaussianScale) => {
-                    let pct = SCALES[rng.below(SCALES.len() as u64) as usize];
-                    let up = rng.below(2) == 0;
-                    child.head[slot] = op_gaussian(child.head[slot], pct, up);
-                }
-                Some(HeadOp::Coordinated) => {
-                    // k ∈ {2,3} 个不同槽，各从比较池/字典 50/50 抽词
-                    // 同时覆写（单算子单应用：一轮一次协同）。k 不超
-                    // 头槽数（头长 1 时退化单槽）。
-                    let k = (2 + rng.below(2) as usize).min(child.head.len());
-                    let mut chosen: Vec<usize> = vec![slot];
-                    while chosen.len() < k {
-                        let s = rng.below(child.head.len() as u64) as usize;
-                        if !chosen.contains(&s) {
-                            chosen.push(s);
-                        }
-                    }
-                    for s in chosen {
-                        let word = if !ctx.cmp_pool.is_empty() && rng.below(2) == 0 {
-                            ctx.cmp_pool[rng.below(ctx.cmp_pool.len() as u64) as usize]
-                        } else {
-                            ctx.consts[rng.below(ctx.consts.len() as u64) as usize]
-                        };
-                        child.head[s] = word.to_be_bytes::<32>();
-                    }
-                }
-                None => legacy_head(rng, &mut child),
+    let band = &crate::tuning::TUNING;
+    // 带边界与守卫顺延语义 = 旧 match（roll 区间不适用时落下一带）。
+    if roll < band.head_op_band && !child.head.is_empty() {
+        // 定长算子（head 非空；head 空顺延下带）。
+        let slot = rng.below(child.head.len() as u64) as usize;
+        match pick_head_op(
+            rng,
+            !ctx.cmp_pool.is_empty(),
+            !ctx.consts.is_empty(),
+            !ctx.storage_pool.is_empty(),
+        ) {
+            Some(HeadOp::CmpFeedback) => {
+                let v = ctx.cmp_pool[rng.below(ctx.cmp_pool.len() as u64) as usize];
+                op_cmp_feedback(&mut child, slot, v);
             }
-        }
-        // 变长尾算子（tail 为 Bytes；否则回落 legacy）。
-        50..=79 if matches!(child.tail, Tail::Bytes(_)) => {
-            let op = pick_tail_op(rng);
-            let Tail::Bytes(tail) = &mut child.tail else {
-                unreachable!("matches 已判定")
-            };
-            let words = tail.len() / 32;
-            match op {
-                TailOp::Truncate => {
-                    let keep = rng.below(words as u64 + 1) as usize;
-                    tail_truncate(tail, keep);
-                    if tail.is_empty() {
-                        child.tail = Tail::Empty;
+            Some(HeadOp::ConstOverwrite) => {
+                let v = ctx.consts[rng.below(ctx.consts.len() as u64) as usize];
+                op_const_overwrite(&mut child, slot, v);
+            }
+            Some(HeadOp::BoundaryIncDec) => {
+                let inc = rng.below(2) == 0;
+                child.head[slot] = op_boundary(child.head[slot], inc);
+            }
+            Some(HeadOp::StorageReplay) => {
+                let kv = ctx.storage_pool[rng.below(ctx.storage_pool.len() as u64) as usize];
+                let use_key = rng.below(10) == 0; // 10% 键
+                op_storage_replay(&mut child, slot, kv, use_key);
+            }
+            Some(HeadOp::GaussianScale) => {
+                let pct =
+                    band.gaussian_scales[rng.below(band.gaussian_scales.len() as u64) as usize];
+                let up = rng.below(2) == 0;
+                child.head[slot] = op_gaussian(child.head[slot], pct, up);
+            }
+            Some(HeadOp::Coordinated) => {
+                // k ∈ {2,3} 个不同槽，各从比较池/字典 50/50 抽词
+                // 同时覆写（单算子单应用：一轮一次协同）。k 不超
+                // 头槽数（头长 1 时退化单槽）。
+                let k = (2 + rng.below(2) as usize).min(child.head.len());
+                let mut chosen: Vec<usize> = vec![slot];
+                while chosen.len() < k {
+                    let s = rng.below(child.head.len() as u64) as usize;
+                    if !chosen.contains(&s) {
+                        chosen.push(s);
                     }
                 }
-                TailOp::Extend => {
-                    let n = 1 + rng.below(2) as usize;
-                    let mut add = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        add.push(if !ctx.consts.is_empty() && rng.below(2) == 0 {
-                            ctx.consts[rng.below(ctx.consts.len() as u64) as usize]
-                                .to_be_bytes::<32>()
-                        } else {
-                            rng.word()
-                        });
-                    }
-                    tail_extend(tail, &add);
-                }
-                TailOp::BlockReplace => {
-                    if words > 0 {
-                        let idx = rng.below(words as u64) as usize;
-                        let w = if !ctx.consts.is_empty() && rng.below(2) == 0 {
-                            ctx.consts[rng.below(ctx.consts.len() as u64) as usize]
-                                .to_be_bytes::<32>()
-                        } else {
-                            rng.word()
-                        };
-                        tail_block_replace(tail, idx, w);
-                    }
+                for s in chosen {
+                    let word = if !ctx.cmp_pool.is_empty() && rng.below(2) == 0 {
+                        ctx.cmp_pool[rng.below(ctx.cmp_pool.len() as u64) as usize]
+                    } else {
+                        ctx.consts[rng.below(ctx.consts.len() as u64) as usize]
+                    };
+                    child.head[s] = word.to_be_bytes::<32>();
                 }
             }
+            None => legacy_head(rng, &mut child),
         }
+    } else if roll < band.tail_op_band && matches!(child.tail, Tail::Bytes(_)) {
+        // 变长尾算子（tail 为 Bytes；否则顺延下带）。
+        let op = pick_tail_op(rng);
+        let Tail::Bytes(tail) = &mut child.tail else {
+            unreachable!("matches 已判定")
+        };
+        let words = tail.len() / 32;
+        match op {
+            TailOp::Truncate => {
+                let keep = rng.below(words as u64 + 1) as usize;
+                tail_truncate(tail, keep);
+                if tail.is_empty() {
+                    child.tail = Tail::Empty;
+                }
+            }
+            TailOp::Extend => {
+                let n = 1 + rng.below(2) as usize;
+                let mut add = Vec::with_capacity(n);
+                for _ in 0..n {
+                    add.push(if !ctx.consts.is_empty() && rng.below(2) == 0 {
+                        ctx.consts[rng.below(ctx.consts.len() as u64) as usize].to_be_bytes::<32>()
+                    } else {
+                        rng.word()
+                    });
+                }
+                tail_extend(tail, &add);
+            }
+            TailOp::BlockReplace => {
+                if words > 0 {
+                    let idx = rng.below(words as u64) as usize;
+                    let w = if !ctx.consts.is_empty() && rng.below(2) == 0 {
+                        ctx.consts[rng.below(ctx.consts.len() as u64) as usize].to_be_bytes::<32>()
+                    } else {
+                        rng.word()
+                    };
+                    tail_block_replace(tail, idx, w);
+                }
+            }
+        }
+    } else if roll < band.abifix_band
+        && !child.head.is_empty()
+        && matches!(child.tail, Tail::Bytes(_))
+    {
         // ABI 自洽化算子（issue #46：嵌套动态尾装配）：候选 calldata
         // 的偏移结构系统性重编码（头偏移重绑定 + 段内层偏移修复，
         // 退化零槽合成最小动态段）。有头有尾才适用；否则回落
         // legacy。与五算子同权重路径，判决独立。
-        80..=83 if !child.head.is_empty() && matches!(child.tail, Tail::Bytes(_)) => {
-            child = crate::abifix::abi_coherence_fix(&child, rng, ctx.dynamic_head);
-        }
+        child = crate::abifix::abi_coherence_fix(&child, rng, ctx.dynamic_head);
+    } else {
         // legacy 兜底（#5 基础变异）。
-        _ => legacy(rng, &mut child),
+        legacy(rng, &mut child);
     }
     child
 }
@@ -428,15 +437,18 @@ fn legacy_head(rng: &mut Rng, child: &mut Input) {
         let byte = rng.below(32) as usize;
         child.head[slot][byte] ^= rng.next_u64() as u8;
     }
-    if rng.below(10) == 0 {
+    if rng.below(crate::tuning::TUNING.legacy_caller_denom) == 0 {
         child.caller = rng.address();
     }
 }
 
 /// legacy 尾系列：字节扰动 / 动态尾生成（与 #5 同语义）。
 fn legacy_tail(rng: &mut Rng, child: &mut Input) {
-    if matches!(child.tail, Tail::Empty | Tail::Free) && rng.below(100) < 15 {
-        let len = rng.below(65) as usize;
+    let tune = &crate::tuning::TUNING;
+    if matches!(child.tail, Tail::Empty | Tail::Free)
+        && rng.below(100) < tune.legacy_tail_gen_percent
+    {
+        let len = rng.below(tune.legacy_tail_len_cap + 1) as usize;
         let mut tail = U256::from(len).to_be_bytes::<32>().to_vec();
         let mut data = vec![0u8; len.div_ceil(32) * 32];
         rng.fill_bytes(&mut data);
@@ -797,7 +809,7 @@ mod tests {
             .map(|i| [U256::from(i), U256::from(i + 1000)])
             .collect();
         pool.absorb(&run2);
-        assert!(pool.cmp().len() <= CMP_POOL_CAP);
-        assert!(pool.storage().len() <= STORAGE_POOL_CAP);
+        assert!(pool.cmp().len() <= crate::tuning::TUNING.cmp_pool_cap);
+        assert!(pool.storage().len() <= crate::tuning::TUNING.storage_pool_cap);
     }
 }
