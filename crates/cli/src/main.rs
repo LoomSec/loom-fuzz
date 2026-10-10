@@ -666,12 +666,6 @@ fn registry_candidate_seed(selector: u32, word: U256) -> SeedInput {
 /// （selector 4B + 全 32B 头词 + 余字节尾；caller 取管线缺省形——
 /// 与编译/字典种子同基座；value 经 `@<wei>` 后缀携带，见
 /// [`parse_seed_calldata`]）。fail-closed：非法 hex / 不足 4 字节。
-fn seed_calldata_input(sc: &str) -> Result<SeedInput, String> {
-    seed_calldata_input_with_value(sc, U256::ZERO)
-}
-
-/// 带 value 形态（issue #41 TeamFinance）：payable 前置步的通用
-/// 需求（引擎零个案）。
 fn seed_calldata_input_with_value(sc: &str, value: U256) -> Result<SeedInput, String> {
     let bytes = loom_fuzz_oracle::hex_bytes(sc).map_err(|e| format!("非合法 hex: {e}"))?;
     if bytes.len() < 4 {
@@ -850,14 +844,17 @@ mod seed_base_tests {
         let mut cd = vec![0xde, 0xad, 0xbe, 0xef];
         cd.extend_from_slice(&[0xaau8; 64]);
         cd.extend_from_slice(&[1, 2, 3]);
-        let input = seed_calldata_input(&format!(
-            "0x{}",
-            cd.iter().fold(String::new(), |mut s, b| {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-                s
-            })
-        ))
+        let input = seed_calldata_input_with_value(
+            &format!(
+                "0x{}",
+                cd.iter().fold(String::new(), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                }),
+            ),
+            U256::ZERO,
+        )
         .unwrap();
         assert_eq!(input.selector, 0xdeadbeef);
         assert_eq!(input.caller, [0x33; 20]);
@@ -870,8 +867,8 @@ mod seed_base_tests {
         // 序列化回 calldata 逐字节一致（原形态保留）。
         assert_eq!(loom_fuzz_oracle::calldata_of(&input), cd);
         // fail-closed：非法 hex / 短 calldata。
-        assert!(seed_calldata_input("0xzz").is_err());
-        assert!(seed_calldata_input("0x0102").is_err());
+        assert!(seed_calldata_input_with_value("0xzz", U256::ZERO).is_err());
+        assert!(seed_calldata_input_with_value("0x0102", U256::ZERO).is_err());
     }
 
     #[test]
