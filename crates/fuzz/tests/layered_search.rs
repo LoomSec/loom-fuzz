@@ -59,6 +59,7 @@ fn cfg_for(code: Vec<u8>, guards: Vec<GuardContext>) -> ExecConfig {
         deployments: Vec::new(),
         entry: None,
         max_steps: 1,
+        dynamic_head_evidence: false,
         guard_context: guards,
     }
 }

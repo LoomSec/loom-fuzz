@@ -26,6 +26,7 @@ pub struct DictionaryProposer {
     consts: Vec<U256>,
     cmp_pool: Vec<U256>,
     storage_pool: Vec<(U256, U256)>,
+    dynamic_head: bool,
 }
 
 impl DictionaryProposer {
@@ -35,6 +36,7 @@ impl DictionaryProposer {
             consts: Vec::new(),
             cmp_pool: Vec::new(),
             storage_pool: Vec::new(),
+            dynamic_head: false,
         }
     }
 }
@@ -44,6 +46,7 @@ impl Proposer for DictionaryProposer {
         self.consts = ctx.consts.to_vec();
         self.cmp_pool = ctx.cmp_pool.to_vec();
         self.storage_pool = ctx.storage_pool.to_vec();
+        self.dynamic_head = ctx.dynamic_head;
     }
 
     fn propose(&mut self, feedback: &[RunFeedback], budget: ProposalBudget) -> Vec<Input> {
@@ -81,6 +84,7 @@ impl Proposer for DictionaryProposer {
                     &self.cmp_pool,
                     &self.storage_pool,
                 );
+                ctx.dynamic_head = self.dynamic_head;
                 mutate(parent, &mut ctx)
             })
             .collect()
@@ -151,6 +155,7 @@ mod tests {
                 consts: &[U256::from(0x42u64)],
                 cmp_pool: &[U256::from(0x99u64)],
                 storage_pool: &[(U256::ZERO, U256::from(1u64))],
+                dynamic_head: false,
             });
             p.propose(&feedback, budget)
         };

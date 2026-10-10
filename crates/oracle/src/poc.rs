@@ -461,6 +461,7 @@ pub fn replay(
         },
         // replay 的序列长度上限 = 见证序列长度（机械约束，不扩搜）。
         max_steps: witness_seq.steps.len() as u32,
+        dynamic_head_evidence: false,
         // replay 不经搜索层（判决独立）；guard 上下文不参与重放。
         guard_context: Vec::new(),
     };
@@ -599,6 +600,7 @@ mod tests {
             deployments: Vec::new(),
             entry: None,
             max_steps: 1,
+            dynamic_head_evidence: false,
             guard_context: Vec::new(),
         };
         (report, cfg)

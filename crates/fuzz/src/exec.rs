@@ -68,6 +68,11 @@ pub struct ExecConfig {
     /// 之上机械组装多步序列（append / splice / 步内变异）。
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
+    /// 动态头证据（issue #48）：守卫事实推导——存在界依赖
+    /// calldata 词的 msg.data.length 守卫（嵌套动态尾结构形态）。
+    /// abifix 零槽合成的启用依据（替代 #46 的拍头宽阈值特判）。
+    #[serde(default)]
+    pub dynamic_head_evidence: bool,
     /// 支配 guard 上下文（revert 归因用；装载端经 xlayer 渲染 cond）。
     #[serde(default)]
     pub guard_context: Vec<GuardContext>,
@@ -227,12 +232,15 @@ pub struct ProposalBudget {
     pub time_left: Duration,
 }
 
-/// 提案器上下文：会话每代前刷新的共享池（变异器的池来源）。
+/// 提案器上下文：会话每代前刷新的共享池（变异器的池来源）+
+/// 会话级标志透传。
 #[derive(Debug, Clone, Copy)]
 pub struct ProposerCtx<'a> {
     pub consts: &'a [U256],
     pub cmp_pool: &'a [U256],
     pub storage_pool: &'a [(U256, U256)],
+    /// 动态头证据（issue #48，守卫事实推导）→ abifix 宽头放行。
+    pub dynamic_head: bool,
 }
 
 /// 反馈驱动进化的提案器抽象（issue #25 分层搜索，#29 决策：dictionary
@@ -349,6 +357,7 @@ pub fn run_targeted_with(
             consts: &consts,
             cmp_pool: &cmp_pool,
             storage_pool: &storage_pool,
+            dynamic_head: cfg.dynamic_head_evidence,
         });
         let feedback = session.proposer_feedback();
         let candidates = proposer.propose(
@@ -375,6 +384,7 @@ pub fn run_targeted_with(
                     table: &table,
                     step_pool: &step_pool,
                     max_steps: cfg.max_steps,
+                    dynamic_head: cfg.dynamic_head_evidence,
                     selector: target.hit.selector(),
                     head_len_hint,
                     dict,
@@ -718,6 +728,7 @@ mod tests {
             deployments: Vec::new(),
             entry: None,
             max_steps: 1,
+            dynamic_head_evidence: false,
             guard_context: Vec::new(),
         };
         let seeds = vec![TxSequence::single(
@@ -772,6 +783,7 @@ mod tests {
             deployments: Vec::new(),
             entry: None,
             max_steps: 1,
+            dynamic_head_evidence: false,
             guard_context: Vec::new(),
         };
         let report = run_targeted(&cfg, &target, &[], &ValueDictionary { words: vec![] });

@@ -143,6 +143,7 @@ fn exec_config(
         deployments: Vec::new(),
         entry: None,
         max_steps: 1,
+        dynamic_head_evidence: false,
         guard_context: Vec::new(),
     }
 }
