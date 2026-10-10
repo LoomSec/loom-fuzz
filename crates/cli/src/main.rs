@@ -468,7 +468,8 @@ fn cmd_run(
         // 与 --dict-word 的保留通道同机制，覆盖字典里的运行时/静态
         // 词（token 地址、阈值常量等）。规模上限 64：超了按字典序
         // 截断并记 assumption（落 fuzz_report）。
-        let (base, note) = full_dict_base(seeds.len(), hit.selector, &seed_out.dict.words, head_cap);
+        let (base, note) =
+            full_dict_base(seeds.len(), hit.selector, &seed_out.dict.words, head_cap);
         seeds.extend(base);
         if let Some(note) = note {
             if !seed_out.assumptions.contains(&note) {
