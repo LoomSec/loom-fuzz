@@ -36,11 +36,13 @@
 //!   常量与字节码 PUSH 立即数。
 
 mod compile;
+mod headwidth;
 mod node;
 
 use serde::{Deserialize, Serialize};
 
 pub use compile::{compile, locate};
+pub use headwidth::{derive as derive_headwidth, head_words_cap, HeadWidth};
 pub use node::{canon, render_node, Node, View};
 
 /// 种子集上限：变体数超此后按字典序截断并记 assumption。
