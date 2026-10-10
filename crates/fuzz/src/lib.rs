@@ -143,7 +143,6 @@ mod mutators;
 pub mod propose;
 mod rng;
 mod sequence;
-mod tfprobe;
 mod tuning;
 
 pub use cfg::DistanceTable;
@@ -158,4 +157,3 @@ pub use fork::{
 pub use loom_fuzz_seed::{HitView, Input, Step, Tail, Target, TxSequence, ValueDictionary};
 pub use propose::DictionaryProposer;
 pub use rng::Rng;
-
