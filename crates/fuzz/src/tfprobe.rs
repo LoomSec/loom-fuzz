@@ -10,6 +10,14 @@ mod tests {
     use crate::exec::{ExecConfig, OutcomeKind};
     use crate::fork::ForkConfig;
 
+    fn hexb(s: &str) -> Vec<u8> {
+        let s = s.trim().trim_start_matches("0x");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     fn read_input(path: &str, value: U256) -> Input {
         let text = std::fs::read_to_string(path).unwrap();
         let hex = text.trim().trim_start_matches("0x");
@@ -28,17 +36,69 @@ mod tests {
     }
 
     #[test]
-    fn probe_teamfinance_three_step() {
+    fn probe_migrate_hit_confirms() {
         if std::env::var("LOOM_FUZZ_FORK_TEST").ok().as_deref() != Some("1") {
             eprintln!("fork 探针跳过");
             return;
         }
-        fn hexb(s: &str) -> Vec<u8> {
-            let s = s.trim_start_matches("0x");
-            (0..s.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-                .collect()
+        let code = hexb(
+            &std::fs::read_to_string(
+                "../../fixtures/real-world/teamfinance-locktoken/TeamFinanceLockToken-impl.bin-runtime",
+            )
+            .unwrap(),
+        );
+        let mut proxy = [0u8; 20];
+        proxy.copy_from_slice(&hexb("0xE2fE530C047f2d85298b07D9333C05737f1435fB"));
+        let cfg = ExecConfig {
+            code,
+            address: proxy,
+            prestate: BTreeMap::new(),
+            seed_rng: 1,
+            max_runs: 3,
+            time_budget: Duration::from_secs(120),
+            gas_per_tx: 2_000_000,
+            run_baseline: false,
+            fork: Some(ForkConfig {
+                rpc_url: std::env::var("BLOCKMACHINE_RPC_URL").unwrap(),
+                block_number: 15837893,
+            }),
+            deployments: Vec::new(),
+            entry: None,
+            max_steps: 1,
+            dynamic_head_evidence: false,
+            guard_context: Vec::new(),
+        };
+        struct H;
+        impl loom_fuzz_seed::HitView for H {
+            fn selector(&self) -> u32 { 0xb86f3ea6 }
+            fn target_pcs(&self) -> &[u32] { &[8143] }
+            fn evidence(&self) -> &str { "" }
+        }
+        let hit = H;
+        let target = loom_fuzz_seed::Target { hit: &hit, func: 0 };
+        let base = "../../fixtures/real-world/teamfinance-locktoken";
+        let seq = TxSequence {
+            steps: vec![
+                Step { target: proxy, input: read_input(&format!("{base}/seed-lockToken.hex"), U256::from(500000000000000000u128)) },
+                Step { target: proxy, input: read_input(&format!("{base}/seed-extendLockDuration.hex"), U256::ZERO) },
+                Step { target: proxy, input: read_input(&format!("{base}/seed-migrate.hex"), U256::ZERO) },
+            ],
+        };
+        let report = crate::run_targeted(&cfg, &target, &[seq], &loom_fuzz_seed::ValueDictionary { words: vec![] });
+        eprintln!("reached={} runs={} outcomes={:?}", report.reached, report.runs_completed, report.trace.step_outcomes);
+        for c in &report.trace.calls {
+            if c.pc.is_some_and(|p| p >= 8143) {
+                let hex: String = c.target.iter().fold(String::new(), |mut s, b| { use std::fmt::Write as _; let _ = write!(s, "{b:02x}"); s });
+                eprintln!("   pc>=8143: {} -> 0x{} step={} in_len={}", c.kind, hex, c.step, c.input.len());
+            }
+        }
+    }
+
+    #[test]
+    fn probe_teamfinance_three_step() {
+        if std::env::var("LOOM_FUZZ_FORK_TEST").ok().as_deref() != Some("1") {
+            eprintln!("fork 探针跳过");
+            return;
         }
         let code = hexb(
             &std::fs::read_to_string(
