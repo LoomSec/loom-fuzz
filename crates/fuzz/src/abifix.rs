@@ -113,7 +113,7 @@ fn fix_segment(seg_words: &[[u8; 32]], rng: &mut Rng) -> Vec<[u8; 32]> {
 
 /// 结构感知重编码：候选 calldata 的偏移结构自洽化（见模块文档）。
 /// 无动态槽 / 无尾时原样返回（算子幂等 no-op）。
-pub(crate) fn abi_coherence_fix(input: &Input, rng: &mut Rng) -> Input {
+pub(crate) fn abi_coherence_fix(input: &Input, rng: &mut Rng, dynamic_head: bool) -> Input {
     let n_head = input.head.len();
     if n_head == 0 {
         return input.clone();
@@ -136,10 +136,12 @@ pub(crate) fn abi_coherence_fix(input: &Input, rng: &mut Rng) -> Input {
     if dyn_slots.is_empty() {
         return input.clone();
     }
-    // 宽头保护（回归红线）：头宽 > 4 时零槽视为数据（anyswap permit
-    // 形 9 槽定长头全是参数数据，零值合法）——零槽合成只在小头
-    // （嵌套 ABI 的偏移头形态 ≤ 4 槽）启用；非零偏移形词不受此限。
-    if n_head > 4 {
+    // 宽头保护（#46 回归红线）：头宽 > 4 且守卫事实无动态头证据
+    // 时，零槽视为数据（anyswap permit 形 9 槽定长头全是参数数据，
+    // 零值合法）——零槽合成只在小头或动态头证据在场时启用（issue
+    // #48：证据 = 界依赖 calldata 词的 msg.data.length 守卫，替代
+    // #46 的纯拍宽度阈值）；非零偏移形词不受此限。
+    if n_head > 4 && !dynamic_head {
         dyn_slots.retain(|&k| input.head[k] != [0u8; 32]);
         if dyn_slots.is_empty() {
             return input.clone();
@@ -262,7 +264,7 @@ mod tests {
         // LiFi 形退化输入：3 零槽头 + 残余尾词。修复后每个头槽
         // 指向合法段（偏移相对 args 头），且修复幂等。
         let degenerate = input(vec![[0u8; 32]; 3], vec![word(0xAAAA), word(0xBBBB)]);
-        let fixed = abi_coherence_fix(&degenerate, &mut Rng::new(7));
+        let fixed = abi_coherence_fix(&degenerate, &mut Rng::new(7), true);
         assert_eq!(fixed.head.len(), 3);
         let Tail::Bytes(tb) = &fixed.tail else {
             panic!("tail")
@@ -286,7 +288,7 @@ mod tests {
         let has_material = tail_words.iter().any(|w| *w == word(0xAAAA));
         assert!(has_material, "材料不丢: {tail_words:?}");
         // 幂等：再修不变。
-        let fixed2 = abi_coherence_fix(&fixed, &mut Rng::new(7));
+        let fixed2 = abi_coherence_fix(&fixed, &mut Rng::new(7), true);
         assert_eq!(fixed.clone(), fixed2, "自洽化幂等");
     }
 
@@ -310,7 +312,7 @@ mod tests {
             word(((n_head + c_at) * 32) as u64),
         ];
         let coherent = input(head, tail);
-        let fixed = abi_coherence_fix(&coherent, &mut Rng::new(9));
+        let fixed = abi_coherence_fix(&coherent, &mut Rng::new(9), true);
         let Tail::Bytes(tb) = &fixed.tail else {
             panic!("tail")
         };
@@ -345,7 +347,7 @@ mod tests {
             vec![word(0x7d), word(0x40)],
             minimal_segment(&mut Rng::new(3)),
         );
-        let fixed = abi_coherence_fix(&trv, &mut Rng::new(3));
+        let fixed = abi_coherence_fix(&trv, &mut Rng::new(3), false);
         assert_eq!(fixed, trv, "自洽头形不破坏");
     }
 
@@ -359,7 +361,7 @@ mod tests {
             head: vec![[0u8; 32]; 9],
             tail: Tail::Empty,
         };
-        let fixed = abi_coherence_fix(&anyswap, &mut Rng::new(1));
+        let fixed = abi_coherence_fix(&anyswap, &mut Rng::new(1), false);
         assert_eq!(fixed, anyswap);
     }
 }

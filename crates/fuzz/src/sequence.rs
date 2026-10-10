@@ -46,6 +46,8 @@ pub(crate) struct AssembleCtx<'a> {
     pub step_pool: &'a [Step],
     /// 序列长度上限（ExecConfig.max_steps）。
     pub max_steps: u32,
+    /// 动态头证据（issue #48）→ 步内变异的 abifix 宽头放行。
+    pub dynamic_head: bool,
     /// 目标 selector（随机填充步用）。
     pub selector: u32,
     /// head 槽数提示（随机填充步用）。
@@ -143,6 +145,7 @@ pub(crate) fn assemble(
     if seq.steps.len() > 1 && rng.below(2) == 0 {
         let idx = rng.below(seq.steps.len() as u64) as usize;
         let mut mctx = MutCtx::new(rng, ctx.consts, ctx.cmp_pool, ctx.storage_pool);
+        mctx.dynamic_head = ctx.dynamic_head;
         seq.steps[idx].input = mutate(&seq.steps[idx].input, &mut mctx);
     }
     seq
@@ -231,6 +234,7 @@ mod tests {
             table,
             step_pool: &[],
             max_steps,
+            dynamic_head: false,
             selector: 0xdeadbeef,
             head_len_hint: 1,
             dict: &EMPTY_DICT,

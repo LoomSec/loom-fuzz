@@ -136,6 +136,9 @@ fn push_immediates(code: &[u8]) -> Vec<U256> {
 
 /// 单轮变异的输入上下文：随机源 + 常量池 + 运行时池（只读）。
 pub(crate) struct MutCtx<'a> {
+    /// 动态头证据（issue #48，守卫事实推导）：透传 abifix 零槽合成
+    /// 的宽头放行依据。缺省 false（既有窄头行为不变）。
+    pub dynamic_head: bool,
     pub rng: &'a mut Rng,
     pub consts: &'a [U256],
     pub cmp_pool: &'a [U256],
@@ -150,6 +153,7 @@ impl<'a> MutCtx<'a> {
         storage_pool: &'a [(U256, U256)],
     ) -> Self {
         MutCtx {
+            dynamic_head: false,
             rng,
             consts,
             cmp_pool,
@@ -401,7 +405,7 @@ pub(crate) fn mutate(parent: &Input, ctx: &mut MutCtx<'_>) -> Input {
         // 退化零槽合成最小动态段）。有头有尾才适用；否则回落
         // legacy。与五算子同权重路径，判决独立。
         80..=83 if !child.head.is_empty() && matches!(child.tail, Tail::Bytes(_)) => {
-            child = crate::abifix::abi_coherence_fix(&child, rng);
+            child = crate::abifix::abi_coherence_fix(&child, rng, ctx.dynamic_head);
         }
         // legacy 兜底（#5 基础变异）。
         _ => legacy(rng, &mut child),
@@ -501,6 +505,7 @@ mod tests {
             deployments: Vec::new(),
             entry: None,
             max_steps: 1,
+            dynamic_head_evidence: false,
             guard_context: Vec::new(),
         }
     }

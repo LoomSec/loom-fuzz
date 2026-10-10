@@ -399,6 +399,21 @@ fn cmd_run(
             }
         }
 
+        // 头宽事实推导（issue #48）：msg.data.length 下界守卫推出
+        // calldata 最小字节数 → 基座/字典变体的头词枚举上限由事实
+        // 定（anyswap ≥4+0x120 → 9 词），不再盲扫 1..=12；动态头
+        // 证据（界依赖 calldata 词的守卫）送执行器作 abifix 零槽
+        // 合成的启用依据。
+        let head_facts = {
+            let guards: Vec<(String, bool)> = hit
+                .dominating_guards
+                .iter()
+                .map(|g| (g.cond.clone(), g.polarity))
+                .collect();
+            loom_fuzz_seed::derive_headwidth(&guards)
+        };
+        let head_cap = loom_fuzz_seed::head_words_cap(head_facts.calldata_min_bytes);
+
         let cfg = ExecConfig {
             code: hitset.code.clone(),
             address: exec_address,
@@ -412,6 +427,7 @@ fn cmd_run(
             deployments: deployments.clone(),
             entry,
             max_steps,
+            dynamic_head_evidence: head_facts.dynamic_head_evidence,
             // revert 归因上下文：支配 guard（装载端已渲染 cond）。
             guard_context: hit
                 .dominating_guards
@@ -423,11 +439,12 @@ fn cmd_run(
                 .collect(),
         };
         // ABI 形态基座种子：seed 编译器 M0 不产动态尾（其 assumption
-        // 如实记录），管线泛型补 n = 1..=4 个零参槽 + 指针尾（末槽 =
-        // 头宽）+ 定长动态尾的基座——动态参数的指针槽正确性由此进
-        // 搜索空间（docs/architecture.md 职责边界），非 fixture 特设。
+        // 如实记录），管线泛型补 n = 1..=头宽上限（事实推导，issue
+        // #48）个零参槽 + 指针尾（末槽 = 头宽）+ 定长动态尾的基座——
+        // 动态参数的指针槽正确性由此进搜索空间（docs/architecture.md
+        // 职责边界），非 fixture 特设。
         let mut seeds = seed_out.inputs.clone();
-        seeds.extend(abi_base_seeds(hit.selector));
+        seeds.extend(abi_base_seeds(hit.selector, head_cap));
         // dict-word 常量同时作"首槽候选种子"进场：registry 常量的
         // 文档化用途（shard 无此事实段，调用方补充）——(address,
         // bytes) 形参基座（首槽 = 常量、二槽 = 0x40 指针 + 定长尾），
@@ -435,11 +452,11 @@ fn cmd_run(
         // 调用方显式补充的少数常量。
         for w in &dict_extra {
             seeds.push(registry_candidate_seed(hit.selector, *w));
-            seeds.extend(dict_slot_variants(hit.selector, *w));
+            seeds.extend(dict_slot_variants(hit.selector, *w, head_cap));
             // 基座变体：常量落槽在 **ABI 形态基座**上（带指针尾）——
             // 动态形参函数（vvisr deposit 的 bytes 形参）裸头变体
             // 死在解码器，组合（常量×基座尾）只能等进化碰运气。
-            for base in abi_base_seeds(hit.selector) {
+            for base in abi_base_seeds(hit.selector, head_cap) {
                 for k in 0..base.head.len() {
                     let mut variant = base.clone();
                     variant.head[k] = w.to_be_bytes::<32>();
@@ -451,7 +468,7 @@ fn cmd_run(
         // 与 --dict-word 的保留通道同机制，覆盖字典里的运行时/静态
         // 词（token 地址、阈值常量等）。规模上限 64：超了按字典序
         // 截断并记 assumption（落 fuzz_report）。
-        let (base, note) = full_dict_base(seeds.len(), hit.selector, &seed_out.dict.words);
+        let (base, note) = full_dict_base(seeds.len(), hit.selector, &seed_out.dict.words, head_cap);
         seeds.extend(base);
         if let Some(note) = note {
             if !seed_out.assumptions.contains(&note) {
@@ -607,9 +624,11 @@ fn seed_sort_key(s: &SeedInput) -> Vec<u8> {
     key
 }
 
-fn dict_slot_variants(selector: u32, word: U256) -> Vec<SeedInput> {
+/// `max_n` = 头词枚举上限（issue #48：由 msg.data.length 守卫事实
+/// 推导的 head_words_cap；保底 4）。
+fn dict_slot_variants(selector: u32, word: U256, max_n: usize) -> Vec<SeedInput> {
     let mut out = Vec::new();
-    for n in 1..=12usize {
+    for n in 1..=max_n {
         for k in 0..n {
             let mut head = vec![[0u8; 32]; n];
             head[k] = word.to_be_bytes::<32>();
@@ -663,17 +682,15 @@ fn abi_tail() -> Tail {
 
 /// ABI 形态基座种子（见调用点注释）。tail = len 字（=4）+ 32B 块
 /// 含 "loom" 前缀——≥4 字节，满足 oracle 的 trivial 长度下限。
-/// n 到 12：真实函数头宽可达 9 槽（anyswap anySwapOut*WithPermit
-/// 的 msg.data.length ≥ 4+0x120 守卫）；#41 实测再扩——LiFi
-/// swapAndStartBridgeTokensViaCBridge（8 LiFiData + 2 偏移 = 10 槽）
-/// 与 Rubic routerCall（8 元组 + router + 偏移 = 10 槽）都是 10 槽头，
-/// 9 槽上限会让这类函数的头词永远缺一词（指针槽落进尾区）不可解。
-fn abi_base_seeds(selector: u32) -> Vec<SeedInput> {
+/// n 到 `max_n`（issue #48 由 msg.data.length 守卫事实推导：如
+/// anyswap ≥4+0x120 → 9 词、LiFi ≥0x104 → 8 词），替代 #41/#46 的
+/// 1..=12 盲扫枚举；无事实函数保底 4（既有行为的保守下限）。
+fn abi_base_seeds(selector: u32, max_n: usize) -> Vec<SeedInput> {
     let tail_bytes = match abi_tail() {
         Tail::Bytes(b) => b,
         _ => unreachable!("abi_tail 恒 Bytes"),
     };
-    (1..=12)
+    (1..=max_n)
         .flat_map(|n| {
             // 双假设：指针槽 = 头宽（ABI 标准形）**或全零**（动态形参
             // 偏移 0/未用形——vvisr deposit 实测 winning witness 是
@@ -768,12 +785,13 @@ fn full_dict_base(
     reserved: usize,
     selector: u32,
     dict_words: &[U256],
+    max_n: usize,
 ) -> (Vec<SeedInput>, Option<String>) {
     const BASE_CAP: usize = 64;
     let mut candidates: Vec<SeedInput> = Vec::new();
     for w in dict_words {
-        candidates.extend(dict_slot_variants(selector, *w));
-        for base in abi_base_seeds(selector) {
+        candidates.extend(dict_slot_variants(selector, *w, max_n));
+        for base in abi_base_seeds(selector, max_n) {
             for k in 0..base.head.len() {
                 let mut variant = base.clone();
                 variant.head[k] = w.to_be_bytes::<32>();
@@ -832,11 +850,11 @@ mod seed_base_tests {
     fn full_dict_base_caps_at_64_with_assumption() {
         // 500 个词 × 9 槽 × 2 族 ≫ 64：截断 + assumption。
         let words: Vec<U256> = (0..500u64).map(U256::from).collect();
-        let (seeds, note) = full_dict_base(10, 0xdeadbeef, &words);
+        let (seeds, note) = full_dict_base(10, 0xdeadbeef, &words, 9);
         assert!(seeds.len() <= 54, "截断到 64-reserved");
         assert!(note.unwrap().contains("按字典序截断"));
         // 确定性：同输入同输出。
-        let (seeds2, _) = full_dict_base(10, 0xdeadbeef, &words);
+        let (seeds2, _) = full_dict_base(10, 0xdeadbeef, &words, 9);
         assert_eq!(seeds, seeds2);
     }
 
@@ -845,11 +863,11 @@ mod seed_base_tests {
         // 每词 ≥99 变体（9 裸头 + 9×10 槽基座×两族），2 词 ≫ 64：
         // 必截断（assumption 如实），且截断确定性。
         let words = vec![U256::from(1u64), U256::from(0x42u64)];
-        let (seeds, note) = full_dict_base(0, 0xdeadbeef, &words);
+        let (seeds, note) = full_dict_base(0, 0xdeadbeef, &words, 9);
         assert!(note.unwrap().contains("按字典序截断"));
         assert!(!seeds.is_empty());
         assert!(seeds.len() <= 64);
-        let (seeds2, _) = full_dict_base(0, 0xdeadbeef, &words);
+        let (seeds2, _) = full_dict_base(0, 0xdeadbeef, &words, 9);
         assert_eq!(seeds, seeds2);
     }
 }

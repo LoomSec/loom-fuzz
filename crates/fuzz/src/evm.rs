@@ -494,6 +494,7 @@ mod tests {
             deployments: Vec::new(),
             entry: None,
             max_steps: 1,
+            dynamic_head_evidence: false,
             guard_context: Vec::new(),
         };
         let input = Input {
@@ -535,6 +536,7 @@ mod tests {
             deployments: Vec::new(),
             entry: None,
             max_steps: 1,
+            dynamic_head_evidence: false,
             guard_context: Vec::new(),
         };
         let input = Input {
