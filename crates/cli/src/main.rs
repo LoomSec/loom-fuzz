@@ -482,7 +482,10 @@ fn cmd_run(
         // 与 --dict-word 的分工：字典词填单槽（形态靠搜索拼），语料
         // 给完整形态（已知攻击/合法笔的通用注入点）。
         for (i, sc) in seed_calldatas.iter().enumerate() {
-            let input = seed_calldata_input(sc).map_err(|e| format!("--seed-calldata[{i}] {e}"))?;
+            let (hex, value) =
+                parse_seed_calldata(sc).map_err(|e| format!("--seed-calldata[{i}] {e}"))?;
+            let input = seed_calldata_input_with_value(hex, value)
+                .map_err(|e| format!("--seed-calldata[{i}] {e}"))?;
             seeds.push(input);
         }
         // 搜索（issue #25/#29）：DictionaryProposer 为唯一路线——字典
@@ -660,15 +663,37 @@ fn registry_candidate_seed(selector: u32, word: U256) -> SeedInput {
 }
 
 /// --seed-calldata 规范化（issue #41）：完整 calldata → 种子 Input
-/// （selector 4B + 全 32B 头词 + 余字节尾；caller/value 取管线缺省
-/// 形——与编译/字典种子同基座）。fail-closed：非法 hex / 不足 4 字节。
+/// （selector 4B + 全 32B 头词 + 余字节尾；caller 取管线缺省形——
+/// 与编译/字典种子同基座；value 经 `@<wei>` 后缀携带，见
+/// [`parse_seed_calldata`]）。fail-closed：非法 hex / 不足 4 字节。
 fn seed_calldata_input(sc: &str) -> Result<SeedInput, String> {
+    seed_calldata_input_with_value(sc, U256::ZERO)
+}
+
+/// 带 value 形态（issue #41 TeamFinance）：payable 前置步的通用
+/// 需求（引擎零个案）。
+fn seed_calldata_input_with_value(sc: &str, value: U256) -> Result<SeedInput, String> {
     let bytes = loom_fuzz_oracle::hex_bytes(sc).map_err(|e| format!("非合法 hex: {e}"))?;
     if bytes.len() < 4 {
         return Err("不足 4 字节 selector".to_string());
     }
-    loom_fuzz_oracle::input_from_calldata([0x33; 20], U256::ZERO, &bytes)
+    loom_fuzz_oracle::input_from_calldata([0x33; 20], value, &bytes)
         .map_err(|e| format!("规范化失败: {e}"))
+}
+
+/// 解析 `--seed-calldata` 项的 `@value` 后缀（缺省 0）：返回
+/// (hex, value)。fail-closed：多个 @ / 非十进制值如实报错。
+fn parse_seed_calldata(spec: &str) -> Result<(&str, U256), String> {
+    let Some((hex, wei)) = spec.split_once('@') else {
+        return Ok((spec, U256::ZERO));
+    };
+    if hex.is_empty() || wei.is_empty() || !wei.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("形态应为 <0x-hex>[@<wei-十进制>]: {spec:?}"));
+    }
+    let value: u128 = wei
+        .parse()
+        .map_err(|_| format!("value 超 u128 或非十进制: {spec:?}"))?;
+    Ok((hex, U256::from(value)))
 }
 
 /// 定长动态尾（len=4 + "loom" 前缀 32B 块）。**长度 = oracle
@@ -847,6 +872,22 @@ mod seed_base_tests {
         // fail-closed：非法 hex / 短 calldata。
         assert!(seed_calldata_input("0xzz").is_err());
         assert!(seed_calldata_input("0x0102").is_err());
+    }
+
+    #[test]
+    fn seed_calldata_at_value_suffix() {
+        // issue #41 TeamFinance：`<hex>@<wei>` 后缀解析（payable 前置步
+        // 的通用携带）；缺省 0；fail-closed。
+        let cd = "0xdeadbeef";
+        assert_eq!(parse_seed_calldata(cd).unwrap(), (cd, U256::ZERO));
+        let (hex, v) = parse_seed_calldata("0xdeadbeef@500000000000000000").unwrap();
+        assert_eq!(hex, "0xdeadbeef");
+        assert_eq!(v, U256::from(500000000000000000u128));
+        let input = seed_calldata_input_with_value(hex, v).unwrap();
+        assert_eq!(input.value, U256::from(500000000000000000u128));
+        assert!(parse_seed_calldata("0xdeadbeef@abc").is_err());
+        assert!(parse_seed_calldata("0xdeadbeef@@1").is_err());
+        assert!(parse_seed_calldata("@1").is_err());
     }
 
     #[test]
