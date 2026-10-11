@@ -205,3 +205,57 @@ fn poc_roundtrip_and_replay_with_entry() {
     let replayed = replay(&poc, &victim_code(), None).expect("replay 重建会话");
     assert_eq!(replayed.verdict, Verdict::Confirmed);
 }
+
+/// 搜索层多合约化（issue #57）：pool_seeds 预置非 victim 目标步
+/// （PROXY 代理 × 非命中 selector）+ func_table 探索带——搜索的
+/// 最优 witness 应含非 victim 目标步（代理步贡献转发 call，择优
+/// 窗口偏好之），confirmed 路径仍可达。
+#[test]
+fn pool_seeded_nonvictim_step_in_witness() {
+    let mut cfg = exec_config(
+        None,
+        vec![Deployment {
+            address: PROXY,
+            runtime: forwarder_runtime(VICTIM),
+        }],
+    );
+    cfg.max_steps = 3;
+    cfg.max_runs = 4000;
+    cfg.func_table = vec![0x1234abcd];
+    cfg.pool_seeds = vec![loom_fuzz_fuzz::Step {
+        target: PROXY,
+        input: Input {
+            selector: 0x1234abcd,
+            caller: [0x33; 20],
+            value: U256::ZERO,
+            head: vec![[0u8; 32]; 2],
+            tail: Tail::Empty,
+        },
+    }];
+    let hit = hit();
+    let view = VictimHit;
+    let target = Target {
+        hit: &view,
+        func: 0,
+    };
+    let session = run_targeted(
+        &cfg,
+        &target,
+        &[TxSequence::single(VICTIM, seed_input())],
+        &ValueDictionary { words: vec![] },
+    );
+    assert!(session.reached, "confirmed 路径须可达: {session:?}");
+    let witness = session.best_steps.clone().expect("reached 必有 witness");
+    assert!(
+        witness.steps.iter().any(|s| s.target == PROXY),
+        "最优 witness 应含非 victim 目标步（pool_seeds 预置素材被组装采用）: {witness:?}"
+    );
+    let calldatas: Vec<Vec<u8>> = witness.steps.iter().map(|s| calldata_of(&s.input)).collect();
+    let report = judge(&hit, &session, &calldatas);
+    assert_eq!(
+        report.verdict,
+        Verdict::Confirmed,
+        "reason: {}",
+        report.reason
+    );
+}
