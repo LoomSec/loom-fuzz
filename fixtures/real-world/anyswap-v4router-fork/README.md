@@ -36,10 +36,20 @@ loom-fuzz run --shard fixtures/real-world/anyswap-v4router-fork/anyswapv4router.
 # ② replay 判决一致
 loom-fuzz replay fixtures/real-world/anyswap-v4router-fork/poc-462530868-26.json \
   --code fixtures/real-world/anyswap-v4router-fork/AnyswapV4Router.bin-runtime
-
 # ③ L2 PoC 合成（fork profile：run.sh = anvil Bearer 代理 + forge test）
 loom-fuzz exploit fixtures/real-world/anyswap-v4router-fork/poc-462530868-26.json \
   --code fixtures/real-world/anyswap-v4router-fork/AnyswapV4Router.bin-runtime \
   --out /tmp/any-fork-l2 --fork
 cd /tmp/any-fork-l2 && bash run.sh   # [PASS] testExploit()
 ```
+
+## 钉环境复验（PR #59 后，issue #41 收尾）
+
+- ✅ 两个签入 poc（0xedbdf5e2 / 0x1b91a934）钉环境 replay 均维持
+  confirmed（arm1）——permit 定罪路径不依赖 block.timestamp，无退化。
+- ✅ 钉环境重搜（seed 2024，60k/300s，观察至 17 会话）：confirmed ×2
+  ——462530868 @21574（与签入 poc-462530868-26 同函数，确定性复现）
+  + 605930207 @208；其余会话 unreachable（预算耗尽，同形态）。
+  两轮独立运行逐行一致（rng 确定性）。注：确认 runs 数（21574/208）
+  与历史值（58/20 等）不同——旧 witness 出自 timestamp=0 环境，
+  钉块后搜索轨迹变化，属预期。

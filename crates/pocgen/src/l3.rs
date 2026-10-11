@@ -137,7 +137,12 @@ pub(crate) fn generate_l3(
             ("README.md".into(), readme_l3(fork)),
         ]
         .into_iter()
-        .chain(fork.then(|| ("run.sh".into(), run_sh(poc.fork.as_ref().map(|f| f.block_number)))))
+        .chain(fork.then(|| {
+            (
+                "run.sh".into(),
+                run_sh(poc.fork.as_ref().map(|f| f.block_number)),
+            )
+        }))
         .collect(),
     };
     artifacts.write(out_dir).map_err(PocgenError::Io)?;
@@ -331,20 +336,13 @@ fn attacker_sol(
         let _ = writeln!(attack_body, "        step{i}(); // 步 {i}（{tag}）");
         let _ = writeln!(step_fns, "\n    function step{i}() internal {{");
         step_fns.push_str(&r.decls);
-        let _ = writeln!(
-            step_fns,
-            "        bytes memory data{i} = {};",
-            r.data_expr
-        );
+        let _ = writeln!(step_fns, "        bytes memory data{i} = {};", r.data_expr);
         let _ = writeln!(
             step_fns,
             "        (bool ok{i}, ) = {}.call{{value: {}}}(data{i});",
             r.target, r.value
         );
-        let _ = writeln!(
-            step_fns,
-            "        require(ok{i}, \"L3 step {i} failed\");"
-        );
+        let _ = writeln!(step_fns, "        require(ok{i}, \"L3 step {i} failed\");");
         let _ = writeln!(step_fns, "    }}");
     }
     format!(

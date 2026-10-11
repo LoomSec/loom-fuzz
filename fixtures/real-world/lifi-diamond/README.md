@@ -177,3 +177,11 @@ loom-fuzz run \
 cmp 池偏移语义的指针修复算子），或 witness 字典补充真实攻击
 calldata 形态作为种子（fixture 层补法，合规）。
 
+
+## 钉环境复验（PR #59 后，issue #41 收尾）
+
+- ✅ 已签入 poc（0x01c0a31a arm3，poc-29401882-339）钉环境 replay
+  **维持 confirmed**（到场且臂 3 证据成立）。
+- ➖ 钉环境重搜（seed 42，60k/300s）：5 hits 全部 unreachable
+  （到场但证据谓词不成立 ×4 + 预算耗尽 ×1）——与 #46 文档盲搜
+  基线一致；coverage 0% 为既有现象。无退化。
