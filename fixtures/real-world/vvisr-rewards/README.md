@@ -28,6 +28,13 @@ Visor Finance **RewardsHypervisor**（vVISR 质押合约）——2021-12-21 被�
 golden 测试（`crates/cli/tests/golden.rs` + `crates/cli/tests/real_world.rs`）
 对拍这两种 pack 的双模式装载行集。
 
+## 钉环境复验（PR #59 后，issue #41 收尾）
+
+- ✅ 旧 confirmed poc（0x2e2d2984 arm1）钉环境 replay **维持
+  confirmed**——定罪路径不依赖 block.timestamp，无退化。
+- ✅ 钉环境重搜（seed 42，120s 预算）：confirmed 774711684
+  **@1230 runs，与旧环境逐字节一致**。
+
 ## 来源
 
 2026-10-08 从 BlockMachine `https://rpc-eth.blockmachine.io` 拉取

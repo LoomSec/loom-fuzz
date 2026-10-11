@@ -64,6 +64,27 @@ B=fixtures/real-world/teamfinance-locktoken
 
 ## 实测记录（如实）
 
+### 钉环境复验（PR #59 BlockEnv 钉 pin 块后，issue #41 收尾）
+
+- ✅ **migrate 多步 confirmed 达成**（钉 timestamp=1666855379）：
+  - seed 42：confirmed @3560 runs（poc-3094298278-62，3 步
+    [lock(0.5ETH), migrate, migrate(junk)]，有效 witness 前 2 步）。
+  - seed 2024：confirmed @4434 runs（2 步 [lock(0.5ETH), migrate]）。
+- ✅ **witness 语义健全**（forge 直接调试，pin 块 fork 态真实
+  proxy）：两个 seed 的 setup 步 lockToken 均真实成功——
+  unlockTime = **1666855384 = pin_ts + 5**（守卫比较把 pin 块
+  时间戳喂进 cmp 池，搜索把词推到 1.6e9 量级，裕量 5 秒）；
+  `Soundness` forge 测试 2/2 PASS（step0 成功 + step1 可执行）。
+- ⚠️ L3 pocgen 工程红灯（如实降级）：L3 模板把 impl 字节码
+  etch 到裸地址重放，无 proxy 部署态（initializer/owner/0x97/0xd8
+  标志槽），step0 在该环境 revert——**环境保真边界**，非 witness
+  语义问题（逐步 forge 验证已独立覆盖语义健全性）。价值断言
+  形态（LP 迁移非 ERC20 drain）亦是已知 L2/L3 边界。
+- ✅ 单步对照（--max-steps 1，seed 42）：migrate unreachable
+  （21038 runs）——多步必要性成立。
+
+### 历史记录（#52–#58 探索期，timestamp=0 旧环境）
+
 - ✅ 字节码/shard/族命中/witness 逐步执行（探针）：3 步序列
   `[lock ✓, extend ✓, migrate 到场 ✓(pc 8143 经过，后续 V3
   createPool revert——L1 定罪不需整笔成功)]`。
