@@ -35,11 +35,30 @@ use alloy_primitives::U256;
 use loom_fuzz_oracle::{hex_bytes, hex_u256, Poc, PocStep};
 
 use crate::synth::{
-    addr_expr, deploy_addr, encode_with_selector, head_arg_exprs, head_words_of, ierc20_sol,
-    mock_erc20_sol, parse_head_shape, render_deploy_etches, render_prestate_stores, u256_hex64,
-    vm_sol, ExploitParams, HeadShape, PocgenError, ProjectArtifacts, VictimModel, VM_ADDRESS,
+    addr_expr, deploy_addr, encode_with_selector, head_arg_exprs, head_words_of,
+    ierc20_sol, is_erc20_drain_call, mock_erc20_sol, parse_head_shape, render_deploy_etches,
+    render_prestate_stores, u256_hex64, vm_sol, ExploitParams, HeadShape, PocgenError,
+    ProjectArtifacts, VictimModel, VM_ADDRESS,
 };
 use crate::synth::{foundry_toml, run_sh, underlying_selector};
+
+/// payload 步的合成模式（issue #61）：
+/// - `Drain`：L2 同锚 ERC20 drain 注入（现行行为）。
+/// - `L1Only`：fork 直通下价值形态超出 ERC20 drain 模型——payload 照
+///   witness 原样重编码，终点断言仅 L1（诚实标注，不伪造绿灯）。
+enum PayloadMode {
+    Drain(PayloadPlan),
+    L1Only,
+}
+
+impl std::fmt::Debug for PayloadMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PayloadMode::Drain(plan) => f.debug_tuple("Drain").field(plan).finish(),
+            PayloadMode::L1Only => f.write_str("L1Only"),
+        }
+    }
+}
 
 /// 单步的渲染产物：目标地址表达式、value 字面量、data 表达式、
 /// 前置声明（request 等）。
@@ -48,9 +67,15 @@ struct StepRender {
     value: String,
     decls: String,
     data_expr: String,
+    /// L1-only 的 payload 步（issue #61）：结果如实 emit（StepOutcome
+    /// 事件），不作 `require(ok)` 硬断言——oracle L1 语义 = 到场 + 臂
+    /// 判定，不依赖整笔交易成功（臂后 revert 是合法收尾，同 replay
+    /// 模板哲学）。布置步恒为硬断言（真实环境布置必须成功）。
+    soft: bool,
 }
 
 /// payload 步（末步）的 L2 同锚分析结果：注入点 + 受害资产模型。
+#[derive(Debug)]
 struct PayloadPlan {
     target_slot: usize,
     tail_slot: Option<usize>,
@@ -80,13 +105,17 @@ pub(crate) fn generate_l3(
         ));
     }
     let evidence_input = hex_bytes(&call.input).map_err(PocgenError::BadPoc)?;
+    let mut evidence_target_arr = [0u8; 20];
+    evidence_target_arr.copy_from_slice(&evidence_target);
     let mut target_word = [0u8; 32];
     target_word[12..].copy_from_slice(&evidence_target);
     let evidence_target_word = U256::from_be_bytes(target_word);
 
-    // 逐步独立头形解析 + 表达式渲染（布置步 verbatim；末步 L2 注入）。
+    // 逐步独立头形解析 + 表达式渲染（布置步 verbatim；末步按价值
+    // 模型 applicability 分派：Drain 注入 / fork 直通 L1Only）。
     let last = steps.len() - 1;
     let mut model = VictimModel::Single;
+    let mut l1_only = false;
     let mut renders = Vec::with_capacity(steps.len());
     let mut total_value = U256::ZERO;
     for (i, step) in steps.iter().enumerate() {
@@ -104,9 +133,21 @@ pub(crate) fn generate_l3(
         let shape = parse_head_shape(&calldata)
             .map_err(|e| PocgenError::BadShape(format!("步 {i} 头形解析失败: {e}")))?;
         if i == last {
-            let plan = analyze_payload(&shape, evidence_target_word, &evidence_input, &calldata)?;
-            model = plan.model;
-            renders.push(render_payload_step(&shape, &plan, target_arr, value));
+            match plan_payload(&shape, evidence_target_word, &evidence_input, &calldata, fork)? {
+                PayloadMode::Drain(plan) => {
+                    model = plan.model;
+                    renders.push(render_payload_step(&shape, &plan, target_arr, value));
+                }
+                PayloadMode::L1Only => {
+                    // 价值形态超出 ERC20 drain 模型（issue #61）：payload
+                    // 照 witness 原样重编码（布置步同款渲染），终点断言
+                    // 仅 L1（诚实标注，不伪造绿灯）。
+                    l1_only = true;
+                    let mut r = render_setup_step(i, &shape, &calldata, target_arr, value)?;
+                    r.soft = true;
+                    renders.push(r);
+                }
+            }
         } else {
             renders.push(render_setup_step(i, &shape, &calldata, target_arr, value)?);
         }
@@ -114,7 +155,6 @@ pub(crate) fn generate_l3(
 
     let artifacts = ProjectArtifacts {
         files: vec![
-            ("src/MockERC20.sol".into(), mock_erc20_sol()),
             ("src/IERC20.sol".into(), ierc20_sol()),
             ("src/Vm.sol".into(), vm_sol()),
             (
@@ -131,12 +171,16 @@ pub(crate) fn generate_l3(
                     contract,
                     model,
                     total_value,
+                    fork,
+                    l1_only,
+                    evidence_target_arr,
                 ),
             ),
             ("foundry.toml".into(), foundry_toml(fork)),
-            ("README.md".into(), readme_l3(fork)),
+            ("README.md".into(), readme_l3(fork, l1_only)),
         ]
         .into_iter()
+        .chain((!l1_only).then(|| ("src/MockERC20.sol".into(), mock_erc20_sol())))
         .chain(fork.then(|| {
             (
                 "run.sh".into(),
@@ -148,6 +192,66 @@ pub(crate) fn generate_l3(
     artifacts.write(out_dir).map_err(PocgenError::Io)?;
     let summary = crate::project::forge_test(out_dir, fork, poc.fork.as_ref())?;
     Ok((out_dir.to_path_buf(), summary))
+}
+
+/// payload 步计划（issue #61）：先判价值模型 applicability（零个案
+/// 机械锚点），再跑结构 eligibility（与 synth.rs 单步路径逐条一致的
+/// L2 同锚检查）。
+///
+/// 价值模型锚点（三选一即适用）：
+/// 1. 臂 3 转发尾在场（动态尾解释 + 定罪证据子串）——注入 = 请求
+///    本体；
+/// 2. 定罪呼出 selector == `underlying()`（pegged 探针，issue #28）；
+/// 3. 定罪呼出形状 == ERC20 transfer/transferFrom（臂 1 证据即盗窃
+///    调用本体）。
+///
+/// 均不满足 = 价值形态超出 ERC20 drain 模型（如 TeamFinance migrate
+/// 的 V3 仓位迁移形态）：fork 直通 → `L1Only`（payload verbatim + 仅
+/// L1 断言，诚实标注不伪造绿灯）；Genesis 无链上环境可直通 →
+/// BadShape 如实降级。模型适用但结构 eligibility 失败（目标槽歧义 /
+/// 臂 3 过滤 / 零词注入点不足）：fork → `L1Only` fail-soft；Genesis →
+/// BadShape（现行行为不回归）。
+fn plan_payload(
+    shape: &HeadShape,
+    evidence_target_word: U256,
+    evidence_input: &[u8],
+    calldata: &[u8],
+    fork: bool,
+) -> Result<PayloadMode, PocgenError> {
+    // 动态尾解释先经定罪证据门槛（与 analyze_payload 同语义：
+    // 定罪呼出 input 是 payload calldata 的子串才算转发证据）。
+    let mut tail_slot = shape.tail_slot;
+    if tail_slot.is_some() {
+        let forwarded = !evidence_input.is_empty()
+            && evidence_input.len() <= calldata.len()
+            && calldata
+                .windows(evidence_input.len())
+                .any(|w| w == evidence_input);
+        if !forwarded {
+            tail_slot = None;
+        }
+    }
+    let value_model = tail_slot.is_some()
+        || evidence_input
+            .first_chunk::<4>()
+            .is_some_and(|sel| u32::from_be_bytes(*sel) == underlying_selector())
+        || is_erc20_drain_call(evidence_input);
+    if !value_model {
+        return if fork {
+            Ok(PayloadMode::L1Only)
+        } else {
+            Err(PocgenError::BadShape(
+                "价值形态超出 ERC20 drain 模型（payload 无臂 3 转发尾；定罪呼出非 drain/underlying 探针形）；Genesis 态如实降级（fork 直通下将降级为仅 L1 断言）".to_string(),
+            ))
+        };
+    }
+    match analyze_payload(shape, evidence_target_word, evidence_input, calldata) {
+        Ok(plan) => Ok(PayloadMode::Drain(plan)),
+        // 模型在场但结构 eligibility 失败：fork 直通fail-soft 到 L1Only
+        // （payload verbatim 仍可重放）；Genesis 维持 BadShape。
+        Err(_) if fork => Ok(PayloadMode::L1Only),
+        Err(e) => Err(e),
+    }
 }
 
 /// payload 步的 L2 同锚 eligibility（与 synth.rs 单步路径逐条一致）：
@@ -262,6 +366,7 @@ fn render_setup_step(
         value: value.to_string(),
         decls: String::new(),
         data_expr,
+        soft: false,
     })
 }
 
@@ -294,6 +399,7 @@ fn render_payload_step(
         value: value.to_string(),
         decls,
         data_expr,
+        soft: false,
     }
 }
 
@@ -324,9 +430,14 @@ fn attacker_sol(
     }
     let mut attack_body = String::new();
     let mut step_fns = String::new();
+    let mut soft_used = false;
     for (i, r) in renders.iter().enumerate() {
         let tag = if i == renders.len() - 1 {
-            "payload（L2 同锚注入）"
+            if r.soft {
+                "payload（witness 原样重编码——价值形态超出 ERC20 模型，仅 L1 断言）"
+            } else {
+                "payload（L2 同锚注入）"
+            }
         } else {
             "setup（witness 原样重编码）"
         };
@@ -337,14 +448,34 @@ fn attacker_sol(
         let _ = writeln!(step_fns, "\n    function step{i}() internal {{");
         step_fns.push_str(&r.decls);
         let _ = writeln!(step_fns, "        bytes memory data{i} = {};", r.data_expr);
-        let _ = writeln!(
-            step_fns,
-            "        (bool ok{i}, ) = {}.call{{value: {}}}(data{i});",
-            r.target, r.value
-        );
-        let _ = writeln!(step_fns, "        require(ok{i}, \"L3 step {i} failed\");");
+        if r.soft {
+            // L1-only payload（issue #61）：结果如实 emit，不作硬断言
+            // （oracle L1 语义不依赖整笔成功；臂后 revert 合法）。
+            soft_used = true;
+            let _ = writeln!(
+                step_fns,
+                "        (bool ok{i}, bytes memory ret{i}) = {}.call{{value: {}}}(data{i});",
+                r.target, r.value
+            );
+            let _ = writeln!(
+                step_fns,
+                "        emit StepOutcome({i}, ok{i}, ret{i});"
+            );
+        } else {
+            let _ = writeln!(
+                step_fns,
+                "        (bool ok{i}, ) = {}.call{{value: {}}}(data{i});",
+                r.target, r.value
+            );
+            let _ = writeln!(step_fns, "        require(ok{i}, \"L3 step {i} failed\");");
+        }
         let _ = writeln!(step_fns, "    }}");
     }
+    let outcome_event = if soft_used {
+        "\n    /// L1-only payload 步结果（issue #61）：如实呈现，不作硬断言。\n    event StepOutcome(uint256 step, bool ok, bytes returndata);\n"
+    } else {
+        ""
+    };
     format!(
         r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
@@ -355,15 +486,17 @@ import {{IERC20}} from "./IERC20.sol";
 /// witness = 调用序列（poc.json steps，issue #35）：attack() 按序
 /// 逐步 target.call{{value: v}}(data)——data 由各步 witness calldata
 /// 头形解析后经 abi 编码重新表达（非硬编码裸字节串；payload 步的
-/// 槽替换 = L2 同锚的价值注入）。构造器收 victim 地址 + 受害资产
-/// mock + 在场合约表（poc.json deployments，issue #34）。
+/// 槽替换 = L2 同锚的价值注入，价值形态超出 ERC20 模型时 payload
+/// 照 witness 原样重编码、结果经 StepOutcome 如实 emit——issue #61）。
+/// 构造器收 victim 地址 + 受害资产/臂证据资产 + 在场合约表
+/// （poc.json deployments，issue #34）。
 contract Attacker {{
     address private immutable router; // victim（分析合约）
-    address private immutable asset; // 受害资产 mock（L2 同锚注入对象）
+    address private immutable asset; // 受害资产 mock / 臂证据资产（L2 同锚注入对象）
 {fields}
     address private constant ATTACKER = {attacker};
     uint256 private constant BALANCE = {balance};
-
+{outcome_event}
     constructor({ctor_params}) {{
 {ctor_body}    }}
 
@@ -375,9 +508,20 @@ contract Attacker {{
     )
 }
 
-/// L3 测试体（机械合成）：布置（L2 同锚资产模型 + 目标/在场合约表
-/// etch + prestate/前提槽）→ 部署 Attacker → attack() → 终点断言
-///（每个受害资产的 ROUTER 持仓严格归零）。
+/// L3 测试体（机械合成）：布置（资产模型 + 目标/在场合约表布置 +
+/// prestate/前提槽）→ 部署 Attacker → attack() → 终点断言。
+///
+/// 终点断言两形态（issue #61，机械分派非个案）：
+/// - Drain（默认）：L2 同锚——每个受害资产的 ROUTER 持仓严格归零。
+/// - L1Only（fork 直通 + 价值形态超出 ERC20 drain 模型）：布置步真实
+///   成功（硬断言）+ payload 步结果由 Attacker 如实 emit（不作硬断言
+///   ——oracle L1 语义不依赖整笔成功）；臂证据资产的受害地址余额变化
+///   经 AffectedAssetBalance 事件展示，**价值断言局限如实标注**。
+///
+/// fork 直通（issue #61）：fork 态**不 etch 分析对象**——真链上状态
+/// （pin 块）即执行环境，proxy 部署态（initializer/owner/标志槽）自然
+/// 在场；poc.json 的 deployments（fuzz 期部署的应答/代理合约）链上
+/// 不在场，仍逐字 etch（既有逻辑）。
 #[allow(clippy::too_many_arguments)]
 fn l3_test_sol(
     prestate: &[(U256, U256)],
@@ -387,6 +531,9 @@ fn l3_test_sol(
     contract: [u8; 20],
     model: VictimModel,
     total_value: U256,
+    fork: bool,
+    l1_only: bool,
+    evidence_asset: [u8; 20],
 ) -> String {
     let router = addr_expr(contract);
     let attacker = format!(
@@ -398,35 +545,67 @@ fn l3_test_sol(
         }))
         .trim_start_matches('0')
     );
-    let (victim_setup, victim_asserts) = match model {
-        VictimModel::Single => (
-            "        MockERC20 token = new MockERC20(address(0));\n        token.mint(ROUTER, BALANCE);\n".to_string(),
-            "        require(\n            token.balanceOf(ROUTER) == 0,\n            string.concat(\"L3: token holding not drained: \", _toString(token.balanceOf(ROUTER)))\n        );\n".to_string(),
-        ),
-        VictimModel::Pegged => (
-            "        MockERC20 underlyingAsset = new MockERC20(address(0));\n        MockERC20 token = new MockERC20(address(underlyingAsset));\n        token.mint(ROUTER, BALANCE);\n        underlyingAsset.mint(ROUTER, BALANCE);\n".to_string(),
-            "        require(\n            token.balanceOf(ROUTER) == 0,\n            string.concat(\"L3: token holding not drained: \", _toString(token.balanceOf(ROUTER)))\n        );\n        require(\n            underlyingAsset.balanceOf(ROUTER) == 0,\n            string.concat(\"L3: underlying holding not drained: \", _toString(underlyingAsset.balanceOf(ROUTER)))\n        );\n".to_string(),
-        ),
-    };
-    let mut allowance_stores = String::new();
-    allowance_stores.push_str(
-        "        vm.store(\n            address(token),\n            keccak256(abi.encode(ROUTER, keccak256(abi.encode(ROUTER, uint256(1))))),\n            bytes32(BALANCE)\n        );\n",
-    );
-    if model == VictimModel::Pegged {
-        allowance_stores.push_str(
-            "        vm.store(\n            address(underlyingAsset),\n            keccak256(abi.encode(ROUTER, keccak256(abi.encode(ROUTER, uint256(1))))),\n            bytes32(BALANCE)\n        );\n",
+    let (victim_setup, victim_asserts, ctor_asset, allowance_stores, l1_event, l1_before) =
+        if l1_only {
+            // L1-only：无受害资产 mock（不伪造价值环境）；ASSET = 臂证据
+            // 受影响资产（真链上地址），其受害地址余额变化仅作证据
+            // 展示（emit），不作硬断言——诚实标注价值断言局限。
+            (
+                String::new(),
+                "        uint256 balanceAfter = IERC20(ASSET).balanceOf(ROUTER);\n        emit AffectedAssetBalance(ASSET, balanceBefore, balanceAfter);\n".to_string(),
+                addr_expr(evidence_asset),
+                String::new(),
+                "    /// L1-only（issue #61）证据事件：臂证据受影响资产的受害\n    /// 地址余额变化——展示用，不作硬断言（诚实标注，不伪造绿灯）。\n    event AffectedAssetBalance(address asset, uint256 beforeBalance, uint256 afterBalance);\n\n".to_string(),
+                "        uint256 balanceBefore = IERC20(ASSET).balanceOf(ROUTER);\n".to_string(),
+            )
+        } else {
+            let (setup, asserts) = match model {
+                VictimModel::Single => (
+                    "        MockERC20 token = new MockERC20(address(0));\n        token.mint(ROUTER, BALANCE);\n".to_string(),
+                    "        require(\n            token.balanceOf(ROUTER) == 0,\n            string.concat(\"L3: token holding not drained: \", _toString(token.balanceOf(ROUTER)))\n        );\n".to_string(),
+                ),
+                VictimModel::Pegged => (
+                    "        MockERC20 underlyingAsset = new MockERC20(address(0));\n        MockERC20 token = new MockERC20(address(underlyingAsset));\n        token.mint(ROUTER, BALANCE);\n        underlyingAsset.mint(ROUTER, BALANCE);\n".to_string(),
+                    "        require(\n            token.balanceOf(ROUTER) == 0,\n            string.concat(\"L3: token holding not drained: \", _toString(token.balanceOf(ROUTER)))\n        );\n        require(\n            underlyingAsset.balanceOf(ROUTER) == 0,\n            string.concat(\"L3: underlying holding not drained: \", _toString(underlyingAsset.balanceOf(ROUTER)))\n        );\n".to_string(),
+                ),
+            };
+            let mut allowance = String::new();
+            allowance.push_str(
+                "        vm.store(\n            address(token),\n            keccak256(abi.encode(ROUTER, keccak256(abi.encode(ROUTER, uint256(1))))),\n            bytes32(BALANCE)\n        );\n",
+            );
+            if model == VictimModel::Pegged {
+                allowance.push_str(
+                    "        vm.store(\n            address(underlyingAsset),\n            keccak256(abi.encode(ROUTER, keccak256(abi.encode(ROUTER, uint256(1))))),\n            bytes32(BALANCE)\n        );\n",
+                );
+            }
+            (setup, asserts, "address(token)".to_string(), allowance, String::new(), String::new())
+        };
+    let mut stores = render_prestate_stores(prestate);
+    if !l1_only {
+        stores
+            .push_str("        // VICTIM_ASSET 作为 service 的 registry 成员布置（价值影响前提）。\n");
+        stores.push_str(
+            "        vm.store(ROUTER, keccak256(abi.encode(address(token), uint256(0))), bytes32(uint256(1)));\n",
         );
     }
-    let mut stores = render_prestate_stores(prestate);
-    stores
-        .push_str("        // VICTIM_ASSET 作为 service 的 registry 成员布置（价值影响前提）。\n");
-    stores.push_str(
-        "        vm.store(ROUTER, keccak256(abi.encode(address(token), uint256(0))), bytes32(uint256(1)));\n",
-    );
     stores.push_str(&render_deploy_etches(deployments));
 
-    // 在场合约表地址 = 构造实参（机械逐个）。
-    let mut ctor_args = String::from("ROUTER, address(token)");
+    // 目标合约布置：Genesis = etch poc.json 字节码；fork 直通 = 不
+    // etch（真链上状态即环境——proxy 部署态自然在场，issue #61）。
+    let etch_line = if fork {
+        "        // fork 直通（issue #61）：不 etch 分析对象——真链上状态（pin 块）\n        // 即执行环境；proxy 部署态（initializer/owner/标志槽）自然在场。\n        // （Genesis 态才 etch poc.json 字节码。）\n".to_string()
+    } else {
+        format!("        vm.etch(ROUTER, hex\"{code_hex}\");\n")
+    };
+    let asset_const = if l1_only {
+        format!("    address constant ASSET = {};\n", addr_expr(evidence_asset))
+    } else {
+        String::new()
+    };
+
+    // 构造实参：受害资产 mock（Drain）/ 臂证据资产（L1Only）+ 在场合
+    // 约表地址（机械逐个）。
+    let mut ctor_args = format!("ROUTER, {ctor_asset}");
     for d in deployments {
         let _ = write!(ctor_args, ", {}", addr_expr(deploy_addr(d)));
     }
@@ -435,39 +614,58 @@ fn l3_test_sol(
     } else {
         String::new()
     };
+    let l1_annotation = if l1_only {
+        "        // L1-only 终点断言（issue #61）：价值形态超出 ERC20 drain 模型\n        // （payload 无臂 3 转发尾；定罪呼出非 drain/underlying 探针形）——\n        // 终点断言仅 L1 层：布置步真实成功（proxy 部署态在场的证据，\n        // 硬断言）+ payload 步可执行（结果由 Attacker 的 StepOutcome\n        // 如实 emit，臂后 revert 合法——oracle L1 语义不依赖整笔成功）。\n        // 价值断言：形态超出 ERC20 模型，仅 L1（fail-soft 如实标注）。\n"
+    } else {
+        ""
+    };
+    // L1Only 无受害资产 mock：MockERC20 文件与 import 同步缺席（不伪造
+    // 价值环境——终点断言仅 L1 的如实标注由工程形态本身承载）。
+    let mock_import = if l1_only {
+        ""
+    } else {
+        "import {MockERC20} from \"../src/MockERC20.sol\";\n"
+    };
+    let setup_comment = if l1_only {
+        "        // 资产模型：L1-only 无受害资产 mock——不伪造价值环境（issue #61）。\n"
+    } else {
+        "        // 资产模型（L2 同锚）：受害资产全额 mint 给 ROUTER。\n"
+    };
+    let final_assert_comment = if l1_only {
+        "        // 价值断言：形态超出 ERC20 模型，仅 L1——余额变化仅作证据 emit。\n"
+    } else {
+        "        // 终点断言（L2 同锚）：每个受害资产的 ROUTER 持仓严格归零。\n"
+    };
 
     format!(
         r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import {{MockERC20}} from "../src/MockERC20.sol";
-import {{Attacker}} from "../src/Attacker.sol";
+{mock_import}import {{Attacker}} from "../src/Attacker.sol";
 import {{Vm}} from "../src/Vm.sol";
 
 /// L3 exploit PoC（loom-fuzz-pocgen 机械合成，勿手改——重生成覆盖）。
 ///
-/// witness = 调用序列（poc.json steps）：布置（L2 同锚资产模型 +
-/// 目标/在场合约表 etch + prestate/前提槽）→ 部署攻击合约（构造器
-/// 收 victim + 受害资产 + 在场合约表）→ attacker.attack() 按序重放
-/// → 终点断言 = 每个受害资产的 ROUTER 持仓严格归零（与 L2 同锚）。
+/// witness = 调用序列（poc.json steps）：布置（资产模型 + 目标/在场
+/// 合约表布置 + prestate/前提槽）→ 部署攻击合约（构造器收 victim +
+/// 受害资产/臂证据资产 + 在场合约表）→ attacker.attack() 按序重放
+/// → 终点断言（Drain = 每个受害资产的 ROUTER 持仓严格归零，L2 同锚；
+/// L1Only = 仅 L1 层断言 + 价值断言局限如实标注，issue #61）。
 contract PoC {{
     Vm constant vm = Vm({VM_ADDRESS});
     address constant ROUTER = {router};
     address constant ATTACKER = {attacker};
     uint256 constant BALANCE = {balance};
-
+{asset_const}{l1_event}
     function testExploit() public {{
-        // 资产模型（L2 同锚）：受害资产全额 mint 给 ROUTER。
-{victim_setup}
-        // 目标合约：poc.json 的运行时字节码 + prestate/在场合约表布置。
-        vm.etch(ROUTER, hex"{code_hex}");
-{stores}{allowance_stores}
-        // 攻击合约：构造器收 victim 地址 + 受害资产 + 在场合约表。
+{setup_comment}{victim_setup}
+        // 目标合约布置：Genesis = etch 字节码；fork 直通 = 真链上状态。
+{etch_line}{stores}{allowance_stores}
+        // 攻击合约：构造器收 victim 地址 + 受害资产/臂证据资产 + 在场合约表。
         Attacker attacker = new Attacker({ctor_args});
-{deal_line}        attacker.attack();
+{deal_line}{l1_annotation}{l1_before}        attacker.attack();
 
-        // 终点断言（L2 同锚）：每个受害资产的 ROUTER 持仓严格归零。
-{victim_asserts}    }}
+{final_assert_comment}{victim_asserts}    }}
 
     function _toString(uint256 v) internal pure returns (string memory) {{
         if (v == 0) return "0";
@@ -491,7 +689,7 @@ contract PoC {{
 }
 
 /// L3 工程 README。
-fn readme_l3(fork: bool) -> String {
+fn readme_l3(fork: bool, l1_only: bool) -> String {
     let mut s = String::new();
     s.push_str(
         r#"# loom-fuzz exploit PoC（L3 多步攻击层，issue #36）
@@ -511,23 +709,49 @@ forge test          # 字节码模式（默认，离线）
 ## 结构
 
 - `src/Attacker.sol`：机械合成的攻击合约（构造器收 victim + 受害
-  资产 + 在场合约表；attack() 序列驱动）。
+  资产/臂证据资产 + 在场合约表；attack() 序列驱动）。
 - `src/MockERC20.sol`：受害资产（槽布局钉死：balanceOf = slot 0、
-  allowance = slot 1——vm.store 机械公式的依据）。
-- `test/PoC.t.sol`：布置（etch + prestate + 前提槽）→ 部署 Attacker
-  → attack() → 终点断言（每个受害资产的 ROUTER 持仓归零）。
+  allowance = slot 1——vm.store 机械公式的依据）。L1-only 工程无此
+  文件（无受害资产 mock）。
+- `test/PoC.t.sol`：布置 → 部署 Attacker → attack() → 终点断言。
 
 "#,
     );
     if fork {
         s.push_str(
-            r#"## fork 模式（BlockMachine）
+            r#"## fork 直通模式（BlockMachine，issue #61）
+
+fork 态**不 etch 分析对象**：真链上状态（pin 块）即执行环境——
+proxy 部署态（initializer/owner/标志槽）自然在场（Genesis 态把 impl
+字节码 etch 到裸地址重放，无部署态存储，真实函数路径走不通）。
+poc.json 的 deployments（fuzz 期部署的应答/代理合约）链上不在场，
+仍逐字 etch。
 
 ```sh
 export BLOCKMACHINE_RPC_URL=...
 export BLOCKMACHINE_API_KEY=...    # 空 = 直接无 key 连接（免费档）
 ./run.sh
 ```
+
+"#,
+        );
+    }
+    if l1_only {
+        s.push_str(
+            r#"## L1-only 终点断言（issue #61，诚实标注）
+
+**价值断言：形态超出 ERC20 模型，仅 L1。** payload 步的损害形态
+无法落入 ERC20 transfer/transferFrom drain 模型（无臂 3 转发尾；
+定罪呼出非 drain/underlying 探针形——如 LP 迁移/V3 仓位类），终点
+断言降级为 L1 层（fail-soft 但有明确标注，不伪造绿灯）：
+
+- 布置步（setup）全部真实成功 = **硬断言**（fork 直通下证明 proxy
+  部署态在场、环境保真）。
+- payload 步结果经 `Attacker.StepOutcome` 事件如实 emit，**不作硬
+  断言**——oracle L1 语义 = 到场 + 臂判定，不依赖整笔交易成功
+  （臂后 revert 是到场路径的合法收尾）。
+- 臂证据受影响资产（`ASSET` = 定罪呼出目标）的受害地址余额变化经
+  `AffectedAssetBalance` 事件展示，仅供参考，不作价值断言。
 "#,
         );
     }
@@ -622,6 +846,234 @@ mod tests {
                 let _ = write!(s, "{x:02x}");
                 s
             })
+    }
+
+    /// 固长头 helper：selector + 词列（U256）。
+    fn fixed_calldata(selector: u32, words: &[U256]) -> Vec<u8> {
+        let mut cd = selector.to_be_bytes().to_vec();
+        for w in words {
+            cd.extend_from_slice(&w.to_be_bytes::<32>());
+        }
+        cd
+    }
+
+    fn addr_word_arr(a: [u8; 20]) -> U256 {
+        let mut w = [0u8; 32];
+        w[12..].copy_from_slice(&a);
+        U256::from_be_bytes(w)
+    }
+
+    const SINK_ADDR: [u8; 20] = [0x11; 20];
+
+    /// issue #61 同形 poc：步0 布置（2 词固长头），步1 payload（5 词
+    /// 固长头，无动态尾），定罪呼出由调用方给（只读探针 / drain 形
+    /// 两用）。TeamFinance migrate 的机械同形：payload 宽头 +
+    /// 臂 1 证据。
+    fn tf_shape_poc(evidence_input: Vec<u8>) -> Poc {
+        let step0 = fixed_calldata(0xdeadbeef, &[U256::from(0x51u64), U256::from(0xc0deu64)]);
+        let step1 = fixed_calldata(
+            0xdeadbeef,
+            &[
+                U256::from(0x67u64),
+                addr_word_arr(SINK_ADDR),
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+            ],
+        );
+        Poc {
+            format: POC_FORMAT.to_string(),
+            digest: "0x00".into(),
+            selector: "0xdeadbeef".into(),
+            step: 0,
+            pc: 0,
+            verdict: "confirmed".into(),
+            steps: vec![
+                loom_fuzz_oracle::PocStep {
+                    target: "0x2222222222222222222222222222222222222222".into(),
+                    caller: "0x3333333333333333333333333333333333333333".into(),
+                    value: word64(0),
+                    calldata: format!("0x{}", hex_str(&step0)),
+                },
+                loom_fuzz_oracle::PocStep {
+                    target: "0x2222222222222222222222222222222222222222".into(),
+                    caller: "0x3333333333333333333333333333333333333333".into(),
+                    value: word64(0),
+                    calldata: format!("0x{}", hex_str(&step1)),
+                },
+            ],
+            tx: None,
+            prestate: Default::default(),
+            responses: vec![],
+            seed: 42,
+            max_runs: 100,
+            time_budget_secs: 300,
+            evidence_value: None,
+            fork: None,
+            deployments: vec![],
+            entry: None,
+            contract: Some("0x2222222222222222222222222222222222222222".into()),
+            family: loom_fuzz_oracle::HitFamily::ArbitraryCall,
+            call: Some(PocCall {
+                target: loom_fuzz_oracle::bytes_hex(&SINK_ADDR),
+                input: format!("0x{}", hex_str(&evidence_input)),
+            }),
+            replay: String::new(),
+        }
+    }
+
+    /// 只读探针形定罪呼出：balanceOf(address)（TeamFinance migrate
+    /// 证据的机械同形）——非 drain/underlying 探针，payload 无转发尾。
+    fn balance_of_probe() -> Vec<u8> {
+        let mut input = 0x70a08231u32.to_be_bytes().to_vec();
+        input.extend_from_slice(&U256::from(0x22u64).to_be_bytes::<32>());
+        input
+    }
+
+    #[test]
+    fn l3_fork_l1_only_beyond_erc20_value_shape() {
+        // issue #61：fork 直通 + 价值形态超出 ERC20 drain 模型 →
+        // L1Only（payload verbatim + 仅 L1 断言 + 诚实标注）。
+        let poc = tf_shape_poc(balance_of_probe());
+        let steps = poc.normalized_steps().unwrap();
+        let call = poc.call.as_ref().unwrap();
+        let etw = addr_word_arr(SINK_ADDR);
+        let evidence_input = hex_bytes(&call.input).unwrap();
+        let calldata = hex_bytes(&steps[1].calldata).unwrap();
+        let shape = parse_head_shape(&calldata).unwrap();
+        // 价值模型 applicability：balanceOf 探针不落入任何锚点。
+        assert!(!is_erc20_drain_call(&evidence_input));
+        assert!(
+            matches!(
+                plan_payload(&shape, etw, &evidence_input, &calldata, true),
+                Ok(PayloadMode::L1Only)
+            ),
+            "fork 直通下应 L1Only fail-soft"
+        );
+        // Genesis 态同形：BadShape 如实降级（无链上环境可直通）。
+        let err = plan_payload(&shape, etw, &evidence_input, &calldata, false).unwrap_err();
+        assert!(
+            format!("{err}").contains("超出 ERC20 drain 模型"),
+            "Genesis 应 BadShape: {err}"
+        );
+
+        // 渲染层：fork 直通不 etch 分析对象；L1Only 无 mock、payload
+        // verbatim、仅 L1 断言 + 局限标注。
+        let body = l3_test_sol(
+            &[],
+            "6000",
+            &ExploitParams::default(),
+            &[],
+            ROUTER_ADDRESS,
+            VictimModel::Single,
+            U256::ZERO,
+            true,  // fork
+            true,  // l1_only
+            SINK_ADDR,
+        );
+        assert!(!body.contains("vm.etch(ROUTER"), "fork 直通不 etch: {body}");
+        assert!(
+            body.contains("形态超出 ERC20 模型，仅 L1"),
+            "局限如实标注: {body}"
+        );
+        assert!(
+            body.contains("AffectedAssetBalance"),
+            "受影响资产余额变化证据事件: {body}"
+        );
+        assert!(!body.contains("new MockERC20"), "L1Only 无受害资产 mock");
+        assert!(
+            body.contains(&format!(
+                "address constant ASSET = {}",
+                addr_expr(SINK_ADDR)
+            )),
+            "ASSET = 臂证据受影响资产: {body}"
+        );
+        // payload verbatim：witness 原词重编码，无 ERC20 注入。
+        let attacker = attacker_sol(
+            &[
+                render_setup_step(0, &shape, &calldata, [0x22; 20], U256::ZERO).unwrap(),
+                {
+                    let mut r =
+                        render_setup_step(1, &shape, &calldata, [0x22; 20], U256::ZERO).unwrap();
+                    r.soft = true;
+                    r
+                },
+            ],
+            &ExploitParams::default(),
+            &[],
+        );
+        assert!(attacker.contains("StepOutcome"), "payload 结果如实 emit");
+        assert!(
+            !attacker.contains("require(ok1"),
+            "L1Only payload 不作硬断言: {attacker}"
+        );
+        assert!(
+            attacker.contains("require(ok0"),
+            "布置步仍硬断言（真实环境布置必须成功）: {attacker}"
+        );
+        assert!(
+            !attacker.contains("address(asset)"),
+            "payload verbatim 无槽替换注入: {attacker}"
+        );
+    }
+
+    #[test]
+    fn l3_fork_drain_shape_keeps_injection_without_etch() {
+        // issue #61 回归锚：价值模型在场（定罪呼出 = transferFrom
+        // drain 形）时 fork 直通仍走 Drain 注入——只是不 etch 分析对象。
+        let sel = {
+            use sha3::{Digest, Keccak256};
+            let mut h = Keccak256::new();
+            h.update(b"transferFrom(address,address,uint256)");
+            u32::from_be_bytes(h.finalize()[..4].try_into().unwrap())
+        };
+        let drain_evidence = fixed_calldata(
+            sel,
+            &[
+                addr_word_arr([0x22; 20]),
+                addr_word_arr([0xbe; 20]),
+                U256::from(100u64),
+            ],
+        );
+        assert!(is_erc20_drain_call(&drain_evidence));
+        let poc = tf_shape_poc(drain_evidence);
+        let steps = poc.normalized_steps().unwrap();
+        let calldata = hex_bytes(&steps[1].calldata).unwrap();
+        let shape = parse_head_shape(&calldata).unwrap();
+        let evidence_input = hex_bytes(&poc.call.as_ref().unwrap().input).unwrap();
+        let mode = plan_payload(
+            &shape,
+            addr_word_arr(SINK_ADDR),
+            &evidence_input,
+            &calldata,
+            true,
+        )
+        .unwrap();
+        let plan = match mode {
+            PayloadMode::Drain(plan) => plan,
+            PayloadMode::L1Only => panic!("drain 形证据应走 Drain 注入"),
+        };
+        assert_eq!(plan.target_slot, 1);
+        let r = render_payload_step(&shape, &plan, [0x22; 20], U256::ZERO);
+        assert!(r.data_expr.contains("address(asset)"), "槽替换保留: {}", r.data_expr);
+        // fork 直通：Drain 工程同样不 etch 分析对象。
+        let body = l3_test_sol(
+            &[],
+            "6000",
+            &ExploitParams::default(),
+            &[],
+            ROUTER_ADDRESS,
+            plan.model,
+            U256::ZERO,
+            true,  // fork
+            false, // l1_only
+            SINK_ADDR,
+        );
+        assert!(!body.contains("vm.etch(ROUTER"), "fork 直通不 etch: {body}");
+        assert!(
+            body.contains("token.balanceOf(ROUTER) == 0"),
+            "Drain 终点断言保留: {body}"
+        );
     }
 
     #[test]
