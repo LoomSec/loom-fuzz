@@ -250,7 +250,11 @@ fn pool_seeded_nonvictim_step_in_witness() {
         witness.steps.iter().any(|s| s.target == PROXY),
         "最优 witness 应含非 victim 目标步（pool_seeds 预置素材被组装采用）: {witness:?}"
     );
-    let calldatas: Vec<Vec<u8>> = witness.steps.iter().map(|s| calldata_of(&s.input)).collect();
+    let calldatas: Vec<Vec<u8>> = witness
+        .steps
+        .iter()
+        .map(|s| calldata_of(&s.input))
+        .collect();
     let report = judge(&hit, &session, &calldatas);
     assert_eq!(
         report.verdict,
