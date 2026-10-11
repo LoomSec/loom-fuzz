@@ -84,6 +84,7 @@
 //! 红灯 / forge 缺失 → typed error 带输出（fail-closed）。
 
 mod l3;
+mod profit;
 mod project;
 mod synth;
 
