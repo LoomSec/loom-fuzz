@@ -259,11 +259,13 @@ pub(crate) fn execute(
             step_cap,
             targets,
             hit_selector,
+            None,
         ),
         Some(fork) => {
             let key = std::env::var("BLOCKMACHINE_API_KEY").unwrap_or_default();
             let remote =
                 crate::fork::ForkDb::shared(fork, &key).expect("CLI 已校验 fork 连通性（契约内）");
+            let pinned = remote.pinned();
             execute_on(
                 cfg,
                 CacheDB::new(revm::database_interface::WrapDatabaseRef(remote)),
@@ -271,6 +273,7 @@ pub(crate) fn execute(
                 step_cap,
                 targets,
                 hit_selector,
+                Some(pinned),
             )
         }
     }
@@ -284,6 +287,7 @@ fn execute_on<DB: revm::DatabaseRef>(
     step_cap: u64,
     targets: &[u32],
     hit_selector: u32,
+    pinned: Option<crate::fork::PinnedBlock>,
 ) -> RunResult {
     // 合约账户（固定布置，不走 create 交易）。
     db.insert_account_info(
@@ -325,14 +329,21 @@ fn execute_on<DB: revm::DatabaseRef>(
         );
     }
 
-    let ctx: CtxFor<DB> =
-        Context::mainnet()
-            .with_db(db)
-            .modify_cfg_chained(|cfg_env: &mut CfgEnv| {
-                cfg_env.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
-                cfg_env.disable_nonce_check = true;
-                cfg_env.disable_balance_check = true;
-            });
+    let ctx: CtxFor<DB> = Context::mainnet()
+        .with_db(db)
+        .modify_cfg_chained(|cfg_env: &mut CfgEnv| {
+            cfg_env.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
+            cfg_env.disable_nonce_check = true;
+            cfg_env.disable_balance_check = true;
+        })
+        .modify_block_chained(|block_env: &mut revm::context::BlockEnv| {
+            if let Some(p) = &pinned {
+                // fork 态钉块环境（时间戳/块号）——与 pin 状态同源的
+                // 确定性（fork.rs PinnedBlock 注释的 TeamFinance 实跑）。
+                block_env.timestamp = U256::from(p.timestamp);
+                block_env.number = U256::from(p.number);
+            }
+        });
 
     let mut evm = ctx.build_mainnet_with_inspector(WitnessInspector::new(step_cap));
 
