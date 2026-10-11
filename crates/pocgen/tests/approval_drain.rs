@@ -90,6 +90,7 @@ fn deputy_poc(input: Vec<u8>) -> Poc {
             target: bytes_hex(&TOKEN),
             input: bytes_hex(&input),
         }),
+        trace_calls: Vec::new(),
         replay: String::new(),
     }
 }

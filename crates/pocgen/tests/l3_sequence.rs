@@ -397,6 +397,7 @@ fn two_step_poc_json() -> Poc {
             target: loom_fuzz_oracle::bytes_hex(&SINK),
             input: format!("0x{}", hex(b"loom")),
         }),
+        trace_calls: Vec::new(),
         replay: String::new(),
     }
 }

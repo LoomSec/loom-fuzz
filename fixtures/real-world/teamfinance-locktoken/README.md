@@ -126,3 +126,20 @@ selector 的 pc 空间过滤—— witness 步的 selector 与 hit selector
 - `TeamFinanceLockToken-impl.bin-runtime` / `teamfinance-impl.lst`：分析/执行对象（实现）。
 - `seed-*.hex`：三步语料（cast calldata 机械编码）。
 - `address.txt`：proxy 地址。
+
+### 价值影响层（PR #64，issue #64 通用设计——禁止 case-by-case）
+
+- ✅ **L3 fork 直通工程 forge 绿灯**：`exploit poc --fork` 生成
+  ProfitTest——witness 逐字重放（prank witness caller）× 受益槽
+  候选注入（payload 头词 address 形词逐候选 fresh fork 试执行）×
+  三族资产级 delta 断言（ERC20 balanceOf / ETH 余额 / ERC721
+  ownerOf）。实测（seed 2024 migrate poc，13 条 trace 资产清单）：
+  `CandidateTried(profit: true, "ETH:recipient-balance")`——
+  重放中协议向 witness caller（0x3333…33）净流入 > 0.5 ETH
+  （lock 0.5 ETH 支出后的净正流入）；其余资产逐资产
+  `AssetUnaffected` 标注。run.sh pin 块 fork 下 1/1 PASS。
+- ✅ 逐资产标注分支同样实测：旧 poc（无 trace_calls，清单退化
+  为定罪目标单资产）+ 无获利候选 = 红灯 + 全程 Candidate*/
+  AssetUnaffected 标注（诚实，不伪造绿灯）。
+- 生成工程见 `/tmp/tf-profit-l3b`（绿灯）/ `/tmp/tf-profit-l3`
+  （标注分支，均临时目录，重生成可复现）。

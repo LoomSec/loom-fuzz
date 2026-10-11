@@ -95,6 +95,12 @@ pub(crate) fn generate_l3(
     contract: [u8; 20],
     params: &ExploitParams,
 ) -> Result<(std::path::PathBuf, String), PocgenError> {
+    // 价值影响层（issue #64）：fork 直通 = 资产清单 × 受益槽候选 ×
+    // 三族 delta 断言（替代 #61 的整体 L1-only——逐资产标注为缺省
+    // 形态）。Genesis 态维持 L2 同锚 mock 模型（无链上资产可测）。
+    if fork {
+        return generate_l3_profit(poc, steps, out_dir, contract);
+    }
     let call = poc.call.as_ref().ok_or_else(|| {
         PocgenError::BadShape("旧 poc 无定罪呼出（#20 前格式）——目标槽不可机械定位".to_string())
     })?;
@@ -198,6 +204,69 @@ pub(crate) fn generate_l3(
     artifacts.write(out_dir).map_err(PocgenError::Io)?;
     let summary = crate::project::forge_test(out_dir, fork, poc.fork.as_ref())?;
     Ok((out_dir.to_path_buf(), summary))
+}
+
+/// 价值影响层 fork 直通工程（issue #64）：witness 逐字重放 × 受益槽
+/// 候选注入 × 三族资产级 delta 断言。机械四元组，零个案：
+/// 资产清单来自 trace ∪ 定罪目标，受益槽 = payload 头词 address 形
+/// 词，获利族 = ERC20/ETH/ERC721 标准接口探测，取不到的逐资产标注。
+fn generate_l3_profit(
+    poc: &Poc,
+    steps: &[PocStep],
+    out_dir: &Path,
+    contract: [u8; 20],
+) -> Result<(std::path::PathBuf, String), PocgenError> {
+    let fork = poc
+        .fork
+        .as_ref()
+        .ok_or_else(|| PocgenError::BadPoc("价值影响层须 fork 直通（poc.fork 在场）".into()))?;
+    if steps.is_empty() {
+        return Err(PocgenError::BadPoc("steps 为空（契约外形态）".into()));
+    }
+    let last = steps.len() - 1;
+    let calldata = hex_bytes(&steps[last].calldata).map_err(PocgenError::BadPoc)?;
+    let shape = parse_head_shape(&calldata)
+        .map_err(|e| PocgenError::BadShape(format!("payload 步头形解析失败: {e}")))?;
+    if crate::profit::recipient_of(poc).is_none() {
+        return Err(PocgenError::BadPoc(
+            "payload 末步 caller 非 20 字节（受益人不可机械定位）".into(),
+        ));
+    }
+    let artifacts = ProjectArtifacts {
+        files: vec![
+            ("src/IERC20.sol".into(), ierc20_sol()),
+            ("src/IERC721.sol".into(), crate::profit::ierc721_sol()),
+            ("src/Vm.sol".into(), vm_sol()),
+            (
+                "test/ProfitTest.sol".into(),
+                crate::profit::profit_test_sol(poc, &shape, &calldata, contract),
+            ),
+            ("foundry.toml".into(), foundry_toml(true)),
+            ("README.md".into(), readme_profit()),
+            ("run.sh".into(), run_sh(Some(fork.block_number))),
+        ],
+    };
+    artifacts.write(out_dir).map_err(PocgenError::Io)?;
+    let summary = crate::project::forge_test(out_dir, true, Some(fork))?;
+    Ok((out_dir.to_path_buf(), summary))
+}
+
+/// 价值影响层 README（issue #64）。
+fn readme_profit() -> String {
+    r#"# L3 价值影响层 PoC（issue #64，pocgen 机械合成）
+
+判别原则：本工程永远合成"调用序列 + 槽注入 + delta 断言"，
+不从"协议怎么被偷"出发；协议特定语义只从 witness 本身读。
+
+- `test/ProfitTest.sol`：每受益槽候选一次 fresh fork，prank
+  逐字重放 witness（payload 词[slot] := RECIPIENT），三族
+  （ERC20 balanceOf delta / ETH 余额 delta / ERC721 ownerOf
+  翻转）资产级断言。
+- 取不到的资产逐资产 `AssetUnaffected` 标注（诚实，不伪造
+  绿灯）；无候选产生获利 = 红灯 + 全程标注。
+- `bash run.sh`（pin 块 fork，anvil Bearer 通路）。
+"#
+    .to_string()
 }
 
 /// payload 步计划（issue #61）：先判价值模型 applicability（零个案
@@ -855,6 +924,7 @@ mod tests {
                 target: sink.into(),
                 input: format!("0x{}", hex_str(&call_input)),
             }),
+            trace_calls: Vec::new(),
             replay: String::new(),
         };
         (poc, step1)
@@ -938,6 +1008,7 @@ mod tests {
                 target: loom_fuzz_oracle::bytes_hex(&SINK_ADDR),
                 input: format!("0x{}", hex_str(&evidence_input)),
             }),
+            trace_calls: Vec::new(),
             replay: String::new(),
         }
     }

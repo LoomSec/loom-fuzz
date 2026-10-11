@@ -83,6 +83,11 @@ pub struct Poc {
     /// 的形状依据；旧 poc 无此字段（None）= 形状不可用。
     #[serde(default)]
     pub call: Option<PocCall>,
+    /// 到场 run 的完整呼出 trace（#64 价值影响层的机械资产清单
+    /// 来源：trace 触及地址 ∪ 定罪呼出目标）；旧 poc 无此字段 =
+    /// 清单退化为仅定罪呼出目标。
+    #[serde(default)]
+    pub trace_calls: Vec<PocCall>,
     /// 手写 replay 命令串（含本文件名）。
     pub replay: String,
 }
@@ -326,6 +331,17 @@ pub fn build_poc(
             target: bytes_hex(&witness.evidence_call.target),
             input: bytes_hex(&witness.evidence_call.input),
         }),
+        // 价值影响层资产清单（issue #64）：到场 run 的完整呼出
+        // trace——机械集合，不含任何协议语义。
+        trace_calls: witness
+            .trace
+            .calls
+            .iter()
+            .map(|c| PocCall {
+                target: bytes_hex(&c.target),
+                input: bytes_hex(&c.input),
+            })
+            .collect(),
         replay,
     })
 }
