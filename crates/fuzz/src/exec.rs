@@ -83,6 +83,17 @@ pub struct ExecConfig {
     /// sound 近似）。
     #[serde(default)]
     pub guard_writers: Vec<u32>,
+    /// 多合约探索函数表（issue #57）：shard 函数表 selector 集
+    /// （装载端去重）。组装算子的探索带从中取 selector——合约表
+    /// 任成员 × 函数表任 selector（对标 Echidna/Foundry invariant
+    /// 的跨合约调用序列；制导正交：写者权重优先，探索步用函数表）。
+    #[serde(default)]
+    pub func_table: Vec<u32>,
+    /// 预置步级池素材（issue #57）：装载端生成的 ABI 基座种子步
+    /// （合约表成员 × 函数表，经 random_input 按函数头宽填形）——
+    /// 会话起步即有多合约步素材，非 victim 函数无需等运行见样。
+    #[serde(default)]
+    pub pool_seeds: Vec<loom_fuzz_seed::Step>,
     /// 支配 guard 上下文（revert 归因用；装载端经 xlayer 渲染 cond）。
     #[serde(default)]
     pub guard_context: Vec<GuardContext>,
@@ -401,6 +412,7 @@ pub fn run_targeted_with(
                     guard_writers: &cfg.guard_writers,
                     seed_writers: &seed_writers,
                     seed_targets: &seed_targets,
+                    func_table: &cfg.func_table,
                     head_len_hint,
                     dict,
                     consts: &consts,
@@ -498,7 +510,7 @@ impl<'a> Session<'a> {
         let contract_table = std::iter::once(cfg.address)
             .chain(cfg.deployments.iter().map(|d| d.address))
             .collect();
-        Session {
+        let mut session = Session {
             cfg,
             table,
             hit_selector,
@@ -517,7 +529,16 @@ impl<'a> Session<'a> {
             contract_table,
             step_pool: Vec::new(),
             step_pool_keys: BTreeSet::new(),
+        };
+        // 预置步级池素材（issue #57）：装载端的多合约函数基座种子
+        // （合约表成员 × 函数表）——会话起步即有非 victim 步素材，
+        // 配对/前置/拼接立即可用（去重键与运行时入池同规则）。
+        for step in &cfg.pool_seeds {
+            if session.step_pool_keys.insert(step.sort_key()) {
+                session.step_pool.push(step.clone());
+            }
         }
+        session
     }
 
     /// 反馈切片：corpus（全史 fitness 最优、去重）+ 最近窗口，截
@@ -727,6 +748,49 @@ impl<'a> Session<'a> {
 mod tests {
     use super::*;
 
+    /// issue #57：pool_seeds 预置步级池——Session::new 起步即有多
+    /// 合约函数基座素材（含非 victim 目标步），配对/前置立即可用。
+    #[test]
+    fn pool_seeds_prefill_step_pool() {
+        let table = DistanceTable::new(&[0x5b, 0x00], &[0]);
+        let non_victim = [0xaau8; 20];
+        let seed_step = loom_fuzz_seed::Step {
+            target: non_victim,
+            input: Input {
+                selector: 0x1234abcd,
+                caller: [0x33; 20],
+                value: U256::ZERO,
+                head: vec![[0u8; 32]; 4],
+                tail: loom_fuzz_seed::Tail::Empty,
+            },
+        };
+        let cfg = ExecConfig {
+            code: vec![0x5b, 0x00],
+            address: [0x22; 20],
+            prestate: Default::default(),
+            seed_rng: 1,
+            max_runs: 0,
+            time_budget: Duration::from_secs(1),
+            gas_per_tx: 100_000,
+            run_baseline: false,
+            fork: None,
+            deployments: Vec::new(),
+            entry: None,
+            max_steps: 3,
+            dynamic_head_evidence: false,
+            guard_slots: Vec::new(),
+            guard_writers: Vec::new(),
+            func_table: vec![0x1234abcd],
+            pool_seeds: vec![seed_step.clone()],
+            guard_context: Vec::new(),
+        };
+        let session = Session::new(&cfg, &table, 0, 1);
+        assert!(
+            session.step_pool.contains(&seed_step),
+            "pool_seeds 应预置进步级池"
+        );
+    }
+
     /// 最小可命中目标：字节码首字节即 JUMPDEST，target = [0]，
     /// 任何输入都命中——验证环路与报告语义。
     #[test]
@@ -761,6 +825,8 @@ mod tests {
             dynamic_head_evidence: false,
             guard_slots: Vec::new(),
             guard_writers: Vec::new(),
+            func_table: Vec::new(),
+            pool_seeds: Vec::new(),
             guard_context: Vec::new(),
         };
         let seeds = vec![TxSequence::single(
@@ -818,6 +884,8 @@ mod tests {
             dynamic_head_evidence: false,
             guard_slots: Vec::new(),
             guard_writers: Vec::new(),
+            func_table: Vec::new(),
+            pool_seeds: Vec::new(),
             guard_context: Vec::new(),
         };
         let report = run_targeted(&cfg, &target, &[], &ValueDictionary { words: vec![] });

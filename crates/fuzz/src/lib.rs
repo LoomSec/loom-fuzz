@@ -155,5 +155,6 @@ pub use fork::{
     forwarder_runtime, pin_block, responder_runtime, responder_runtime_sender, ForkConfig, ForkDb,
 };
 pub use loom_fuzz_seed::{HitView, Input, Step, Tail, Target, TxSequence, ValueDictionary};
+pub use mutate::random_input;
 pub use propose::DictionaryProposer;
 pub use rng::Rng;

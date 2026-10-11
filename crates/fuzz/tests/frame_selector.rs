@@ -119,6 +119,8 @@ fn cfg(code: &[u8]) -> ExecConfig {
         dynamic_head_evidence: false,
         guard_slots: Vec::new(),
         guard_writers: Vec::new(),
+        func_table: Vec::new(),
+        pool_seeds: Vec::new(),
         guard_context: Vec::new(),
     }
 }

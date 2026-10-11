@@ -464,6 +464,8 @@ pub fn replay(
         dynamic_head_evidence: false,
         guard_slots: Vec::new(),
         guard_writers: Vec::new(),
+        func_table: Vec::new(),
+        pool_seeds: Vec::new(),
         // replay 不经搜索层（判决独立）；guard 上下文不参与重放。
         guard_context: Vec::new(),
     };
@@ -605,6 +607,8 @@ mod tests {
             dynamic_head_evidence: false,
             guard_slots: Vec::new(),
             guard_writers: Vec::new(),
+            func_table: Vec::new(),
+            pool_seeds: Vec::new(),
             guard_context: Vec::new(),
         };
         (report, cfg)

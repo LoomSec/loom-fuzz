@@ -98,6 +98,11 @@ pub(crate) struct Tuning {
     /// （issue #54 辅助制导：below(denom) == 0 → 换；空守卫写者集
     /// 不消耗投掷）。**纯 tuning，改它跑回归**。
     pub guard_writer_step_denom: u64,
+    /// append 随机填充步换用多合约探索函数表 selector 的概率分母
+    /// （issue #57：below(denom) == 0 → 从 shard 函数表取任
+    /// selector——合约表任成员 × 函数表任 selector 的探索步；
+    /// 空函数表不消耗投掷）。**纯 tuning，改它跑回归**。
+    pub seq_explore_denom: u64,
 }
 
 /// 生产调参值（唯一实例；不要散写魔法数——改这里并跑回归）。
@@ -134,4 +139,5 @@ pub(crate) const TUNING: Tuning = Tuning {
     legacy_caller_denom: 10,
     guard_write_credit: 8,
     guard_writer_step_denom: 5,
+    seq_explore_denom: 4,
 };
