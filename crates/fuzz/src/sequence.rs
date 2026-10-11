@@ -50,6 +50,9 @@ pub(crate) struct AssembleCtx<'a> {
     pub dynamic_head: bool,
     /// 目标 selector（随机填充步用）。
     pub selector: u32,
+    /// 守卫写者 selector 集（issue #54 辅助制导：append 随机填充步
+    /// 以 TUNING.guard_writer_step_denom 概率换用其一；空 = 关闭）。
+    pub guard_writers: &'a [u32],
     /// head 槽数提示（随机填充步用）。
     pub head_len_hint: usize,
     /// 值字典（随机填充步用）。
@@ -169,12 +172,24 @@ fn append(rng: &mut Rng, proposed: &Input, src: &Sources<'_>, ctx: &AssembleCtx<
     let input = if rng.below(2) == 0 {
         src.random_step(rng)
             .map(|st| st.input)
-            .unwrap_or_else(|| random_input(rng, ctx.selector, ctx.head_len_hint, Some(ctx.dict)))
+            .unwrap_or_else(|| fill_step(rng, ctx))
     } else {
-        random_input(rng, ctx.selector, ctx.head_len_hint, Some(ctx.dict))
+        fill_step(rng, ctx)
     };
     seq.steps.push(Step { target, input });
     seq
+}
+
+/// 追加步的随机填充输入：以 TUNING.guard_writer_step_denom 概率
+/// 换用守卫写者 selector（issue #54 辅助制导——布置步直接打守卫
+/// 写者函数）；守卫写者集为空时不消耗投掷，逐位等价旧行为。
+fn fill_step(rng: &mut Rng, ctx: &AssembleCtx<'_>) -> Input {
+    let mut selector = ctx.selector;
+    if !ctx.guard_writers.is_empty() && rng.below(crate::tuning::TUNING.guard_writer_step_denom) == 0
+    {
+        selector = ctx.guard_writers[rng.below(ctx.guard_writers.len() as u64) as usize];
+    }
+    random_input(rng, selector, ctx.head_len_hint, Some(ctx.dict))
 }
 
 /// splice：两个不同素材序列拼接（素材不足时退化为素材 +
@@ -238,6 +253,7 @@ mod tests {
             max_steps,
             dynamic_head: false,
             selector: 0xdeadbeef,
+            guard_writers: &[],
             head_len_hint: 1,
             dict: &EMPTY_DICT,
             consts: &[],
@@ -380,5 +396,29 @@ mod tests {
             assemble(&mut rng, input(9), &feedback, &c)
         };
         assert_eq!(run(42), run(42));
+    }
+
+    /// issue #54 辅助制导：append 随机填充步以
+    /// 1/TUNING.guard_writer_step_denom 概率换用守卫写者 selector。
+    #[test]
+    fn guard_writers_bias_fill_steps() {
+        let guard_writers = vec![0x1111_1111, 0x2222_2222];
+        let ctx = AssembleCtx {
+            guard_writers: &guard_writers,
+            ..ctx(4, &TABLE)
+        };
+        let feedback = vec![fb(TxSequence::single([0x22; 20], input(1)), 1)];
+        let mut hits = 0usize;
+        for seed in 0..200u64 {
+            let mut rng = Rng::new(seed);
+            let s = assemble(&mut rng, input(9), &feedback, &ctx);
+            if s.steps
+                .iter()
+                .any(|st| guard_writers.contains(&st.input.selector))
+            {
+                hits += 1;
+            }
+        }
+        assert!(hits > 0, "守卫写者 selector 应出现在追加步中");
     }
 }

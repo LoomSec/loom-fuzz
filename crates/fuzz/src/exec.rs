@@ -383,6 +383,7 @@ pub fn run_targeted_with(
                     max_steps: cfg.max_steps,
                     dynamic_head: cfg.dynamic_head_evidence,
                     selector: target.hit.selector(),
+                    guard_writers: &cfg.guard_writers,
                     head_len_hint,
                     dict,
                     consts: &consts,

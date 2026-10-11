@@ -89,6 +89,10 @@ pub(crate) struct Tuning {
     /// run 距离减该值——setup 步进入进化信用。依据：单块距离量级
     /// 的几分之一，多步累积可反超——**纯 tuning，改它跑回归**。
     pub guard_write_credit: u32,
+    /// append 追加随机填充步时换用守卫写者 selector 的概率分母
+    /// （issue #54 辅助制导：below(denom) == 0 → 换；空守卫写者集
+    /// 不消耗投掷）。**纯 tuning，改它跑回归**。
+    pub guard_writer_step_denom: u64,
 }
 
 /// 生产调参值（唯一实例；不要散写魔法数——改这里并跑回归）。
@@ -123,4 +127,5 @@ pub(crate) const TUNING: Tuning = Tuning {
     legacy_tail_len_cap: 64,
     legacy_caller_denom: 10,
     guard_write_credit: 8,
+    guard_writer_step_denom: 5,
 };
