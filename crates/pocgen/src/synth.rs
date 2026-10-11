@@ -197,7 +197,7 @@ pub fn select_action(poc: &Poc) -> Result<HarmfulAction, PocgenError> {
 /// 盗窃调用本体时，drain 注入模型成立；只读探针（balanceOf 等）不在
 /// 其列（价值形态超出 ERC20 模型，如实降级）。
 pub(crate) fn is_erc20_drain_call(input: &[u8]) -> bool {
-    if input.len() < 4 || (input.len() - 4) % 32 != 0 {
+    if input.len() < 4 || !(input.len() - 4).is_multiple_of(32) {
         return false;
     }
     let selector = u32::from_be_bytes(input[..4].try_into().expect("len≥4"));
@@ -1593,7 +1593,8 @@ mod tests {
     }
 
     #[test]
-    fn underlying_selector_is_keccak() {        // 与真实 AnyswapV4Router 探针一致（4byte: underlying() =
+    fn underlying_selector_is_keccak() {
+        // 与真实 AnyswapV4Router 探针一致（4byte: underlying() =
         // 0x6f307dc3）——pegged 双 mock 模型的机械判定锚点。
         assert_eq!(underlying_selector(), 0x6f307dc3);
     }

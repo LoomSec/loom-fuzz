@@ -35,8 +35,8 @@ use alloy_primitives::U256;
 use loom_fuzz_oracle::{hex_bytes, hex_u256, Poc, PocStep};
 
 use crate::synth::{
-    addr_expr, deploy_addr, encode_with_selector, head_arg_exprs, head_words_of,
-    ierc20_sol, is_erc20_drain_call, mock_erc20_sol, parse_head_shape, render_deploy_etches,
+    addr_expr, deploy_addr, encode_with_selector, head_arg_exprs, head_words_of, ierc20_sol,
+    is_erc20_drain_call, mock_erc20_sol, parse_head_shape, render_deploy_etches,
     render_prestate_stores, u256_hex64, vm_sol, ExploitParams, HeadShape, PocgenError,
     ProjectArtifacts, VictimModel, VM_ADDRESS,
 };
@@ -133,7 +133,13 @@ pub(crate) fn generate_l3(
         let shape = parse_head_shape(&calldata)
             .map_err(|e| PocgenError::BadShape(format!("步 {i} 头形解析失败: {e}")))?;
         if i == last {
-            match plan_payload(&shape, evidence_target_word, &evidence_input, &calldata, fork)? {
+            match plan_payload(
+                &shape,
+                evidence_target_word,
+                &evidence_input,
+                &calldata,
+                fork,
+            )? {
                 PayloadMode::Drain(plan) => {
                     model = plan.model;
                     renders.push(render_payload_step(&shape, &plan, target_arr, value));
@@ -457,10 +463,7 @@ fn attacker_sol(
                 "        (bool ok{i}, bytes memory ret{i}) = {}.call{{value: {}}}(data{i});",
                 r.target, r.value
             );
-            let _ = writeln!(
-                step_fns,
-                "        emit StepOutcome({i}, ok{i}, ret{i});"
-            );
+            let _ = writeln!(step_fns, "        emit StepOutcome({i}, ok{i}, ret{i});");
         } else {
             let _ = writeln!(
                 step_fns,
@@ -578,12 +581,20 @@ fn l3_test_sol(
                     "        vm.store(\n            address(underlyingAsset),\n            keccak256(abi.encode(ROUTER, keccak256(abi.encode(ROUTER, uint256(1))))),\n            bytes32(BALANCE)\n        );\n",
                 );
             }
-            (setup, asserts, "address(token)".to_string(), allowance, String::new(), String::new())
+            (
+                setup,
+                asserts,
+                "address(token)".to_string(),
+                allowance,
+                String::new(),
+                String::new(),
+            )
         };
     let mut stores = render_prestate_stores(prestate);
     if !l1_only {
-        stores
-            .push_str("        // VICTIM_ASSET 作为 service 的 registry 成员布置（价值影响前提）。\n");
+        stores.push_str(
+            "        // VICTIM_ASSET 作为 service 的 registry 成员布置（价值影响前提）。\n",
+        );
         stores.push_str(
             "        vm.store(ROUTER, keccak256(abi.encode(address(token), uint256(0))), bytes32(uint256(1)));\n",
         );
@@ -598,7 +609,10 @@ fn l3_test_sol(
         format!("        vm.etch(ROUTER, hex\"{code_hex}\");\n")
     };
     let asset_const = if l1_only {
-        format!("    address constant ASSET = {};\n", addr_expr(evidence_asset))
+        format!(
+            "    address constant ASSET = {};\n",
+            addr_expr(evidence_asset)
+        )
     } else {
         String::new()
     };
@@ -626,6 +640,12 @@ fn l3_test_sol(
     } else {
         "import {MockERC20} from \"../src/MockERC20.sol\";\n"
     };
+    // L1Only 的余额证据事件用 IERC20（ASSET 余额快照）。
+    let ierc20_import = if l1_only {
+        "import {IERC20} from \"../src/IERC20.sol\";\n"
+    } else {
+        ""
+    };
     let setup_comment = if l1_only {
         "        // 资产模型：L1-only 无受害资产 mock——不伪造价值环境（issue #61）。\n"
     } else {
@@ -641,7 +661,7 @@ fn l3_test_sol(
         r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-{mock_import}import {{Attacker}} from "../src/Attacker.sol";
+{mock_import}{ierc20_import}import {{Attacker}} from "../src/Attacker.sol";
 import {{Vm}} from "../src/Vm.sol";
 
 /// L3 exploit PoC（loom-fuzz-pocgen 机械合成，勿手改——重生成覆盖）。
@@ -967,8 +987,8 @@ mod tests {
             ROUTER_ADDRESS,
             VictimModel::Single,
             U256::ZERO,
-            true,  // fork
-            true,  // l1_only
+            true, // fork
+            true, // l1_only
             SINK_ADDR,
         );
         assert!(!body.contains("vm.etch(ROUTER"), "fork 直通不 etch: {body}");
@@ -981,6 +1001,10 @@ mod tests {
             "受影响资产余额变化证据事件: {body}"
         );
         assert!(!body.contains("new MockERC20"), "L1Only 无受害资产 mock");
+        assert!(
+            body.contains("import {IERC20} from \"../src/IERC20.sol\";"),
+            "L1Only 余额证据需 IERC20: {body}"
+        );
         assert!(
             body.contains(&format!(
                 "address constant ASSET = {}",
@@ -1055,7 +1079,11 @@ mod tests {
         };
         assert_eq!(plan.target_slot, 1);
         let r = render_payload_step(&shape, &plan, [0x22; 20], U256::ZERO);
-        assert!(r.data_expr.contains("address(asset)"), "槽替换保留: {}", r.data_expr);
+        assert!(
+            r.data_expr.contains("address(asset)"),
+            "槽替换保留: {}",
+            r.data_expr
+        );
         // fork 直通：Drain 工程同样不 etch 分析对象。
         let body = l3_test_sol(
             &[],
