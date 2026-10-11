@@ -299,7 +299,7 @@ pub fn run_targeted_with(
 
     // 制导会话。常量池（字典 ∪ PUSH 立即数）会话级构建一次。
     let consts = const_pool(&cfg.code, dict);
-    let mut session = Session::new(cfg, &table, cfg.seed_rng);
+    let mut session = Session::new(cfg, &table, target.hit.selector(), cfg.seed_rng);
     let head_len_hint = seeds
         .iter()
         .flat_map(|s| s.steps.iter())
@@ -392,7 +392,12 @@ pub fn run_targeted_with(
     // 无种子、无制导、无字典（静态知识也不给，最严格对照）。基线
     // 恒为单步随机序列（max_steps 只放开制导侧的序列组装）。
     if cfg.run_baseline {
-        let mut baseline = Session::new(cfg, &table, cfg.seed_rng ^ 0x5DEE_CE66_1BAD_BEE5);
+        let mut baseline = Session::new(
+            cfg,
+            &table,
+            target.hit.selector(),
+            cfg.seed_rng ^ 0x5DEE_CE66_1BAD_BEE5,
+        );
         while !baseline.reached && baseline.budget_left() {
             let input = random_input(
                 baseline.rng_mut(),
@@ -427,6 +432,9 @@ struct Evaluated {
 struct Session<'a> {
     cfg: &'a ExecConfig,
     table: &'a DistanceTable,
+    /// 目标帧 selector（帧归属检查，issue #53；u32::MAX = fallback
+    /// 命中跳过检查）。
+    hit_selector: u32,
     rng: Rng,
     deadline: Instant,
     runs: u64,
@@ -458,13 +466,14 @@ struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    fn new(cfg: &'a ExecConfig, table: &'a DistanceTable, seed: u64) -> Self {
+    fn new(cfg: &'a ExecConfig, table: &'a DistanceTable, hit_selector: u32, seed: u64) -> Self {
         let contract_table = std::iter::once(cfg.address)
             .chain(cfg.deployments.iter().map(|d| d.address))
             .collect();
         Session {
             cfg,
             table,
+            hit_selector,
             rng: Rng::new(seed),
             deadline: Instant::now() + cfg.time_budget,
             runs: 0,
@@ -578,16 +587,21 @@ impl<'a> Session<'a> {
         }
         self.runs += 1;
         let targets = self.table.targets();
-        let result = evm::execute(self.cfg, seq, crate::tuning::TUNING.step_cap, &targets);
+        let result = evm::execute(
+            self.cfg,
+            seq,
+            crate::tuning::TUNING.step_cap,
+            &targets,
+            self.hit_selector,
+        );
         // 观测入池（去重有上限）：比较操作数 → 算子 1，SLOAD 键值
         // 对 → 算子 4。
         self.pools.absorb(&result);
         let fitness = self.table.fitness(result.visited_pcs.iter().copied());
         self.push_feedback(&result, seq, fitness);
-        let hit_now = result
-            .visited_pcs
-            .iter()
-            .any(|&pc| self.table.is_target(pc));
+        // 命中 = 帧归属过滤后的真到场（issue #53：pc 数值跨函数
+        // 重叠的假到场不算）。
+        let hit_now = result.arrival.is_some();
         let evaluated = Evaluated {
             seq: seq.clone(),
             fitness,

@@ -33,6 +33,9 @@ pub(crate) struct RunResult {
     pub trace: WitnessTrace,
     /// fitness 计算所需的 visited pcs（各步并集，有序去重）。
     pub visited_pcs: Vec<u32>,
+    /// 到达步下标（帧归属过滤后的真到场，issue #53；None = 未到
+    /// 达或仅假到场）。Session 的命中判定据此。
+    pub arrival: Option<usize>,
     /// 本 run 观测到的比较操作数对（LT/GT/SLT/SGT/EQ，step 时栈顶
     /// 两元；ISZERO 不收——单操作数，无回灌价值）。
     pub cmp_observed: Vec<[U256; 2]>,
@@ -221,17 +224,29 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
 /// 共享缓存) 叠层——overlay（合约/prestate/deployments/caller）照旧
 /// 写 CacheDB 本地，miss 时按 pin block 远程读（on-demand，任何深度）。
 ///
-/// `targets` = 目标 pc 集合（排序）：定位**到达步**——trace.truncated
-/// 只计到达步及其之前的截断（之后的步不影响已成立的到场见证，如实
-/// 不夸大 inconclusive）。
+/// `targets` = 目标 pc 集合（排序）；`hit_selector` = 目标帧的函数
+/// selector（**帧归属检查**，issue #53）：到达步 = 首个 visited ∩
+/// targets ≠ ∅ **且该步顶层 calldata 的 selector == hit_selector** 的
+/// 步——pc 数值跨函数重叠（同合约多函数/多合约）的"假到场"不计。
+/// `u32::MAX` 哨兵 = 无 selector 的 fallback 命中，跳过检查（既有
+/// 行为）。trace.truncated 只计到达步及其之前的截断（之后的步不
+/// 影响已成立的到场见证，如实不夸大 inconclusive）。
 pub(crate) fn execute(
     cfg: &ExecConfig,
     seq: &TxSequence,
     step_cap: u64,
     targets: &[u32],
+    hit_selector: u32,
 ) -> RunResult {
     match &cfg.fork {
-        None => execute_on(cfg, CacheDB::new(EmptyDB::new()), seq, step_cap, targets),
+        None => execute_on(
+            cfg,
+            CacheDB::new(EmptyDB::new()),
+            seq,
+            step_cap,
+            targets,
+            hit_selector,
+        ),
         Some(fork) => {
             let key = std::env::var("BLOCKMACHINE_API_KEY").unwrap_or_default();
             let remote =
@@ -242,6 +257,7 @@ pub(crate) fn execute(
                 seq,
                 step_cap,
                 targets,
+                hit_selector,
             )
         }
     }
@@ -254,6 +270,7 @@ fn execute_on<DB: revm::DatabaseRef>(
     seq: &TxSequence,
     step_cap: u64,
     targets: &[u32],
+    hit_selector: u32,
 ) -> RunResult {
     // 合约账户（固定布置，不走 create 交易）。
     db.insert_account_info(
@@ -378,9 +395,14 @@ fn execute_on<DB: revm::DatabaseRef>(
 
     // 到达步 = 首个 visited 含目标 pc 的步；截断如实只计到达步及
     // 之前（之后步的截断不动摇已成立的到场见证）。
+    // 到达步 = 首个 visited ∩ targets ≠ ∅ 且帧归属一致（该步顶层
+    // calldata selector == hit_selector；u32::MAX 哨兵跳过检查）的步
+    // ——pc 数值跨函数重叠的假到场不算到场（issue #53）。
     let arrival = step_visited
         .iter()
         .position(|pcs| pcs.iter().any(|pc| targets.contains(pc)));
+    let arrival = arrival
+        .filter(|&k| hit_selector == u32::MAX || seq.steps[k].input.selector == hit_selector);
     let truncated = match arrival {
         Some(k) => step_truncs[..=k].iter().any(|t| *t),
         None => step_truncs.iter().any(|t| *t),
@@ -400,6 +422,7 @@ fn execute_on<DB: revm::DatabaseRef>(
             step_outcomes,
         },
         visited_pcs: visited.iter().copied().collect(),
+        arrival,
         cmp_observed,
         storage_observed,
         feedback_guard,
@@ -505,7 +528,7 @@ mod tests {
             tail: Tail::Empty,
         };
         let seq = TxSequence::single([0x22; 20], input);
-        let run = execute(&cfg, &seq, 1_000_000, &[0]);
+        let run = execute(&cfg, &seq, 1_000_000, &[0], u32::MAX);
         assert_eq!(run.trace.calls.len(), 1);
         let call = &run.trace.calls[0];
         assert_eq!(call.kind, "CALL");
@@ -547,7 +570,7 @@ mod tests {
             tail: Tail::Empty,
         };
         let seq = TxSequence::single([0x22; 20], input);
-        let run = execute(&cfg, &seq, 100, &[0]);
+        let run = execute(&cfg, &seq, 100, &[0], u32::MAX);
         assert!(run.trace.truncated);
         assert_eq!(run.trace.outcome, OutcomeKind::OutOfGas);
         assert!(run.trace.visited_pcs.len() <= 4);
