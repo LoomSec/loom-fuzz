@@ -416,7 +416,7 @@ fn cmd_run(
         };
         let guard_writers = writer_closure(&shard, &guard_slots);
         if !guard_writers.is_empty() {
-            seed_out.assumptions.push(format!(
+            assumptions.push(format!(
                 "守卫存储闭包：槽 {:?} 的写者函数 {guard_writers:#x?}（issue #54 辅助靶子）",
                 guard_slots
             ));
@@ -705,6 +705,11 @@ fn seed_calldata_input_with_value(sc: &str, value: U256) -> Result<SeedInput, St
 /// 表达式树含守卫基槽（mapping 的 BASE 或常量槽值）的函数
 /// selector 集——写守卫族槽的函数 = 辅助目标（loom 事实驱动，
 /// 零个案）。
+/// 写者闭包（issue #54）：消费 shard may-summary 的 writes_s
+/// （(func, slot 表达式)——loom 预筛事实段；展开流 entries 只有
+/// input_read 效果，写事实在 SUMM 段），槽表达式树含守卫基槽
+/// （mapping 的 BASE 或常量槽值）的函数 selector 集——写守卫族槽
+/// 的函数 = 辅助目标（loom 事实驱动，零个案）。
 fn writer_closure(shard: &Shard, slots: &[loom_fuzz_seed::GuardSlot]) -> Vec<u32> {
     use std::collections::BTreeSet;
     let bases: BTreeSet<alloy_primitives::U256> = slots.iter().map(|s| s.base_key()).collect();
@@ -712,16 +717,11 @@ fn writer_closure(shard: &Shard, slots: &[loom_fuzz_seed::GuardSlot]) -> Vec<u32
         return Vec::new();
     }
     let mut writers = BTreeSet::new();
-    for f in shard.functions() {
-        let Some(sel) = f.selector else { continue };
-        let touches = f.effects().any(|e| match e {
-            loom_fuzz_shard::Entry::Effect { kind, operands, .. } if kind == "sstore" => operands
-                .iter()
-                .any(|(name, id)| name == "key" && expr_touches_base(shard.exprs(), *id, &bases)),
-            _ => false,
-        });
-        if touches {
-            writers.insert(sel);
+    for (func, slot) in &shard.summaries().writes_s {
+        if expr_touches_base(shard.exprs(), *slot, &bases) {
+            if let Some(sel) = shard.functions()[*func as usize].selector {
+                writers.insert(sel);
+            }
         }
     }
     writers.into_iter().collect()
