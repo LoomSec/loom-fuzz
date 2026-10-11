@@ -160,9 +160,15 @@ pub(crate) fn assemble(
 }
 
 /// 定向配对（issue #54 多步拼序）：步级池中抽守卫写者步（selector
-/// ∈ 守卫写者闭包——loom 事实驱动的布置步候选），前置接到提案目标
-/// 步前，并对目标步做一次效果词交接（参数跨步耦合）。无写者素材
-/// （守卫写者集空 / 池尚无写者步）时退化 append——配对带不浪费。
+/// ∈ 守卫写者闭包——loom 事实驱动的布置步候选），与目标步配对。
+/// 两种形态（各 50%）：
+/// (a) `[写者, 目标]`——目标优先步级池中 selector == 命中 selector
+///     的素材（携带已知最优 calldata——种子编译器的反解 head 等，
+///     不交接防破坏）；缺省提案候选（效果词交接 = 参数跨步耦合）。
+/// (b) `写者前置`——写者步插到随机素材序列头部（[lock, extend,
+///     migrate] 类多布置链由多次前置 + splice 拼出）。
+/// 无写者素材（守卫写者集空 / 池尚无写者步）时退化 append——配对带
+/// 不浪费。
 fn pair(rng: &mut Rng, proposed: &Input, src: &Sources<'_>, ctx: &AssembleCtx<'_>) -> TxSequence {
     if ctx.guard_writers.is_empty() {
         return append(rng, proposed, src, ctx);
@@ -176,16 +182,46 @@ fn pair(rng: &mut Rng, proposed: &Input, src: &Sources<'_>, ctx: &AssembleCtx<'_
         return append(rng, proposed, src, ctx);
     }
     let writer = writers[rng.below(writers.len() as u64) as usize];
-    let mut target = proposed.clone();
-    handoff(rng, &mut target, ctx);
-    TxSequence {
-        steps: vec![
-            (*writer).clone(),
-            Step {
-                target: ctx.address,
-                input: target,
-            },
-        ],
+    if rng.below(2) == 0 {
+        // 形态 (a)：写者 + 目标步。
+        let pool_targets: Vec<&Step> = src
+            .step_pool
+            .iter()
+            .filter(|st| st.input.selector == ctx.selector)
+            .collect();
+        if !pool_targets.is_empty() && rng.below(2) == 0 {
+            // 池素材目标：已知最优 calldata，原样使用（不交接）。
+            TxSequence {
+                steps: vec![
+                    (*writer).clone(),
+                    (*pool_targets[rng.below(pool_targets.len() as u64) as usize]).clone(),
+                ],
+            }
+        } else {
+            let mut target = proposed.clone();
+            handoff(rng, &mut target, ctx);
+            TxSequence {
+                steps: vec![
+                    (*writer).clone(),
+                    Step {
+                        target: ctx.address,
+                        input: target,
+                    },
+                ],
+            }
+        }
+    } else {
+        // 形态 (b)：写者前置到随机素材序列头部。
+        let total = src.total();
+        if total == 0 {
+            return TxSequence::single(ctx.address, proposed.clone());
+        }
+        let mut seq = src.get(rng.below(total)).expect("索引在 total 内");
+        if seq.steps.len() as u32 >= ctx.max_steps {
+            return TxSequence::single(ctx.address, proposed.clone());
+        }
+        seq.steps.insert(0, (*writer).clone());
+        seq
     }
 }
 
@@ -488,8 +524,8 @@ mod tests {
         assert!(hits > 0, "守卫写者 selector 应出现在追加步中");
     }
 
-    /// issue #54 多步拼序：定向配对从步级池抽守卫写者步前置，目标
-    /// 步 = 提案候选（target = victim 地址）。
+    /// issue #54 多步拼序：定向配对两种形态——(a) 写者 + 目标步
+    /// （提案候选），(b) 写者前置到素材序列头部。
     #[test]
     fn pair_builds_writer_then_target() {
         let guard_writers = vec![0xdeadbeef];
@@ -498,16 +534,21 @@ mod tests {
             input: input(7),
         };
         let step_pool = vec![writer_step.clone()];
+        // selector 与写者不同：池素材目标过滤不命中，(a) 形态度
+        // 用提案候选（测试确定性）。
+        let base = ctx(3, &TABLE);
         let ctx = AssembleCtx {
             step_pool: &step_pool,
             guard_writers: &guard_writers,
-            ..ctx(3, &TABLE)
+            selector: 0x9999,
+            ..base
         };
         let feedback = Vec::new();
         let mut proposed = input(9);
         proposed.selector = 0xcafebabe;
-        let mut hits = 0usize;
-        for seed in 0..300u64 {
+        let mut form_a = 0usize;
+        let mut form_b = 0usize;
+        for seed in 0..400u64 {
             let mut rng = Rng::new(seed);
             let s = assemble(&mut rng, proposed.clone(), &feedback, &ctx);
             if s.steps.len() == 2
@@ -515,10 +556,14 @@ mod tests {
                 && s.steps[1].input.selector == 0xcafebabe
                 && s.steps[1].target == [0x22; 20]
             {
-                hits += 1;
+                form_a += 1;
+            }
+            if s.steps.len() >= 2 && s.steps[0].input == writer_step.input {
+                form_b += 1;
             }
         }
-        assert!(hits > 0, "守卫写者步应被配对到目标步前");
+        assert!(form_a > 0, "形态 (a) 写者+目标步应出现");
+        assert!(form_b > 0, "形态 (b) 写者前置应出现");
     }
 
     /// issue #54 参数跨步耦合：效果词交接把观测池词写进目标步零槽
