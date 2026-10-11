@@ -191,6 +191,22 @@ pub fn select_action(poc: &Poc) -> Result<HarmfulAction, PocgenError> {
     }
 }
 
+/// 定罪呼出 input 是否 ERC20 drain 形（transferFrom = 3 头槽 /
+/// transfer = 2 头槽，selector keccak 现算，与 select_action 同形状
+/// 知识）——L3 价值模型的机械锚点之一（issue #61）：臂 1 证据即
+/// 盗窃调用本体时，drain 注入模型成立；只读探针（balanceOf 等）不在
+/// 其列（价值形态超出 ERC20 模型，如实降级）。
+pub(crate) fn is_erc20_drain_call(input: &[u8]) -> bool {
+    if input.len() < 4 || !(input.len() - 4).is_multiple_of(32) {
+        return false;
+    }
+    let selector = u32::from_be_bytes(input[..4].try_into().expect("len≥4"));
+    let words = (input.len() - 4) / 32;
+    let (transfer_from, transfer) = erc20_selectors();
+    matches!((selector, words), (s, 3) if s == transfer_from)
+        || matches!((selector, words), (s, 2) if s == transfer)
+}
+
 /// witness calldata 的广义 ABI 头形（issue #28）：selector + k 个定长
 /// 槽（1 ≤ k ≤ HEAD_MAX），其中至多一个槽可解释为动态 bytes/string
 /// 段的尾偏移（`tail_slot`）。逐槽尝试"尾偏移"解释（值 32 对齐、指
@@ -1545,6 +1561,35 @@ mod tests {
         let err = parse_head_shape(&cd).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("多解"), "{msg}");
+    }
+
+    #[test]
+    fn erc20_drain_call_shape_is_mechanical_anchor() {
+        // issue #61：drain 形判定 = L3 价值模型锚点——transferFrom 3 槽
+        // / transfer 2 槽成立；只读探针（balanceOf）与 underlying()
+        // 探针不算（后者另有专用锚点）。
+        let (transfer_from, transfer) = erc20_selectors();
+        let word = |v: u64| U256::from(v).to_be_bytes::<32>();
+        let mut input = transfer_from.to_be_bytes().to_vec();
+        for _ in 0..3 {
+            input.extend_from_slice(&word(0x11));
+        }
+        assert!(is_erc20_drain_call(&input));
+        let mut input = transfer.to_be_bytes().to_vec();
+        for _ in 0..2 {
+            input.extend_from_slice(&word(0x11));
+        }
+        assert!(is_erc20_drain_call(&input));
+        // balanceOf(address) = 1 词只读探针（TeamFinance migrate 证据
+        // 形）→ 不算 drain 形。
+        let mut probe = 0x70a08231u32.to_be_bytes().to_vec();
+        probe.extend_from_slice(&word(0x22));
+        assert!(!is_erc20_drain_call(&probe));
+        // underlying() 探针（0 词）→ 不算（pegged 锚点另行判定）。
+        assert!(!is_erc20_drain_call(&underlying_selector().to_be_bytes()));
+        // 非法长度 / 非 32 对齐 → false。
+        assert!(!is_erc20_drain_call(&[]));
+        assert!(!is_erc20_drain_call(&transfer_from.to_be_bytes()));
     }
 
     #[test]

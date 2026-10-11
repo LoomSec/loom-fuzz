@@ -75,11 +75,25 @@ B=fixtures/real-world/teamfinance-locktoken
   unlockTime = **1666855384 = pin_ts + 5**（守卫比较把 pin 块
   时间戳喂进 cmp 池，搜索把词推到 1.6e9 量级，裕量 5 秒）；
   `Soundness` forge 测试 2/2 PASS（step0 成功 + step1 可执行）。
-- ⚠️ L3 pocgen 工程红灯（如实降级）：L3 模板把 impl 字节码
-  etch 到裸地址重放，无 proxy 部署态（initializer/owner/0x97/0xd8
-  标志槽），step0 在该环境 revert——**环境保真边界**，非 witness
-  语义问题（逐步 forge 验证已独立覆盖语义健全性）。价值断言
-  形态（LP 迁移非 ERC20 drain）亦是已知 L2/L3 边界。
+- ✅ **L3 fork 直通绿灯（issue #61，pocgen 环境保真）**：
+  `loom-fuzz exploit --fork` 生成 fork 直通工程（不 etch 分析对象，
+  pin 块 15837893 真链上状态 = 执行环境）+ L1-only 终点断言（价值
+  形态超出 ERC20 drain 模型——migrate 的 LP 迁移/V3 仓位形态，
+  机械判定零个案）。forge 真跑 **PASS**：
+  - step0 lockToken **真实成功**（proxy 部署态在场：真实 USDT
+    decimals 查询、真实价格预言机 STATICCALL、selfmadeToken
+    transferFrom、`Deposit` NFT 15328——完整 delegatecall 路径）；
+  - step1 migrate 执行后经 `StepOutcome` 如实 emit（L3 调用方 =
+    Attacker 合约 ≠ witness caller 0x3333…，迁移的 sender 守卫
+    revert——臂后 revert 合法，oracle L1 语义不依赖整笔成功）；
+  - 价值断言局限工程内明确标注「形态超出 ERC20 模型，仅 L1」，
+    臂证据资产（selfmadeToken）余额变化经 `AffectedAssetBalance`
+    事件展示。
+  - 注意：poc-3094298278-62 原始 step0 的 unlockTime=12396 是
+    timestamp=0 旧环境的搜索产物（L1 到场语义下过守卫的方式），
+    直通 pin 块环境会如实 "Invalid unlock time" revert；按本文件
+    上文 Soundness 验证书形换入 unlockTime=0x635a31d8（pin_ts+5）
+    后全绿——witness 语义健全性 #41 已独立确认，非 pocgen 缺陷。
 - ✅ 单步对照（--max-steps 1，seed 42）：migrate unreachable
   （21038 runs）——多步必要性成立。
 

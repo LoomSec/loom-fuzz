@@ -55,9 +55,21 @@
 //! `eth_rpc_url = "${BLOCKMACHINE_RPC_URL}"`）+ `run.sh`——
 //! `BLOCKMACHINE_API_KEY` 为空 = 直接无 key 连接；非空 =
 //! `forge test --fork-url "$RPC" -H "Authorization: Bearer $KEY"`
-//! （foundry.toml 不能带头，header 由脚本表达）。资产模型差异
-//! （链上真实余额、跳过 vm.etch）见工程 README；M0 验收以字节码
-//! 模式为准，fork plumbing 最小测试环境门控（见 tests/）。
+//! （foundry.toml 不能带头，header 由脚本表达）。
+//!
+//! **L3 fork 直通（issue #61）**：多步工程在 fork 上执行时**不
+//! etch 分析对象**——真链上状态（pin 块）即执行环境（同 fuzz 执行
+//! 器的 overlay 语义），proxy 部署态（initializer/owner/标志槽）自然
+//! 在场（Genesis 态把 impl 字节码 etch 到裸地址重放，真实函数路径
+//! 走不通）；poc.json 的 deployments（fuzz 期部署的应答/代理合约）
+//! 链上不在场，仍逐字 etch（既有逻辑）。**非 ERC20 损害模型**
+//! （如 LP 迁移/V3 仓位形态）：payload 头形无法落入 ERC20 drain
+//! 模型时，fork 直通下终点断言如实降级为 L1 层（布置步全 ok 硬
+//! 断言 + payload 结果 emit 呈现），工程内明确标注"价值断言：形态
+//! 超出 ERC20 模型，仅 L1"——fail-soft 但有标注，不伪造绿灯；
+//! Genesis 态同形仍 BadShape 诚实降级。资产模型差异（链上真实
+//! 余额、跳过 vm.etch）见工程 README；M0 验收以字节码模式为准，
+//! fork plumbing 最小测试环境门控（见 tests/）。
 //!
 //! # 诚实降级
 //!
