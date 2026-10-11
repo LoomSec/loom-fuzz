@@ -404,6 +404,24 @@ fn cmd_run(
         // 定（anyswap ≥4+0x120 → 9 词），不再盲扫 1..=12；动态头
         // 证据（界依赖 calldata 词的守卫）送执行器作 abifix 零槽
         // 合成的启用依据。
+        // 守卫存储依赖闭包（issue #54）：守卫槽 → 写者函数集；
+        // 执行器给写守卫槽的步 fitness 信用（setup 步制导）。
+        let guard_slots = {
+            let guards: Vec<(String, bool)> = hit
+                .dominating_guards
+                .iter()
+                .map(|g| (g.cond.clone(), g.polarity))
+                .collect();
+            loom_fuzz_seed::parse_guard_slots(&guards)
+        };
+        let guard_writers = writer_closure(&shard, &guard_slots);
+        if !guard_writers.is_empty() {
+            seed_out.assumptions.push(format!(
+                "守卫存储闭包：槽 {:?} 的写者函数 {guard_writers:#x?}（issue #54 辅助靶子）",
+                guard_slots
+            ));
+        }
+
         let head_facts = {
             let guards: Vec<(String, bool)> = hit
                 .dominating_guards
@@ -428,6 +446,14 @@ fn cmd_run(
             entry,
             max_steps,
             dynamic_head_evidence: head_facts.dynamic_head_evidence,
+            guard_slots: guard_slots
+                .iter()
+                .filter_map(|s| match s {
+                    loom_fuzz_seed::GuardSlot::Const(c) => Some(*c),
+                    _ => None,
+                })
+                .collect(),
+            guard_writers: guard_writers.clone(),
             // revert 归因上下文：支配 guard（装载端已渲染 cond）。
             guard_context: hit
                 .dominating_guards
@@ -673,6 +699,64 @@ fn seed_calldata_input_with_value(sc: &str, value: U256) -> Result<SeedInput, St
     }
     loom_fuzz_oracle::input_from_calldata([0x33; 20], value, &bytes)
         .map_err(|e| format!("规范化失败: {e}"))
+}
+
+/// 写者闭包（issue #54）：扫 shard 全部函数的 sstore 效果，key
+/// 表达式树含守卫基槽（mapping 的 BASE 或常量槽值）的函数
+/// selector 集——写守卫族槽的函数 = 辅助目标（loom 事实驱动，
+/// 零个案）。
+fn writer_closure(shard: &Shard, slots: &[loom_fuzz_seed::GuardSlot]) -> Vec<u32> {
+    use std::collections::BTreeSet;
+    let bases: BTreeSet<alloy_primitives::U256> = slots.iter().map(|s| s.base_key()).collect();
+    if bases.is_empty() {
+        return Vec::new();
+    }
+    let mut writers = BTreeSet::new();
+    for f in shard.functions() {
+        let Some(sel) = f.selector else { continue };
+        let touches = f.effects().any(|e| match e {
+            loom_fuzz_shard::Entry::Effect { kind, operands, .. } if kind == "sstore" => operands
+                .iter()
+                .any(|(name, id)| name == "key" && expr_touches_base(shard.exprs(), *id, &bases)),
+            _ => false,
+        });
+        if touches {
+            writers.insert(sel);
+        }
+    }
+    writers.into_iter().collect()
+}
+
+/// 表达式树深度优先匹配：任一 Const 节点 ∈ 守卫基槽集即命中
+/// （mapping(BASE, key) 的基槽与常量槽同规则）。
+fn expr_touches_base(
+    exprs: &[loom_fuzz_shard::ExprNode],
+    id: u32,
+    bases: &std::collections::BTreeSet<alloy_primitives::U256>,
+) -> bool {
+    let Some(node) = exprs.get(id as usize) else {
+        return false;
+    };
+    match node {
+        loom_fuzz_shard::ExprNode::Const(w) => {
+            bases.contains(&alloy_primitives::U256::from_be_bytes(*w))
+        }
+        loom_fuzz_shard::ExprNode::Unary(_, a) | loom_fuzz_shard::ExprNode::Cast(a, _) => {
+            expr_touches_base(exprs, *a, bases)
+        }
+        loom_fuzz_shard::ExprNode::Binary(_, a, b) | loom_fuzz_shard::ExprNode::Cmp(_, a, b) => {
+            expr_touches_base(exprs, *a, bases) || expr_touches_base(exprs, *b, bases)
+        }
+        loom_fuzz_shard::ExprNode::Ternary(_, a, b, c) => {
+            expr_touches_base(exprs, *a, bases)
+                || expr_touches_base(exprs, *b, bases)
+                || expr_touches_base(exprs, *c, bases)
+        }
+        loom_fuzz_shard::ExprNode::Nary(_, ids) => {
+            ids.iter().any(|i| expr_touches_base(exprs, *i, bases))
+        }
+        _ => false,
+    }
 }
 
 /// 解析 `--seed-calldata` 项的 `@value` 后缀（缺省 0）：返回

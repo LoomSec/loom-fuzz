@@ -45,6 +45,10 @@ pub(crate) struct RunResult {
     /// revert 归因：最近经过的支配 guard（ExecConfig.guard_context
     /// 非空且某步 Revert 时产出——取最近 revert 步的归因）。
     pub feedback_guard: Option<crate::exec::GuardFeedback>,
+    /// 守卫存储写信用（issue #54）：本 run 写了守卫槽（SSTORE
+    /// key == 常量守卫槽）或写者函数的步发生 SSTORE——setup 步
+    /// 的 fitness 信用。守卫配置为空时恒 false（行为不变）。
+    pub guard_credit: bool,
 }
 
 /// 泛型上下文：Genesis（EmptyDB）与 fork（ForkDb 包装）通用。
@@ -70,6 +74,8 @@ pub(crate) struct WitnessInspector {
     cmp_observed: Vec<[U256; 2]>,
     /// SLOAD 观测（#6 算子 4 的变异池来源）。
     storage_observed: Vec<(U256, U256)>,
+    /// SSTORE 观测（issue #54 守卫写信用：键值对 + 所属步）。
+    sstore_observed: Vec<(U256, U256, u32)>,
     /// step 时暂存的 SLOAD 键，step_end 对值。
     pending_sload: Option<U256>,
 }
@@ -86,6 +92,7 @@ impl WitnessInspector {
             step_capped: false,
             cmp_observed: Vec::new(),
             storage_observed: Vec::new(),
+            sstore_observed: Vec::new(),
             pending_sload: None,
         }
     }
@@ -118,6 +125,12 @@ impl<DB: revm::DatabaseRef> Inspector<CtxFor<DB>> for WitnessInspector {
         } else if op == opcode::SLOAD {
             // step_end 收值（值在指令执行后上栈）。
             self.pending_sload = interp.stack.peek(0).ok();
+        } else if op == opcode::SSTORE {
+            // SSTORE 观测（issue #54 守卫写信用）：执行前栈顶 =
+            // key、次顶 = value。步号在合并循环统一标注。
+            if let (Ok(key), Ok(value)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                self.sstore_observed.push((key, value, 0));
+            }
         }
         if self.steps >= self.step_cap {
             // 主动截停：按 OOG 收尾（gas 记满额），上层据
@@ -333,6 +346,7 @@ fn execute_on<DB: revm::DatabaseRef>(
     let mut calls: Vec<RecordedCall> = Vec::new();
     let mut cmp_observed: Vec<[U256; 2]> = Vec::new();
     let mut storage_observed: Vec<(U256, U256)> = Vec::new();
+    let mut sstore_observed: Vec<(U256, U256, u32)> = Vec::new();
     let mut gas_used: u64 = 0;
     let mut feedback_guard: Option<crate::exec::GuardFeedback> = None;
 
@@ -363,10 +377,13 @@ fn execute_on<DB: revm::DatabaseRef>(
                 continue;
             }
         };
-        // 合并本步 witness（call 的步号如实标注）。
+        // 合并本步 witness（call/sstore 的步号如实标注）。
         for mut call in std::mem::take(&mut evm.inspector.calls) {
             call.step = i as u32;
             calls.push(call);
+        }
+        for (k, v, _) in std::mem::take(&mut evm.inspector.sstore_observed) {
+            sstore_observed.push((k, v, i as u32));
         }
         let inspector = &evm.inspector;
         let (outcome, gas, truncated_by_gas) = map_result(&result);
@@ -407,6 +424,20 @@ fn execute_on<DB: revm::DatabaseRef>(
         Some(k) => step_truncs[..=k].iter().any(|t| *t),
         None => step_truncs.iter().any(|t| *t),
     };
+    // 守卫存储写信用（issue #54）：SSTORE key 命中常量守卫槽，或
+    // 写者函数的步发生 SSTORE（mapping 派生槽按函数归组）。
+    let guard_credit = (!cfg.guard_slots.is_empty() || !cfg.guard_writers.is_empty()) && {
+        let key_hit = !cfg.guard_slots.is_empty()
+            && sstore_observed
+                .iter()
+                .any(|(k, _, _)| cfg.guard_slots.contains(k));
+        let writer_hit = !cfg.guard_writers.is_empty()
+            && sstore_observed.iter().any(|(_, _, step)| {
+                cfg.guard_writers
+                    .contains(&seq.steps[*step as usize].input.selector)
+            });
+        key_hit || writer_hit
+    };
     RunResult {
         trace: WitnessTrace {
             contract: cfg.address,
@@ -426,6 +457,7 @@ fn execute_on<DB: revm::DatabaseRef>(
         cmp_observed,
         storage_observed,
         feedback_guard,
+        guard_credit,
     }
 }
 
@@ -518,6 +550,8 @@ mod tests {
             entry: None,
             max_steps: 1,
             dynamic_head_evidence: false,
+            guard_slots: Vec::new(),
+            guard_writers: Vec::new(),
             guard_context: Vec::new(),
         };
         let input = Input {
@@ -560,6 +594,8 @@ mod tests {
             entry: None,
             max_steps: 1,
             dynamic_head_evidence: false,
+            guard_slots: Vec::new(),
+            guard_writers: Vec::new(),
             guard_context: Vec::new(),
         };
         let input = Input {

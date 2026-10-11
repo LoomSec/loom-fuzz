@@ -41,7 +41,9 @@ impl GuardSlot {
 
 /// 从支配 guard 渲染文本解析守卫存储槽。`guards` = (cond, polarity)；
 /// 只消费 polarity=true（通过条件为真时才约束执行形态）。
-pub fn parse_guard_slots<'a>(guards: impl IntoIterator<Item = &'a (String, bool)>) -> Vec<GuardSlot> {
+pub fn parse_guard_slots<'a>(
+    guards: impl IntoIterator<Item = &'a (String, bool)>,
+) -> Vec<GuardSlot> {
     let mut out: Vec<GuardSlot> = Vec::new();
     for (cond, polarity) in guards {
         if !polarity || !cond.contains("storage(this, ") {
@@ -138,7 +140,9 @@ mod tests {
     #[test]
     fn teamfinance_unlocktime_slot_parses() {
         // TeamFinance migrate 守卫：unlockTime(id) 形态。
-        let gs = [g("<(block.timestamp, storage(this, +(0x3, mapping(0xcc, calldata_word(0x4)))))")];
+        let gs = [g(
+            "<(block.timestamp, storage(this, +(0x3, mapping(0xcc, calldata_word(0x4)))))",
+        )];
         let slots = parse_guard_slots(&gs);
         assert_eq!(
             slots,
