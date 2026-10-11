@@ -144,6 +144,8 @@ fn exec_config(
         entry: None,
         max_steps: 1,
         dynamic_head_evidence: false,
+        guard_slots: Vec::new(),
+        guard_writers: Vec::new(),
         guard_context: Vec::new(),
     }
 }

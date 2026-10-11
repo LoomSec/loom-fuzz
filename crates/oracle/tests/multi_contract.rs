@@ -95,6 +95,8 @@ fn exec_config(entry: Option<[u8; 20]>, deployments: Vec<Deployment>) -> ExecCon
         entry,
         max_steps: 1,
         dynamic_head_evidence: false,
+        guard_slots: Vec::new(),
+        guard_writers: Vec::new(),
         guard_context: Vec::new(),
     }
 }

@@ -73,6 +73,16 @@ pub struct ExecConfig {
     /// abifix 零槽合成的启用依据（替代 #46 的拍头宽阈值特判）。
     #[serde(default)]
     pub dynamic_head_evidence: bool,
+    /// 守卫存储槽（常量槽，issue #54）：fitness 信用判定——run 的
+    /// SSTORE key 命中即得信用（loom 事实驱动，装载端解析）。
+    #[serde(default)]
+    pub guard_slots: Vec<U256>,
+    /// 守卫槽写者函数 selector 集（issue #54）：run 的某步
+    /// （selector ∈ 写者集）发生 SSTORE 即得信用——setup 步制导
+    /// （mapping 派生槽运行时 key 为 keccak 值，按函数归组的
+    /// sound 近似）。
+    #[serde(default)]
+    pub guard_writers: Vec<u32>,
     /// 支配 guard 上下文（revert 归因用；装载端经 xlayer 渲染 cond）。
     #[serde(default)]
     pub guard_context: Vec<GuardContext>,
@@ -373,6 +383,7 @@ pub fn run_targeted_with(
                     max_steps: cfg.max_steps,
                     dynamic_head: cfg.dynamic_head_evidence,
                     selector: target.hit.selector(),
+                    guard_writers: &cfg.guard_writers,
                     head_len_hint,
                     dict,
                     consts: &consts,
@@ -597,7 +608,13 @@ impl<'a> Session<'a> {
         // 观测入池（去重有上限）：比较操作数 → 算子 1，SLOAD 键值
         // 对 → 算子 4。
         self.pools.absorb(&result);
-        let fitness = self.table.fitness(result.visited_pcs.iter().copied());
+        let mut fitness = self.table.fitness(result.visited_pcs.iter().copied());
+        // 守卫存储写信用（issue #54）：写了守卫槽的 run 得 fitness
+        // 奖励——setup 步（lockToken/extendLockDuration 类写守卫族槽）
+        // 从 fitness 死路进入进化信用（loom 标靶→靶场）。
+        if result.guard_credit {
+            fitness = fitness.saturating_sub(crate::tuning::TUNING.guard_write_credit);
+        }
         self.push_feedback(&result, seq, fitness);
         // 命中 = 帧归属过滤后的真到场（issue #53：pc 数值跨函数
         // 重叠的假到场不算）。
@@ -725,6 +742,8 @@ mod tests {
             entry: None,
             max_steps: 1,
             dynamic_head_evidence: false,
+            guard_slots: Vec::new(),
+            guard_writers: Vec::new(),
             guard_context: Vec::new(),
         };
         let seeds = vec![TxSequence::single(
@@ -780,6 +799,8 @@ mod tests {
             entry: None,
             max_steps: 1,
             dynamic_head_evidence: false,
+            guard_slots: Vec::new(),
+            guard_writers: Vec::new(),
             guard_context: Vec::new(),
         };
         let report = run_targeted(&cfg, &target, &[], &ValueDictionary { words: vec![] });
