@@ -36,12 +36,14 @@
 //!   常量与字节码 PUSH 立即数。
 
 mod compile;
+mod guardtaint;
 mod headwidth;
 mod node;
 
 use serde::{Deserialize, Serialize};
 
 pub use compile::{compile, locate};
+pub use guardtaint::{parse_guard_slots, GuardSlot};
 pub use headwidth::{derive as derive_headwidth, head_words_cap, HeadWidth};
 pub use node::{canon, render_node, Node, View};
 
