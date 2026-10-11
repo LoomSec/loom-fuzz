@@ -16,10 +16,11 @@
 //!
 //! | 区间 | 行为 |
 //! |---|---|
-//! | 0-59 | 单步 `[proposed]`（与旧行为一致，步级利用为主） |
-//! | 60-79 | append：取一素材序列（反馈或步级池单步），从合约表 |
+//! | 0-44 | 单步 `[proposed]`（步级利用为主） |
+//! | 45-64 | **定向配对**（issue #54）：步级池抽守卫写者步前置 + 目标步 |
+//! | 65-84 | append：取一素材序列（反馈或步级池单步），从合约表 |
 //! |      | 选目标追加一步（新步输入克隆随机素材步或随机填充） |
-//! | 80-99 | splice：两个不同素材序列拼接，截断到 `max_steps` |
+//! | 85-99 | splice：两个不同素材序列拼接，截断到 `max_steps` |
 //!
 //! 组装出的多步序列再经一步内变异（50% 概率挑一步跑既有
 //! `mutators::mutate`——五算子原样复用，池与会话共享）。
@@ -141,6 +142,8 @@ pub(crate) fn assemble(
     let roll = rng.below(100);
     let mut seq = if roll < crate::tuning::TUNING.seq_single_band {
         TxSequence::single(ctx.address, proposed)
+    } else if roll < crate::tuning::TUNING.seq_pair_band {
+        pair(rng, &proposed, &src, ctx)
     } else if roll < crate::tuning::TUNING.seq_append_band {
         append(rng, &proposed, &src, ctx)
     } else {
@@ -154,6 +157,68 @@ pub(crate) fn assemble(
         seq.steps[idx].input = mutate(&seq.steps[idx].input, &mut mctx);
     }
     seq
+}
+
+/// 定向配对（issue #54 多步拼序）：步级池中抽守卫写者步（selector
+/// ∈ 守卫写者闭包——loom 事实驱动的布置步候选），前置接到提案目标
+/// 步前，并对目标步做一次效果词交接（参数跨步耦合）。无写者素材
+/// （守卫写者集空 / 池尚无写者步）时退化 append——配对带不浪费。
+fn pair(rng: &mut Rng, proposed: &Input, src: &Sources<'_>, ctx: &AssembleCtx<'_>) -> TxSequence {
+    if ctx.guard_writers.is_empty() {
+        return append(rng, proposed, src, ctx);
+    }
+    let writers: Vec<&Step> = src
+        .step_pool
+        .iter()
+        .filter(|st| ctx.guard_writers.contains(&st.input.selector))
+        .collect();
+    if writers.is_empty() {
+        return append(rng, proposed, src, ctx);
+    }
+    let writer = writers[rng.below(writers.len() as u64) as usize];
+    let mut target = proposed.clone();
+    handoff(rng, &mut target, ctx);
+    TxSequence {
+        steps: vec![
+            (*writer).clone(),
+            Step {
+                target: ctx.address,
+                input: target,
+            },
+        ],
+    }
+}
+
+/// 参数跨步耦合（issue #54）：配对序列的目标步从观测池交接一个词——
+/// 守卫写者步执行后其读写的键值（nextId 类 id 词）已逐代入
+/// storage/cmp 观测池（exec.rs 每代快照回灌），目标步的同义参数槽
+/// 覆写为该词。零槽优先（未绑定词——不破坏 proposer 已解守卫绑定），
+/// 无零槽随机槽。全部既有 loom 观测设施，零个案。
+fn handoff(rng: &mut Rng, target: &mut Input, ctx: &AssembleCtx<'_>) {
+    if target.head.is_empty() {
+        return;
+    }
+    let word = if !ctx.storage_pool.is_empty() && rng.below(2) == 0 {
+        Some(ctx.storage_pool[rng.below(ctx.storage_pool.len() as u64) as usize].1)
+    } else if !ctx.cmp_pool.is_empty() {
+        Some(ctx.cmp_pool[rng.below(ctx.cmp_pool.len() as u64) as usize])
+    } else {
+        None
+    };
+    let Some(word) = word else { return };
+    let zeros: Vec<usize> = target
+        .head
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.iter().all(|b| *b == 0))
+        .map(|(i, _)| i)
+        .collect();
+    let slot = if !zeros.is_empty() && rng.below(2) == 0 {
+        zeros[rng.below(zeros.len() as u64) as usize]
+    } else {
+        rng.below(target.head.len() as u64) as usize
+    };
+    target.head[slot] = word.to_be_bytes::<32>();
 }
 
 /// append：一素材序列（随机挑，缺省 `[proposed]`）+ 从合约表选
@@ -421,5 +486,76 @@ mod tests {
             }
         }
         assert!(hits > 0, "守卫写者 selector 应出现在追加步中");
+    }
+
+    /// issue #54 多步拼序：定向配对从步级池抽守卫写者步前置，目标
+    /// 步 = 提案候选（target = victim 地址）。
+    #[test]
+    fn pair_builds_writer_then_target() {
+        let guard_writers = vec![0xdeadbeef];
+        let writer_step = Step {
+            target: [0x22; 20],
+            input: input(7),
+        };
+        let step_pool = vec![writer_step.clone()];
+        let ctx = AssembleCtx {
+            step_pool: &step_pool,
+            guard_writers: &guard_writers,
+            ..ctx(3, &TABLE)
+        };
+        let feedback = Vec::new();
+        let mut proposed = input(9);
+        proposed.selector = 0xcafebabe;
+        let mut hits = 0usize;
+        for seed in 0..300u64 {
+            let mut rng = Rng::new(seed);
+            let s = assemble(&mut rng, proposed.clone(), &feedback, &ctx);
+            if s.steps.len() == 2
+                && s.steps[0].input == writer_step.input
+                && s.steps[1].input.selector == 0xcafebabe
+                && s.steps[1].target == [0x22; 20]
+            {
+                hits += 1;
+            }
+        }
+        assert!(hits > 0, "守卫写者步应被配对到目标步前");
+    }
+
+    /// issue #54 参数跨步耦合：效果词交接把观测池词写进目标步零槽
+    /// （未绑定词），观测池空时不改动。
+    #[test]
+    fn handoff_writes_pool_word_to_zero_slot() {
+        let word = U256::from(0x2ee0u64);
+        let storage_pool = vec![(U256::from(0xccu64), word)];
+        let actx = AssembleCtx {
+            storage_pool: &storage_pool,
+            ..ctx(3, &TABLE)
+        };
+        let mut proposed = input(9);
+        proposed.head = vec![[0u8; 32], [0xffu8; 32]];
+        let mut zero_hits = 0usize;
+        let mut nonzero_hits = 0usize;
+        for seed in 0..200u64 {
+            let mut rng = Rng::new(seed);
+            let mut target = proposed.clone();
+            handoff(&mut rng, &mut target, &actx);
+            if target.head[0] == word.to_be_bytes::<32>() {
+                zero_hits += 1;
+            }
+            if target.head[1] == word.to_be_bytes::<32>() {
+                nonzero_hits += 1;
+            }
+        }
+        assert!(zero_hits > 0, "零槽应收到观测池词");
+        assert!(
+            zero_hits > nonzero_hits,
+            "零槽优先：零槽命中应多于非零槽（{zero_hits} vs {nonzero_hits}）"
+        );
+        // 观测池全空：不改动。
+        let empty_ctx = ctx(3, &TABLE);
+        let mut rng = Rng::new(1);
+        let mut target = proposed.clone();
+        handoff(&mut rng, &mut target, &empty_ctx);
+        assert_eq!(target, proposed, "空观测池不交接");
     }
 }

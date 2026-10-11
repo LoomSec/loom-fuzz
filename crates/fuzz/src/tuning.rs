@@ -38,7 +38,12 @@ pub(crate) struct Tuning {
     /// 单步带上限：roll < 60 → `[proposed]`（步级利用为主）。
     /// 依据：与 #25 分层搜索同思路——**纯 tuning**。
     pub seq_single_band: u64,
-    /// append 带上限：60 ≤ roll < 80 → append；其余 splice。
+    /// 定向配对带上限：single ≤ roll < pair → 守卫写者步 × 目标步
+    /// 配对（issue #54 多步拼序；写者素材不足时退化 append）。
+    /// 依据：真 witness = 布置步 + 触发步，盲拼序碰撞空间过大——
+    /// **纯 tuning**。
+    pub seq_pair_band: u64,
+    /// append 带上限：pair ≤ roll < append → append；其余 splice。
     /// 依据：同上单步主导——**纯 tuning**。
     pub seq_append_band: u64,
     /// 多步序列的步内变异概率分母：rng.below(denom) == 0 即触发
@@ -109,8 +114,9 @@ pub(crate) const TUNING: Tuning = Tuning {
         (HeadOp::Coordinated, 8),
     ],
     gaussian_scales: &[10, 25, 50, 100, 200, 500, 1000],
-    seq_single_band: 60,
-    seq_append_band: 80,
+    seq_single_band: 45,
+    seq_pair_band: 65,
+    seq_append_band: 85,
     seq_step_mutate_denom: 2,
     post_hit_runs: 1536,
     step_pool_cap: 256,
