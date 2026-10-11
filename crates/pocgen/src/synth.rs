@@ -223,8 +223,9 @@ pub(crate) fn head_words_of(shape: &HeadShape) -> &[U256] {
 
 /// 头槽扫描上限（保持旧解析的上限风格：头形推断只在有限前缀上做；
 /// 真实函数头宽可达 9 槽——anySwapOut*WithPermit 的 msg.data.length
-/// ≥ 4+0x120 守卫——上限取 16 覆盖 0x140 形）。
-const HEAD_MAX: usize = 16;
+/// ≥ 4+0x120 守卫——#41 TeamFinance migrate 实跑再扩：其 calldata
+/// 头 17 槽（549B），16 上限会让真实 witness 诚实降级拒合成）。
+const HEAD_MAX: usize = 24;
 
 /// 尾段长度合理上限（防垃圾值被误解析为动态段）。
 const TAIL_LEN_CAP: u64 = 4096;
@@ -511,6 +512,7 @@ pub fn generate_exploit_with(
                         fork_mode,
                         &poc.deployments,
                         contract,
+                        poc.fork.as_ref().map(|f| f.block_number),
                     )
                 }
                 // 头形解析不了但处于 fork 态：通用 replay 模板
@@ -522,6 +524,7 @@ pub fn generate_exploit_with(
                     caller_arr,
                     &poc.deployments,
                     contract,
+                    poc.fork.as_ref().map(|f| f.block_number),
                 ),
                 Err(e) => return Err(e),
             }
@@ -552,6 +555,7 @@ pub fn generate_exploit_with(
                     contract,
                 },
                 fork_mode,
+                poc.fork.as_ref().map(|f| f.block_number),
             )
         }
     };
@@ -582,6 +586,7 @@ impl ProjectArtifacts {
         fork: bool,
         deployments: &[PocDeployment],
         contract: [u8; 20],
+        fork_block: Option<u64>,
     ) -> Self {
         let mut files = vec![
             ("src/MockERC20.sol".into(), mock_erc20_sol()),
@@ -604,7 +609,7 @@ impl ProjectArtifacts {
             ("README.md".into(), readme(fork)),
         ];
         if fork {
-            files.push(("run.sh".into(), run_sh()));
+            files.push(("run.sh".into(), run_sh(fork_block)));
         }
         ProjectArtifacts { files }
     }
@@ -618,6 +623,7 @@ impl ProjectArtifacts {
         caller: [u8; 20],
         deployments: &[PocDeployment],
         contract: [u8; 20],
+        fork_block: Option<u64>,
     ) -> Self {
         let files = vec![
             ("src/IERC20.sol".into(), ierc20_sol()),
@@ -628,7 +634,7 @@ impl ProjectArtifacts {
             ),
             ("foundry.toml".into(), foundry_toml(true)),
             ("README.md".into(), readme(true)),
-            ("run.sh".into(), run_sh()),
+            ("run.sh".into(), run_sh(fork_block)),
         ];
         ProjectArtifacts { files }
     }
@@ -638,7 +644,12 @@ impl ProjectArtifacts {
     /// 代币），witness calldata verbatim 重放（vm.prank caller），
     /// 缴获断言 balanceOf(缴获地址) == 金额。genesis / fork 同模板
     /// （fork = --fork-url + run.sh，链上状态其余部分照 fork）。
-    fn render_drain(action: HarmfulAction, ctx: &DrainCtx<'_>, fork: bool) -> Self {
+    fn render_drain(
+        action: HarmfulAction,
+        ctx: &DrainCtx<'_>,
+        fork: bool,
+        fork_block: Option<u64>,
+    ) -> Self {
         let mut files = vec![
             ("src/MockERC20.sol".into(), mock_erc20_sol()),
             ("src/IERC20.sol".into(), ierc20_sol()),
@@ -648,7 +659,7 @@ impl ProjectArtifacts {
             ("README.md".into(), readme_drain(fork)),
         ];
         if fork {
-            files.push(("run.sh".into(), run_sh()));
+            files.push(("run.sh".into(), run_sh(fork_block)));
         }
         ProjectArtifacts { files }
     }
@@ -696,6 +707,27 @@ pub(crate) fn u256_hex64(v: U256) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// 宽参数列表编码渲染：非 IR codegen 对单次调用的栈深敏感（实跑
+/// TeamFinance migrate 17 词头 abi.encodeWithSelector 17 参即
+/// Stack too deep；≤12 参的既有案例 anyswap 9 参/vvisr 编译正常），
+/// 超 SINGLE_MAX 时按 INNER_CHUNK 分片嵌套 abi.encode 规避；
+/// ≤SINGLE_MAX 时保持原样单调用（回归输出逐字节不变）。
+pub(crate) fn encode_with_selector(selector: &str, args: &[String]) -> String {
+    const SINGLE_MAX: usize = 12;
+    const INNER_CHUNK: usize = 8;
+    if args.len() <= SINGLE_MAX {
+        return format!("abi.encodeWithSelector({}, {})", selector, args.join(", "));
+    }
+    let chunks: Vec<String> = args
+        .chunks(INNER_CHUNK)
+        .map(|c| format!("abi.encode({})", c.join(", ")))
+        .collect();
+    format!(
+        "abi.encodePacked(bytes4({selector}), {})",
+        chunks.join(", ")
+    )
 }
 
 /// registry/prestate 槽布置渲染（机械：每条一个 vm.store，L2/L3 共用）。
@@ -922,11 +954,7 @@ fn poc_test_sol(
         "address(token)",
         "ROUTER",
     );
-    let data_expr = format!(
-        "abi.encodeWithSelector({}, {})",
-        selector,
-        arg_exprs.join(", ")
-    );
+    let data_expr = encode_with_selector(&selector, &arg_exprs);
     let request_line = if shape.tail_slot.is_some() {
         "        bytes memory request =\n            abi.encodeCall(IERC20.transferFrom, (ROUTER, ATTACKER, BALANCE));\n".to_string()
     } else {
@@ -1299,21 +1327,31 @@ foundry.toml 不能带头）。
     s
 }
 
-pub(crate) fn run_sh() -> String {
-    r#"#!/usr/bin/env bash
+pub(crate) fn run_sh(fork_block: Option<u64>) -> String {
+    let pin_forge = fork_block
+        .map(|n| format!(" --fork-block-number {n}"))
+        .unwrap_or_default();
+    let pin_anvil = fork_block
+        .map(|n| format!(" --fork-block-number {n}"))
+        .unwrap_or_default();
+    format!(
+        r#"#!/usr/bin/env bash
 # BlockMachine fork 模式（pocgen 生成）：
 #   BLOCKMACHINE_API_KEY 为空 = 直接无 key 连接（免费档）；
 #   非空 = Bearer 头经 anvil 代理附加（forge test 1.5.1 无 header 旗，
 #   anvil --fork-header 是 foundry 族内惯用通路）。
+# pin 块 = witness 的确定性前提（poc.json fork.block_number）：两条
+# 通路都钉住，否则 fork 到 latest 与 witness 环境错位（#54 实跑：
+# TeamFinance lockToken 在 latest 态守卫判定不同）。
 set -euo pipefail
-RPC="${BLOCKMACHINE_RPC_URL:-https://rpc-polygon.blockmachine.io}"
-KEY="${BLOCKMACHINE_API_KEY:-}"
+RPC="${{BLOCKMACHINE_RPC_URL:-https://rpc-polygon.blockmachine.io}}"
+KEY="${{BLOCKMACHINE_API_KEY:-}}"
 if [ -z "$KEY" ]; then
-  exec forge test --fork-url "$RPC" "$@"
+  exec forge test --fork-url "$RPC"{pin_forge} "$@"
 fi
 
-PORT="${LOOM_FUZZ_ANVIL_PORT:-19545}"
-anvil --fork-url "$RPC" --fork-header "Authorization: Bearer $KEY" --port "$PORT" &
+PORT="${{LOOM_FUZZ_ANVIL_PORT:-19545}}"
+anvil --fork-url "$RPC" --fork-header "Authorization: Bearer $KEY" --port "$PORT"{pin_anvil} &
 ANVIL_PID=$!
 trap 'kill "$ANVIL_PID" 2>/dev/null || true' EXIT
 # 等 anvil 就绪（轮询本地端口）。
@@ -1325,7 +1363,7 @@ for _ in $(seq 1 50); do
 done
 forge test --fork-url "http://127.0.0.1:$PORT" "$@"
 "#
-    .to_string()
+    )
 }
 
 /// poc.json 部署地址解析（渲染期）。

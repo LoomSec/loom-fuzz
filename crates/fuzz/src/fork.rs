@@ -44,6 +44,7 @@ type HttpProvider = RootProvider<Ethereum>;
 pub struct ForkDb {
     alloy: WrapDatabaseAsync<AlloyDB<Ethereum, HttpProvider>>,
     cache: Arc<Mutex<ForkCacheMap>>,
+    pinned: PinnedBlock,
 }
 
 #[derive(Debug, Default)]
@@ -80,6 +81,16 @@ fn build_provider(rpc_url: &str, api_key: &str) -> Result<HttpProvider, String> 
 type SharedTable = BTreeMap<(String, u64), Arc<ForkDb>>;
 static SHARED: OnceLock<Mutex<SharedTable>> = OnceLock::new();
 
+/// pin 块的区块环境事实（#54 收尾实跑暴露：revm Context::mainnet()
+/// 默认 timestamp=0，守卫 unlockTime > now 的函数（TeamFinance
+/// lockToken）在 fork 态被 0 时间戳放过，PoC 在真实块时间下红灯
+/// —— fork 执行必须把块时间/块号钉到 pin 块，与状态同源的确定性）。
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedBlock {
+    pub timestamp: u64,
+    pub number: u64,
+}
+
 impl ForkDb {
     /// 构建（或复用）一个 pin block 的 fork 数据库。
     pub fn shared(cfg: &ForkConfig, api_key: &str) -> Result<Arc<ForkDb>, String> {
@@ -90,15 +101,33 @@ impl ForkDb {
             return Ok(db.clone());
         }
         let provider = build_provider(&cfg.rpc_url, api_key)?;
-        let alloy = AlloyDB::new(provider, BlockId::from(cfg.block_number));
         let runtime =
             tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime 构建失败: {e}"))?;
+        let pinned = {
+            let p = provider.clone();
+            let block_id = BlockId::from(cfg.block_number);
+            runtime
+                .block_on(async { p.get_block(block_id).await })
+                .map_err(|e| format!("fork pin 块头拉取失败: {e}"))?
+                .ok_or_else(|| format!("fork pin 块 {} 不存在", cfg.block_number))
+                .map(|b| PinnedBlock {
+                    timestamp: b.header.timestamp,
+                    number: b.header.number,
+                })?
+        };
+        let alloy = AlloyDB::new(provider, BlockId::from(cfg.block_number));
         let db = Arc::new(ForkDb {
             alloy: WrapDatabaseAsync::with_runtime(alloy, runtime),
             cache: Arc::new(Mutex::new(ForkCacheMap::default())),
+            pinned,
         });
         table.insert(key, db.clone());
         Ok(db)
+    }
+
+    /// pin 块的区块环境（execute 钉 BlockEnv 用）。
+    pub fn pinned(&self) -> PinnedBlock {
+        self.pinned
     }
 }
 
