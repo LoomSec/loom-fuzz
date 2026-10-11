@@ -54,6 +54,11 @@ pub(crate) struct AssembleCtx<'a> {
     /// 守卫写者 selector 集（issue #54 辅助制导：append 随机填充步
     /// 以 TUNING.guard_writer_step_denom 概率换用其一；空 = 关闭）。
     pub guard_writers: &'a [u32],
+    /// 多合约探索函数表（issue #57）：shard 函数表 selector 集。
+    /// append 随机填充步以 1/TUNING.seq_explore_denom 概率换用
+    /// 其一（合约表任成员 × 函数表任 selector 的探索步）；空 =
+    /// 关闭（不消耗投掷，逐位等价旧行为）。
+    pub func_table: &'a [u32],
     /// 种子中的守卫写者步（issue #54 配对：调用方供给的已知良性
     /// 布置素材——selector ∈ guard_writers 的种子步，优先于池素材）。
     pub seed_writers: &'a [Step],
@@ -321,15 +326,19 @@ fn append(rng: &mut Rng, proposed: &Input, src: &Sources<'_>, ctx: &AssembleCtx<
     seq
 }
 
-/// 追加步的随机填充输入：以 TUNING.guard_writer_step_denom 概率
-/// 换用守卫写者 selector（issue #54 辅助制导——布置步直接打守卫
-/// 写者函数）；守卫写者集为空时不消耗投掷，逐位等价旧行为。
+/// 追加步的随机填充输入：守卫写者 selector 优先（1/denom，
+/// issue #54），其次多合约探索带（1/TUNING.seq_explore_denom，
+/// issue #57——shard 函数表任 selector × 合约表任成员）；两者
+/// 皆空时不消耗投掷，逐位等价旧行为。
 fn fill_step(rng: &mut Rng, ctx: &AssembleCtx<'_>) -> Input {
     let mut selector = ctx.selector;
     if !ctx.guard_writers.is_empty()
         && rng.below(crate::tuning::TUNING.guard_writer_step_denom) == 0
     {
         selector = ctx.guard_writers[rng.below(ctx.guard_writers.len() as u64) as usize];
+    } else if !ctx.func_table.is_empty() && rng.below(crate::tuning::TUNING.seq_explore_denom) == 0
+    {
+        selector = ctx.func_table[rng.below(ctx.func_table.len() as u64) as usize];
     }
     random_input(rng, selector, ctx.head_len_hint, Some(ctx.dict))
 }
@@ -398,6 +407,7 @@ mod tests {
             guard_writers: &[],
             seed_writers: &[],
             seed_targets: &[],
+            func_table: &[],
             head_len_hint: 1,
             dict: &EMPTY_DICT,
             consts: &[],
@@ -643,6 +653,38 @@ mod tests {
             }
         }
         assert!(hits > 0, "种子写者 + 种子目标应被直接配对");
+    }
+
+    /// issue #57 多合约探索带：函数表非空时 append 随机填充步以
+    /// 1/TUNING.seq_explore_denom 概率换用函数表 selector（非命中
+    /// selector 的探索步）；空函数表不消耗投掷。
+    #[test]
+    fn explore_band_uses_func_table() {
+        let func_table = vec![0xaaaa0001, 0xaaaa0002, 0xaaaa0003];
+        let actx = AssembleCtx {
+            func_table: &func_table,
+            ..ctx(4, &TABLE)
+        };
+        let feedback = vec![fb(TxSequence::single([0x22; 20], input(1)), 1)];
+        let mut hits = 0usize;
+        for seed in 0..400u64 {
+            let mut rng = Rng::new(seed);
+            let s = assemble(&mut rng, input(9), &feedback, &actx);
+            if s.steps
+                .iter()
+                .any(|st| func_table.contains(&st.input.selector))
+            {
+                hits += 1;
+            }
+        }
+        assert!(hits > 0, "函数表 selector 应出现在探索步中");
+        // 空函数表：探索带关闭（不 panic、不出现探索投掷效果）。
+        let c = ctx(4, &TABLE);
+        for seed in 0..50u64 {
+            let mut rng = Rng::new(seed);
+            let s = assemble(&mut rng, input(9), &feedback, &c);
+            assert!(s.steps.iter().all(|st| st.input.selector == 0xdeadbeef));
+        }
     }
 
     /// issue #54 参数跨步耦合：效果词交接把观测池词写进目标步零槽

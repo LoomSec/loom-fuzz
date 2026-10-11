@@ -26,7 +26,7 @@ use loom_fuzz_seed::{Input as SeedInput, Tail};
 use loom_fuzz_shard::Shard;
 use loom_fuzz_xlayer::Xlayer;
 
-use loom_fuzz_cli::{load_from_cli, load_from_shard};
+use loom_fuzz_cli::{load_from_cli, load_from_shard, render_node};
 
 const CONTRACT_ADDRESS: [u8; 20] = [0x22; 20];
 
@@ -370,6 +370,59 @@ fn cmd_run(
     let shard = Shard::from_bytes(&shard_bytes).map_err(|e| format!("shard 解析失败: {e}"))?;
     let view = Xlayer::new(&shard);
 
+    // 多合约函数表种子基座（issue #57）：shard 函数表每函数的守卫
+    // 流渲染 → derive_headwidth → head_words_cap（无守卫函数走
+    // cap(None)=4 有依据默认，见 headwidth.rs）→ ABI 基座 Input；
+    // 合约表成员（victim + --deploy）笛卡尔进步级池——非 victim
+    // 函数从零起步即有步素材（对标 Echidna/Foundry invariant 跨
+    // 合约调用序列；制导仍来自 loom 事实）。
+    let func_table: Vec<u32> = {
+        let mut seen = std::collections::BTreeSet::new();
+        shard
+            .functions()
+            .iter()
+            .filter_map(|f| f.selector)
+            .filter(|s| seen.insert(*s))
+            .collect()
+    };
+    let pool_seeds: Vec<loom_fuzz_fuzz::Step> = {
+        let mut frng = loom_fuzz_fuzz::Rng::new(seed ^ 0x570D_57F0_0D5E_ED00);
+        let dict = loom_fuzz_seed::ValueDictionary {
+            words: dict_extra.clone(),
+        };
+        let mut members: Vec<[u8; 20]> = vec![exec_address];
+        members.extend(deployments.iter().map(|d| d.address));
+        let mut out = Vec::new();
+        for member in members {
+            for (f_idx, f) in shard.functions().iter().enumerate() {
+                let Some(sel) = f.selector else { continue };
+                let head_words = view
+                    .expand(f_idx)
+                    .map(|entries| {
+                        let guards: Vec<(String, bool)> = entries
+                            .iter()
+                            .filter_map(|e| match e {
+                                loom_fuzz_xlayer::XEntry::Guard { cond, polarity, .. } => {
+                                    Some((render_node(&view, *cond), *polarity))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        loom_fuzz_seed::head_words_cap(
+                            loom_fuzz_seed::derive_headwidth(&guards).calldata_min_bytes,
+                        )
+                    })
+                    .unwrap_or(4);
+                let input = loom_fuzz_fuzz::random_input(&mut frng, sel, head_words, Some(&dict));
+                out.push(loom_fuzz_fuzz::Step {
+                    target: member,
+                    input,
+                });
+            }
+        }
+        out
+    };
+
     // 补充字典词进每个 hit 的编译字典（registry 常量补法）。
     let mut reports: Vec<HitReport> = Vec::new();
     let mut hit_entries: Vec<HitEntry> = Vec::new();
@@ -454,6 +507,8 @@ fn cmd_run(
                 })
                 .collect(),
             guard_writers: guard_writers.clone(),
+            func_table: func_table.clone(),
+            pool_seeds: pool_seeds.clone(),
             // revert 归因上下文：支配 guard（装载端已渲染 cond）。
             guard_context: hit
                 .dominating_guards

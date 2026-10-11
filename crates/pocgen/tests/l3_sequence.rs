@@ -213,6 +213,8 @@ fn l3_two_step_exploit_forge_green() {
         dynamic_head_evidence: false,
         guard_slots: Vec::new(),
         guard_writers: Vec::new(),
+        func_table: Vec::new(),
+        pool_seeds: Vec::new(),
         guard_context: Vec::new(),
     };
     let hit_view = FixtureHit { pc: target_pc };
