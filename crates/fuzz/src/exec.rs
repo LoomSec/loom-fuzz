@@ -346,6 +346,21 @@ pub fn run_targeted_with(
     // 进化环：提案器驱动（DictionaryProposer——唯一搜索路线，#29）。
     // 连续空代（提案器不产候选）三代即停——防零候选提案器把
     // 时间预算烧光（fail-closed：无候选 = 搜索无法继续）。
+    // 种子步分类（issue #54 配对素材）：守卫写者步（布置步）与
+    // 命中 selector 步（目标步）——调用方供给的已知最优 calldata
+    // 优先于池素材参与定向配对。
+    let seed_writers: Vec<loom_fuzz_seed::Step> = seeds
+        .iter()
+        .flat_map(|s| s.steps.iter())
+        .filter(|st| cfg.guard_writers.contains(&st.input.selector))
+        .cloned()
+        .collect();
+    let seed_targets: Vec<loom_fuzz_seed::Step> = seeds
+        .iter()
+        .flat_map(|s| s.steps.iter())
+        .filter(|st| st.input.selector == target.hit.selector())
+        .cloned()
+        .collect();
     let mut empty_gens = 0u32;
     while !session.satisfied() && session.budget_left() && empty_gens < 3 {
         let cmp_pool = session.pools.cmp();
@@ -384,6 +399,8 @@ pub fn run_targeted_with(
                     dynamic_head: cfg.dynamic_head_evidence,
                     selector: target.hit.selector(),
                     guard_writers: &cfg.guard_writers,
+                    seed_writers: &seed_writers,
+                    seed_targets: &seed_targets,
                     head_len_hint,
                     dict,
                     consts: &consts,

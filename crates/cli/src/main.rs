@@ -701,10 +701,6 @@ fn seed_calldata_input_with_value(sc: &str, value: U256) -> Result<SeedInput, St
         .map_err(|e| format!("规范化失败: {e}"))
 }
 
-/// 写者闭包（issue #54）：扫 shard 全部函数的 sstore 效果，key
-/// 表达式树含守卫基槽（mapping 的 BASE 或常量槽值）的函数
-/// selector 集——写守卫族槽的函数 = 辅助目标（loom 事实驱动，
-/// 零个案）。
 /// 写者闭包（issue #54）：消费 shard may-summary 的 writes_s
 /// （(func, slot 表达式)——loom 预筛事实段；展开流 entries 只有
 /// input_read 效果，写事实在 SUMM 段），槽表达式树含守卫基槽
