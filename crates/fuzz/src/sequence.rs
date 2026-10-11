@@ -185,7 +185,8 @@ fn append(rng: &mut Rng, proposed: &Input, src: &Sources<'_>, ctx: &AssembleCtx<
 /// 写者函数）；守卫写者集为空时不消耗投掷，逐位等价旧行为。
 fn fill_step(rng: &mut Rng, ctx: &AssembleCtx<'_>) -> Input {
     let mut selector = ctx.selector;
-    if !ctx.guard_writers.is_empty() && rng.below(crate::tuning::TUNING.guard_writer_step_denom) == 0
+    if !ctx.guard_writers.is_empty()
+        && rng.below(crate::tuning::TUNING.guard_writer_step_denom) == 0
     {
         selector = ctx.guard_writers[rng.below(ctx.guard_writers.len() as u64) as usize];
     }
