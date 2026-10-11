@@ -80,8 +80,9 @@ pub(crate) fn token_id_candidates(poc: &Poc, asset: [u8; 20]) -> Vec<U256> {
         if input.len() < 36 {
             return;
         }
-        for chunk in input[4..].chunks_exact(32) {
-            let w = U256::from_be_bytes::<32>(chunk.try_into().expect("chunks_exact(32)"));
+        let (chunks, _) = input[4..].as_chunks::<32>();
+        for chunk in chunks {
+            let w = U256::from_be_bytes::<32>(*chunk);
             if w != U256::ZERO && !out.contains(&w) {
                 out.push(w);
                 if out.len() >= 8 {
@@ -162,7 +163,7 @@ pub(crate) fn profit_test_sol(
     let router = addr_expr(contract);
     let recipient_expr = addr_expr(recipient);
 
-    // 每步常量 + prank 重放序（payload 步的 data 在 attempt 内构建）。
+    // 每步常量 + 重放序（函数体在 _replay；payload soft——L1 语义）。
     let mut step_consts = String::new();
     let mut fund = String::new();
     let mut replay = String::new();
@@ -191,7 +192,7 @@ pub(crate) fn profit_test_sol(
         if i == last {
             let _ = writeln!(
                 replay,
-                "        vm.prank(C{i});\n        (bool ok{i}, ) = T{i}.call{{value: V{i}}}(payload);\n        require(ok{i}, \"L3 step {i} failed\");"
+                "        vm.prank(C{i});\n        (bool ok{i}, bytes memory ret{i}) = T{i}.call{{value: V{i}}}(payload);\n        emit StepOutcome({i}, ok{i}, ret{i});"
             );
         } else {
             let _ = writeln!(
@@ -199,10 +200,11 @@ pub(crate) fn profit_test_sol(
                 "        bytes memory data{i} = hex\"{hex}\";",
                 hex = {
                     let b = hex_bytes(&s.calldata).expect("调用方已校验");
-                    b.iter().fold(String::with_capacity(b.len() * 2), |mut s, x| {
-                        let _ = write!(s, "{x:02x}");
-                        s
-                    })
+                    b.iter()
+                        .fold(String::with_capacity(b.len() * 2), |mut s, x| {
+                            let _ = write!(s, "{x:02x}");
+                            s
+                        })
                 }
             );
             let _ = writeln!(
@@ -212,55 +214,48 @@ pub(crate) fn profit_test_sol(
         }
     }
 
-    // 资产清单 + tokenId 候选常量 + 快照/探测代码。
+    // 资产清单常量 + tokenId 字面量初始化（标量常量 + memory 数组装配）。
     let mut asset_consts = String::new();
-    let mut snap = String::new();
-    let mut probes = String::new();
+    let mut tid_init = String::new();
     for (i, a) in inventory.iter().enumerate() {
-        let _ = writeln!(asset_consts, "    address constant A{i} = {};", addr_expr(*a));
-        let tids = token_id_candidates(poc, *a);
-        let tid_list: Vec<String> = tids
-            .iter()
-            .map(|w| format!("uint256(0x{})", u256_hex64(*w)))
-            .collect();
         let _ = writeln!(
             asset_consts,
-            "    uint256[] constant TID{i} = [{}];",
-            tid_list.join(", ")
+            "    address constant A{i} = {};",
+            addr_expr(*a)
         );
+        let tids = token_id_candidates(poc, *a);
         let _ = writeln!(
-            snap,
-            "        bool erc20ok{i}; uint256 balBefore{i};\n        (erc20ok{i}, balBefore{i}) = _erc20Balance(A{i}, RECIPIENT);"
+            tid_init,
+            "        tids[{i}] = new uint256[]({});",
+            tids.len()
         );
-        // 逐资产三族探测 + 标注。
-        let _ = writeln!(
-            probes,
-            "        if (erc20ok{i}) {{\n            (, uint256 balAfter{i}) = _erc20Balance(A{i}, RECIPIENT);\n            if (balAfter{i} > balBefore{i}) {{\n                gained = true;\n                note = string.concat(note, \"ERC20:\", _toHex(A{i}), \" \");\n            }} else {{\n                emit AssetUnaffected(A{i}, \"ERC20\", \"balanceOf delta <= 0\");\n            }}\n        }}"
-        );
-        if !tids.is_empty() {
+        for (k, w) in tids.iter().enumerate() {
             let _ = writeln!(
-                probes,
-                "        for (uint256 t = 0; t < TID{i}.length; t++) {{\n            (bool okT{i}, address ownerBefore) = _erc721Owner(A{i}, TID{i}[t]);\n            if (okT{i}) {{\n                (, address ownerAfter) = _erc721Owner(A{i}, TID{i}[t]);\n                if (ownerAfter == RECIPIENT && ownerBefore != RECIPIENT) {{\n                    gained = true;\n                    note = string.concat(note, \"ERC721:\", _toHex(A{i}), \" \");\n                }} else {{\n                    emit AssetUnaffected(A{i}, \"ERC721\", \"ownerOf not flipped to recipient\");\n                }}\n            }}\n        }}"
+                tid_init,
+                "        tids[{i}][{k}] = uint256(0x{});",
+                u256_hex64(*w)
             );
         }
-        let _ = writeln!(
-            probes,
-        );
     }
 
-    let probe_erc20 = probe_erc20_sol();
-    let probe_erc721 = probe_erc721_sol();
-    let slot_list = slots
+    let n_assets = inventory.len();
+    let slot_init = slots
         .iter()
-        .map(|s| s.to_string())
+        .enumerate()
+        .map(|(k, s)| format!("        slots[{k}] = {s};"))
         .collect::<Vec<_>>()
-        .join(", ");
-    let payload_hex: String = calldata_last
-        .iter()
-        .fold(String::with_capacity(calldata_last.len() * 2), |mut s, b| {
+        .join("\n");
+    let asset_init = (0..n_assets)
+        .map(|i| format!("        assets[{i}] = A{i};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let payload_hex: String = calldata_last.iter().fold(
+        String::with_capacity(calldata_last.len() * 2),
+        |mut s, b| {
             let _ = write!(s, "{b:02x}");
             s
-        });
+        },
+    );
 
     format!(
         r#"// SPDX-License-Identifier: MIT
@@ -281,64 +276,110 @@ contract ProfitTest {{
     address constant RECIPIENT = {recipient_expr};
 {step_consts}
 {asset_consts}
-    uint256[] constant SLOTS = [{slot_list}];
     bytes constant PAYLOAD = hex"{payload_hex}";
 
     event CandidateTried(uint256 slot, bool profit, string note);
+    event StepOutcome(uint256 step, bool ok, bytes returndata);
     event CandidateFailed(uint256 slot, bytes err);
     event AssetUnaffected(address asset, string family, string detail);
 
     function testExploit() public {{
         bool any = false;
-        for (uint256 ci = 0; ci < SLOTS.length; ci++) {{
+        uint256[] memory slots = new uint256[]({n_slots});
+{slot_init}
+        for (uint256 ci = 0; ci < slots.length; ci++) {{
             vm.createSelectFork(FORK_URL, FORK_BLOCK);
-            try this.attempt(SLOTS[ci]) returns (bool gained, string memory note) {{
+            try this.attempt(slots[ci]) returns (bool gained, string memory note) {{
                 if (gained) any = true;
-                emit CandidateTried(SLOTS[ci], gained, note);
+                emit CandidateTried(slots[ci], gained, note);
             }} catch (bytes memory err) {{
-                emit CandidateFailed(SLOTS[ci], err);
+                emit CandidateFailed(slots[ci], err);
             }}
         }}
         require(any, "no candidate recipient produced attacker profit (see Candidate*/Asset* annotations)");
     }}
 
-    /// 单候选尝试：prank 逐字重放 witness（payload 词[slot] :=
-    /// RECIPIENT），三族探测资产级 delta。
+    /// 单候选尝试：快照 → prank 逐字重放（payload 词[slot] :=
+    /// RECIPIENT）→ 三族资产级 delta 探测。
     function attempt(uint256 slot) external returns (bool, string memory) {{
-{fund}
+        address[] memory assets = new address[]({n_assets});
+{asset_init}
+        uint256[][] memory tids = new uint256[][]({n_assets});
+{tid_init}
         uint256 balBefore = RECIPIENT.balance;
-        bytes memory payload = PAYLOAD;
-        // 头词槽注入：词区 [4+32*slot, ...) 与 selector/尾区不重叠。
-        assembly {{
-            mstore(add(add(payload, 36), mul(slot, 32)), RECIPIENT)
-        }}
-{snap}
-{replay}
-        (bool gained, string memory note) = _profit(balBefore);
-        return (gained, note);
-    }}
-
-    /// 三族资产级 delta 探测（机械，逐资产标注）。
-    function _profit(uint256 balBefore) internal returns (bool, string memory) {{
+        (bool[] memory ercOk, uint256[] memory balB) = _snap(assets);
+        _replay(slot);
         bool gained = false;
         string memory note = "";
         if (RECIPIENT.balance > balBefore) {{
             gained = true;
             note = "ETH:recipient-balance ";
         }}
-{probes}
+        for (uint256 ai = 0; ai < assets.length; ai++) {{
+            (bool g, string memory n) = _assetProfit(assets[ai], balB[ai], ercOk[ai], tids[ai]);
+            if (g) {{
+                gained = true;
+                note = string.concat(note, n);
+            }}
+        }}
         return (gained, note);
     }}
 
-{probe_erc20}
-{probe_erc721}
+    /// witness 逐字重放：布置步硬断言（真实环境布置必须成功）；
+    /// payload 步 soft（L1 语义：臂执行不依赖整笔成功，臂后 revert
+    /// 合法）——结果如实 emit。
+    function _replay(uint256 slot) internal {{
+{fund}
+        bytes memory payload = PAYLOAD;
+        uint256 recipientWord = uint256(uint160(RECIPIENT));
+        assembly {{
+            mstore(add(add(payload, 36), mul(slot, 32)), recipientWord)
+        }}
+{replay}
+    }}
+
+    /// ERC20 balanceOf 快照（机械探测：形态不符 = ok false）。
+    function _snap(address[] memory assets) internal view returns (bool[] memory, uint256[] memory) {{
+        bool[] memory okFlags = new bool[](assets.length);
+        uint256[] memory bals = new uint256[](assets.length);
+        for (uint256 i = 0; i < assets.length; i++) {{
+            (okFlags[i], bals[i]) = _erc20Balance(assets[i], RECIPIENT);
+        }}
+        return (okFlags, bals);
+    }}
+
+    /// 单资产三族 delta 探测（机械，逐资产标注）。
+    function _assetProfit(address asset, uint256 balB, bool erc20ok, uint256[] memory tids) internal returns (bool, string memory) {{
+        if (erc20ok) {{
+            (, uint256 balAfter) = _erc20Balance(asset, RECIPIENT);
+            if (balAfter > balB) {{
+                return (true, string.concat("ERC20:", _toHex(asset), " "));
+            }}
+            emit AssetUnaffected(asset, "ERC20", "balanceOf delta <= 0");
+        }}
+        for (uint256 t = 0; t < tids.length; t++) {{
+            (bool okT, address ownerBefore) = _erc721Owner(asset, tids[t]);
+            if (okT) {{
+                (, address ownerAfter) = _erc721Owner(asset, tids[t]);
+                if (ownerAfter == RECIPIENT && ownerBefore != RECIPIENT) {{
+                    return (true, string.concat("ERC721:", _toHex(asset), " "));
+                }}
+                emit AssetUnaffected(asset, "ERC721", "ownerOf not flipped to recipient");
+            }}
+        }}
+        return (false, "");
+    }}
+
+{pe20}
+{pe721}
     function _toHex(address a) internal pure returns (string memory) {{
         bytes memory s = new bytes(42);
         s[0] = "0"; s[1] = "x";
         bytes memory hexd = "0123456789abcdef";
+        bytes20 ab = bytes20(a);
         for (uint256 i = 0; i < 20; i++) {{
-            s[2 + i * 2] = hexd[uint8(a[i] >> 4)];
-            s[3 + i * 2] = hexd[uint8(a[i] & 0xf)];
+            s[2 + i * 2] = hexd[uint8(ab[i]) >> 4];
+            s[3 + i * 2] = hexd[uint8(ab[i]) & 0xf];
         }}
         return string(s);
     }}
@@ -346,6 +387,9 @@ contract ProfitTest {{
 "#,
         fork_url = fork.rpc_url,
         fork_block = fork.block_number,
+        n_slots = slots.len(),
+        pe20 = probe_erc20_sol(),
+        pe721 = probe_erc721_sol(),
     )
 }
 
@@ -444,7 +488,11 @@ mod tests {
         let cd = hex_bytes(&steps[0].calldata).unwrap();
         let shape = crate::synth::parse_head_shape(&cd).unwrap();
         let slots = beneficiary_slots(&shape);
-        assert_eq!(slots, vec![0, 1], "word0(0x3be0) 与 word1(地址) 均为地址形非零词");
+        assert_eq!(
+            slots,
+            vec![0, 1],
+            "word0(0x3be0) 与 word1(地址) 均为地址形非零词"
+        );
     }
 
     #[test]
@@ -466,7 +514,7 @@ mod tests {
         let shape = crate::synth::parse_head_shape(&cd).unwrap();
         let body = profit_test_sol(&poc, &shape, &cd, [0x22; 20]);
         assert!(body.contains("vm.createSelectFork(FORK_URL, FORK_BLOCK)"));
-        assert!(body.contains("mstore(add(add(payload, 36), mul(slot, 32)), RECIPIENT)"));
+        assert!(body.contains("mstore(add(add(payload, 36), mul(slot, 32)), recipientWord)"));
         assert!(body.contains("0x70a08231"), "ERC20 族探测");
         assert!(body.contains("0x6352211e"), "ERC721 族探测");
         assert!(body.contains("RECIPIENT.balance"), "ETH 族探测");

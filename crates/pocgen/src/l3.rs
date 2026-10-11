@@ -243,10 +243,7 @@ fn generate_l3_profit(
             ),
             ("foundry.toml".into(), foundry_toml(true)),
             ("README.md".into(), readme_profit()),
-            (
-                "run.sh".into(),
-                run_sh(Some(fork.block_number)),
-            ),
+            ("run.sh".into(), run_sh(Some(fork.block_number))),
         ],
     };
     artifacts.write(out_dir).map_err(PocgenError::Io)?;

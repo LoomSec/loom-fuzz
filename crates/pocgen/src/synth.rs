@@ -934,6 +934,7 @@ interface Vm {
     function prank(address msgSender) external;
     function deal(address account, uint256 balance) external;
     function expectRevert(bytes calldata revertData) external;
+    function createSelectFork(string calldata urlOrAlias, uint256 blockNumber) external returns (uint256);
 }
 "#
     .to_string()
