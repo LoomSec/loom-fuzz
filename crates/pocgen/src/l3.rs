@@ -529,14 +529,14 @@ fn attacker_sol(
             soft_used = true;
             let _ = writeln!(
                 step_fns,
-                "        (bool ok{i}, bytes memory ret{i}) = {}.call{{value: {}}}(data{i});",
+                "        (bool ok{i}, bytes memory ret{i}) = {}.call{{value: {}, gas: 4_000_000}}(data{i});",
                 r.target, r.value
             );
             let _ = writeln!(step_fns, "        emit StepOutcome({i}, ok{i}, ret{i});");
         } else {
             let _ = writeln!(
                 step_fns,
-                "        (bool ok{i}, ) = {}.call{{value: {}}}(data{i});",
+                "        (bool ok{i}, ) = {}.call{{value: {}, gas: 4_000_000}}(data{i});",
                 r.target, r.value
             );
             let _ = writeln!(step_fns, "        require(ok{i}, \"L3 step {i} failed\");");
