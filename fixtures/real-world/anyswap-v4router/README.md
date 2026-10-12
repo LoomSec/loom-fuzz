@@ -23,7 +23,11 @@ call + approval deputy 混合形态样本。
   / 0x3f88de89×2 / 0x456862aa / 0x825bb13c / 0x87cc6e2f×2）+
   **drain_forward 0 条**。
 - `arbitrary_call.lq`：`vuln_arbitrary` 20 条。
-- Genesis 回归基线（issue #20 前已钉）：4 条臂 1 confirmed（selector
-  0x1b91a934×3 / 0x241dc2df，best_runs 58/20/58/20）。
+- ~~Genesis 回归基线（issue #20 前已钉）：4 条臂 1 confirmed~~
+  **已废止**（issue #73）：genesis 空存储下 registry 类守卫不可解，
+  该基线在当前引擎不可复现（排查见 loom-fuzz#67）；产品面只支持
+  fork 态，运行基线以姊妹 fixture `anyswap-v4router-fork/` 为准
+  （confirmed @208 runs 同参复验）。装载行集 golden 对拍不受
+  影响（纯装载层，无执行）。
 
 golden 测试对拍这两种 pack 的双模式装载行集。
