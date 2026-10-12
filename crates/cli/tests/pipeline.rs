@@ -48,6 +48,9 @@ fn trv_args(dir: &Path) -> Vec<String> {
             .into(),
         "--dict-word".into(),
         "0x7d".into(),
+        // genesis 测试底座逃生门（issue #73）：合成 fixture 无链上
+        // 状态，验收测试不走 fork。
+        "--genesis-test".into(),
         "--out".into(),
         dir.to_string_lossy().into(),
     ]
@@ -224,6 +227,7 @@ fn seed_calldata_confirms_immediately() {
             .into(),
         "--seed-calldata".into(),
         TRV_WINNING_CALDATA.into(),
+        "--genesis-test".into(),
         "--out".into(),
         dir.to_string_lossy().into(),
     ]);
@@ -263,6 +267,7 @@ fn noise_fixture_reports_empty() {
         fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
             .to_string_lossy()
             .into(),
+        "--genesis-test".into(),
         "--out".into(),
         dir.to_string_lossy().into(),
     ]);
@@ -313,6 +318,7 @@ fn entry_not_in_contract_table_fails_closed() {
                 .to_string_lossy(),
             "--entry",
             "0x9999999999999999999999999999999999999999",
+            "--genesis-test",
             "--out",
             &dir.to_string_lossy(),
         ])
@@ -345,6 +351,7 @@ fn multi_deploy_with_forwarder_accepted() {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:forwarder",
             "--deploy",
             "0xcccccccccccccccccccccccccccccccccccccccc:responder-sender",
+            "--genesis-test",
             "--out",
             &dir.to_string_lossy(),
         ])
