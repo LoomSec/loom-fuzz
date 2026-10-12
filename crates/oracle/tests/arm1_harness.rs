@@ -189,3 +189,86 @@ fn arm1_eval_bottom_is_fail_closed() {
     assert_eq!(r.verdict, Verdict::Unreachable);
     assert!(r.reason.contains("臂 1"), "{:?}", r.reason);
 }
+
+/// 退化目标拒绝（issue #71）：evidence 词为零时 call to 0x0 与
+/// cast160(0) trivial 相等——旧实现据此出假 confirmed（Sushi RP2
+/// 实跑：balanceOf 打 0x0 的 7 个伪确认）。修复后须 Rejected。
+#[test]
+fn arm1_rejects_degenerate_zero_target() {
+    let zero = [0u8; 32];
+    let seed = Input {
+        selector: 0xdeadbeef,
+        caller: [0x33; 20],
+        value: U256::ZERO,
+        head: vec![zero],
+        tail: Tail::Empty,
+    };
+    let cfg = ExecConfig {
+        code: ROUTER_CODE.to_vec(),
+        address: [0x22; 20],
+        prestate: BTreeMap::new(),
+        seed_rng: 7,
+        max_runs: 10,
+        time_budget: Duration::from_secs(30),
+        gas_per_tx: 100_000,
+        run_baseline: false,
+        fork: None,
+        deployments: Vec::new(),
+        entry: None,
+        max_steps: 1,
+        dynamic_head_evidence: false,
+        guard_slots: Vec::new(),
+        guard_writers: Vec::new(),
+        func_table: Vec::new(),
+        pool_seeds: Vec::new(),
+        guard_context: Vec::new(),
+    };
+    let hit_view = HarnessHit;
+    let target = Target { hit: &hit_view, func: 0 };
+    let report = run_targeted(
+        &cfg,
+        &target,
+        &[TxSequence::single([0x22; 20], seed)],
+        &ValueDictionary { words: vec![] },
+    );
+    assert!(report.reached, "harness 到场（CALL 0x0 也是到场）");
+    assert_eq!(report.trace.calls.len(), 1);
+    assert!(
+        report.trace.calls[0].target.iter().all(|b| *b == 0),
+        "call target 应为零地址"
+    );
+    let calldata =
+        loom_fuzz_oracle::calldata_of(&report.best_steps.as_ref().unwrap().steps[0].input);
+    // 求值承诺路（replay 形态）：evidence = 0 → 退化拒绝。
+    let r = judge_with(
+        &hit(),
+        &report,
+        std::slice::from_ref(&calldata),
+        &JudgeInput {
+            view: None,
+            expected_evidence: Some(U256::ZERO),
+        },
+    );
+    assert_ne!(
+        r.verdict,
+        Verdict::Confirmed,
+        "零 evidence 不得 confirmed（退化目标）: {}",
+        r.reason
+    );
+    // 视图求值路（live 形态）：calldata 槽 0 = 0 → 同拒。
+    let r2 = judge_with(
+        &hit(),
+        &report,
+        &[calldata],
+        &JudgeInput {
+            view: Some(&HarnessView),
+            expected_evidence: None,
+        },
+    );
+    assert_ne!(
+        r2.verdict,
+        Verdict::Confirmed,
+        "视图求值路零 evidence 同拒: {}",
+        r2.reason
+    );
+}

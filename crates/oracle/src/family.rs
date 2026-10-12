@@ -175,9 +175,15 @@ fn arm1_check(
         return candidates.iter().find_map(|call| {
             let calldata = step_calldata_of(call, calldatas).to_vec();
             let value = eval::eval_word(view, expr, &eval::EvalEnv::new(calldata, default_this()))?;
-            let low160 = value
+            let low160: alloy_primitives::U256 = value
                 & ((alloy_primitives::U256::from(1u64) << 160)
                     - alloy_primitives::U256::from(1u64));
+            // 退化目标拒绝（issue #71）：evidence 词为零时 cast160(0)
+            // 与对 0x0 的 CALL 自然相等——trivial 匹配，无盗窃语义，
+            // 且搜索层极易撞出后锁死最优池，挤占真实路径。
+            if low160.is_zero() {
+                return None;
+            }
             let mut target_bytes = [0u8; 32];
             target_bytes[12..].copy_from_slice(&call.target);
             (alloy_primitives::U256::from_be_bytes(target_bytes) == low160).then(|| (*call).clone())
@@ -185,8 +191,12 @@ fn arm1_check(
     } else {
         input.expected_evidence?
     };
-    let low160 =
+    let low160: alloy_primitives::U256 =
         value & ((alloy_primitives::U256::from(1u64) << 160) - alloy_primitives::U256::from(1u64));
+    // 退化目标拒绝（issue #71）：同 view 分支，零 evidence = trivial。
+    if low160.is_zero() {
+        return None;
+    }
     candidates.iter().find_map(|call| {
         let mut target_bytes = [0u8; 32];
         target_bytes[12..].copy_from_slice(&call.target);
