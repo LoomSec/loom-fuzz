@@ -19,6 +19,92 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_loom-fuzz")
 }
 
+/// 共享 anvil 空 devnet（issue #75）：CLI 只有 fork 一条线路，合成
+/// fixture 验收测试经本地 anvil 走同一 ForkDb 路径——空存储 = fork
+/// 的特例，不再有第二条执行线。进程级共享（OnceLock），测试二进制
+/// 退出时随 Drop 清理。anvil 不在 PATH = 测试环境缺 foundry，显式
+/// panic（不静默 skip，防假绿）。
+struct AnvilGuard {
+    port: u16,
+    child: std::process::Child,
+}
+
+impl Drop for AnvilGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn anvil() -> &'static AnvilGuard {
+    static GUARD: std::sync::OnceLock<AnvilGuard> = std::sync::OnceLock::new();
+    GUARD.get_or_init(|| {
+        let exe = which_anvil();
+        // 让 OS 分配空闲端口：先 bind 释放再传给 anvil（竞态窗口可接受：
+        // 测试环境无并发抢占者；失败时 anvil 自身会报错退出）。
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("临时端口探测");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let mut child = std::process::Command::new(exe)
+            .args(["--port", &port.to_string(), "--silent"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn anvil（测试环境须装 foundry）");
+        // 就绪等待：轮询端口可连（anvil 启动 ~300ms）。
+        let url = format!("http://127.0.0.1:{port}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "anvil 就绪超时（{url}）"
+            );
+            if let Some(status) = child.try_wait().expect("anvil 状态") {
+                panic!("anvil 过早退出（{status}）——测试环境须装 foundry");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        AnvilGuard { port, child }
+    })
+}
+
+fn which_anvil() -> String {
+    // 与 forge 同目录优先（foundryup 标准布局），退而 PATH。
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_anvil") {
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+    }
+    let from_forge = std::env::var("CARGO_BIN_EXE_forge")
+        .ok()
+        .map(|f| {
+            std::path::PathBuf::from(f)
+                .parent()
+                .map(|d| d.join("anvil"))
+                .unwrap_or_default()
+        })
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned());
+    from_forge.unwrap_or_else(|| "anvil".to_string())
+}
+
+/// fork 目标参数：共享 anvil + latest pin + 合成 fixture 的合约
+/// 地址约定（0x22…22 = 管线 CONTRACT_ADDRESS）。
+fn fork_args() -> Vec<String> {
+    let a = anvil();
+    vec![
+        "--fork-url".into(),
+        format!("http://127.0.0.1:{}", a.port),
+        "--fork-block".into(),
+        "latest".into(),
+        "--contract-addr".into(),
+        "0x2222222222222222222222222222222222222222".into(),
+    ]
+}
+
 /// TRV fixture 的 confirmed 见证 calldata（seed 42 标准配置；
 /// --seed-calldata 语料种子测试用——完整形态 run 1 即到场）。
 const TRV_WINNING_CALDATA: &str = "0x90ce82d4000000000000000000000000000000000000000000000000000000000000007d000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000046c6f6f6d00000000000000000000000000000000000000000000000000000000";
@@ -48,12 +134,14 @@ fn trv_args(dir: &Path) -> Vec<String> {
             .into(),
         "--dict-word".into(),
         "0x7d".into(),
-        // genesis 测试底座逃生门（issue #73）：合成 fixture 无链上
-        // 状态，验收测试不走 fork。
-        "--genesis-test".into(),
+    ]
+    .into_iter()
+    .chain(fork_args())
+    .chain([
         "--out".into(),
         dir.to_string_lossy().into(),
-    ]
+    ])
+    .collect()
 }
 
 fn run_cli(args: &[String]) -> std::process::Output {
@@ -227,10 +315,12 @@ fn seed_calldata_confirms_immediately() {
             .into(),
         "--seed-calldata".into(),
         TRV_WINNING_CALDATA.into(),
-        "--genesis-test".into(),
-        "--out".into(),
-        dir.to_string_lossy().into(),
-    ]);
+    ]
+    .into_iter()
+    .chain(fork_args())
+    .chain(["--out".into(), dir.to_string_lossy().into()])
+    .collect::<Vec<String>>(),
+    );
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -267,10 +357,12 @@ fn noise_fixture_reports_empty() {
         fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
             .to_string_lossy()
             .into(),
-        "--genesis-test".into(),
-        "--out".into(),
-        dir.to_string_lossy().into(),
-    ]);
+    ]
+    .into_iter()
+    .chain(fork_args())
+    .chain(["--out".into(), dir.to_string_lossy().into()])
+    .collect::<Vec<String>>(),
+    );
     assert!(output.status.success(), "无命中也 exit 0（如实空报告）");
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("fuzz_report.json")).unwrap()).unwrap();
@@ -318,10 +410,12 @@ fn entry_not_in_contract_table_fails_closed() {
                 .to_string_lossy(),
             "--entry",
             "0x9999999999999999999999999999999999999999",
-            "--genesis-test",
-            "--out",
-            &dir.to_string_lossy(),
-        ])
+        ]
+        .into_iter()
+        .chain(fork_args().iter().map(String::as_str))
+        .chain(["--out", &dir.to_string_lossy()])
+        .collect::<Vec<&str>>(),
+    )
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -335,7 +429,8 @@ fn entry_not_in_contract_table_fails_closed() {
 #[test]
 fn multi_deploy_with_forwarder_accepted() {
     // issue #34：多 --deploy（含机械 forwarder 代理规格）装载归一：
-    // Genesis 态照跑（minibank 无命中 → 空报告 exit 0）。
+    // fork 线路照跑（issue #75：anvil 空 devnet；minibank 无命中 →
+    // 空报告 exit 0）。
     let dir = out_dir("multi-deploy");
     let fx = fixtures();
     let out = Command::new(bin())
@@ -351,10 +446,12 @@ fn multi_deploy_with_forwarder_accepted() {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:forwarder",
             "--deploy",
             "0xcccccccccccccccccccccccccccccccccccccccc:responder-sender",
-            "--genesis-test",
-            "--out",
-            &dir.to_string_lossy(),
-        ])
+        ]
+        .into_iter()
+        .chain(fork_args().iter().map(String::as_str))
+        .chain(["--out", &dir.to_string_lossy()])
+        .collect::<Vec<&str>>(),
+    )
         .output()
         .unwrap();
     assert!(

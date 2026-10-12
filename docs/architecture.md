@@ -99,11 +99,10 @@ HitSet
   │     步只回滚自身效果，如实记 step_outcomes）；inspector 每步
   │     换新（pc/call 不跨步混淆，call 记 step 号），fork 态与
   │     Genesis 态同路径（#24 叠层）。截断如实只计到达步及之前。
-  │     ⚠ 产品面只支持 fork 态（issue #73）：genesis 空存储语义
-  │     退化（registry 类守卫不可解，issue #67 实跑排查），真实
-  │     分析 = fork（唯一裁判 #118）；genesis 仅作库内测试底座
-  │     （ExecConfig.fork: None + harness 测试的 RPC-free 快回路），
-  │     CLI `run` 不带 fork 配置 fail-closed 报错。
+  │     ⚠ fork 唯一线路（issue #73/#75）：CLI 不存在 genesis 分支，
+  │     空存储是 fork 的特例（本地 anvil 空 devnet 即"genesis"），
+  │     引擎不为产品维护第二条执行线；库内 ExecConfig.fork: Option
+  │     仅供 harness 测试（RPC-free 快回路），产品不暴露。
   │  ③ --target 制导：CFG PC 距离表，距离缩小的输入保留进化
   │     （fitness = 各步 visited 的块距离最小）
   │  ④ 变异：步内 = 既有五算子（原样复用）；序列级 = 组装算子
