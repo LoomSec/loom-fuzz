@@ -404,7 +404,12 @@ pub fn generate_exploit_with(
     // 多步 witness（issue #36/L3）：steps.len() > 1 走攻击合约 +
     // 序列驱动合成（arbitrary_call 族）；其余族如实降级（fail-closed
     // 不硬套）。单步 = 原 L2 路径（回归保证，下方不变）。
-    if steps.len() > 1 {
+    //
+    // 价值影响层（issue #64）的 dispatch 完备化：**fork 直通态下单步
+    // 同样走 ProfitTest**（L2 同锚 mock 模型是 Genesis 语义；fork 态
+    // 真实资产在场，资产级 delta 断言替代唯一槽交叉定位——
+    // "多个头词匹配"的歧义形态由此从 BadShape 升级为候选试执行）。
+    if steps.len() > 1 || poc.fork.is_some() {
         return match poc.family {
             loom_fuzz_oracle::HitFamily::ArbitraryCall => crate::l3::generate_l3(
                 poc,
@@ -417,7 +422,7 @@ pub fn generate_exploit_with(
                 params,
             ),
             other => Err(PocgenError::NoGenericAction(format!(
-                "多步 L3 目前只支持 arbitrary_call 族（payload 头形注入）；族 {other:?} 的多步合成未实现，如实降级"
+                "多步/直通 L3 目前只支持 arbitrary_call 族（payload 头形注入）；族 {other:?} 的合成未实现，如实降级"
             ))),
         };
     }

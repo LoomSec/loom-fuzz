@@ -239,12 +239,16 @@ pub(crate) fn profit_test_sol(
     }
 
     let n_assets = inventory.len();
-    let slot_init = slots
+    let mut slot_init: Vec<String> = slots
         .iter()
         .enumerate()
         .map(|(k, s)| format!("        slots[{k}] = {s};"))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    slot_init.push(
+        "        slots[{last}] = type(uint256).max; // verbatim：不注入，witness 原样"
+            .replace("{last}", &slots.len().to_string()),
+    );
+    let slot_init = slot_init.join("\n");
     let asset_init = (0..n_assets)
         .map(|i| format!("        assets[{i}] = A{i};"))
         .collect::<Vec<_>>()
@@ -306,6 +310,8 @@ contract ProfitTest {{
 {asset_init}
         uint256[][] memory tids = new uint256[][]({n_assets});
 {tid_init}
+        // 资金垫底先行，余额快照在后——deal 的绝对置额不计入利润。
+{fund}
         uint256 balBefore = RECIPIENT.balance;
         (bool[] memory ercOk, uint256[] memory balB) = _snap(assets);
         _replay(slot);
@@ -329,11 +335,12 @@ contract ProfitTest {{
     /// payload 步 soft（L1 语义：臂执行不依赖整笔成功，臂后 revert
     /// 合法）——结果如实 emit。
     function _replay(uint256 slot) internal {{
-{fund}
         bytes memory payload = PAYLOAD;
-        uint256 recipientWord = uint256(uint160(RECIPIENT));
-        assembly {{
-            mstore(add(add(payload, 36), mul(slot, 32)), recipientWord)
+        if (slot != type(uint256).max) {{
+            uint256 recipientWord = uint256(uint160(RECIPIENT));
+            assembly {{
+                mstore(add(add(payload, 36), mul(slot, 32)), recipientWord)
+            }}
         }}
 {replay}
     }}
@@ -387,7 +394,7 @@ contract ProfitTest {{
 "#,
         fork_url = fork.rpc_url,
         fork_block = fork.block_number,
-        n_slots = slots.len(),
+        n_slots = slots.len() + 1,
         pe20 = probe_erc20_sol(),
         pe721 = probe_erc721_sol(),
     )
