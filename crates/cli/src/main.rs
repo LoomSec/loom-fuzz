@@ -434,8 +434,22 @@ fn cmd_run(
 
     for hit in &hitset.hits {
         let hit_view = CliHitView(hit);
-        let func = locate(&shard, &view, &hit_view)
-            .ok_or_else(|| format!("命中 selector {:#010x} 无法定位函数", hit.selector))?;
+        // fail-soft（issue #69）：单 hit 定位失败（shard 有 selector
+        // 未恢复函数，0xffffffff 哨兵命中是常态）不中止整个 run——
+        // 该 hit 如实报 unreachable（reason 写明），循环继续，报告
+        // 照常写出。
+        let func = match locate(&shard, &view, &hit_view) {
+            Some(f) => f,
+            None => {
+                reports.push(HitReport {
+                    verdict: Verdict::Unreachable,
+                    hit: hit.clone(),
+                    witness: None,
+                    reason: "函数定位失败（shard 无该 selector 展开流），跳过搜索".to_string(),
+                });
+                continue;
+            }
+        };
         let target = Target {
             hit: &hit_view,
             func,
