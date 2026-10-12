@@ -131,12 +131,12 @@ pub(crate) fn recipient_of(poc: &Poc) -> Option<[u8; 20]> {
 
 /// ERC20 balanceOf 运行时探测（staticcall；形态不符 = ok false）。
 fn probe_erc20_sol() -> &'static str {
-    "    function _erc20Balance(address asset, address who) internal view returns (bool ok, uint256 bal) {\n        (bool s, bytes memory r) = asset.staticcall(abi.encodeWithSelector(0x70a08231, who));\n        if (!s || r.length != 32) return (false, 0);\n        bal = abi.decode(r, (uint256));\n        return (true, bal);\n    }\n"
+    "    function _erc20Balance(address asset, address who) internal view returns (bool ok, uint256 bal) {\n        (bool s, bytes memory r) = asset.staticcall{gas: 100_000}(abi.encodeWithSelector(0x70a08231, who));\n        if (!s || r.length != 32) return (false, 0);\n        bal = abi.decode(r, (uint256));\n        return (true, bal);\n    }\n"
 }
 
 /// ERC721 ownerOf 运行时探测。
 fn probe_erc721_sol() -> &'static str {
-    "    function _erc721Owner(address asset, uint256 tid) internal view returns (bool ok, address owner) {\n        (bool s, bytes memory r) = asset.staticcall(abi.encodeWithSelector(0x6352211e, tid));\n        if (!s || r.length != 32) return (false, address(0));\n        owner = abi.decode(r, (address));\n        return (true, owner);\n    }\n"
+    "    function _erc721Owner(address asset, uint256 tid) internal view returns (bool ok, address owner) {\n        (bool s, bytes memory r) = asset.staticcall{gas: 100_000}(abi.encodeWithSelector(0x6352211e, tid));\n        if (!s || r.length != 32) return (false, address(0));\n        owner = abi.decode(r, (address));\n        return (true, owner);\n    }\n"
 }
 
 /// 价值影响层 fork 直通测试合约（issue #64）。
@@ -192,7 +192,7 @@ pub(crate) fn profit_test_sol(
         if i == last {
             let _ = writeln!(
                 replay,
-                "        vm.prank(C{i});\n        (bool ok{i}, bytes memory ret{i}) = T{i}.call{{value: V{i}}}(payload);\n        emit StepOutcome({i}, ok{i}, ret{i});"
+                "        vm.prank(C{i});\n        (bool ok{i}, bytes memory ret{i}) = T{i}.call{{value: V{i}, gas: 4_000_000}}(payload);\n        emit StepOutcome({i}, ok{i}, ret{i});"
             );
         } else {
             let _ = writeln!(
@@ -209,7 +209,7 @@ pub(crate) fn profit_test_sol(
             );
             let _ = writeln!(
                 replay,
-                "        vm.prank(C{i});\n        (bool ok{i}, ) = T{i}.call{{value: V{i}}}(data{i});\n        require(ok{i}, \"L3 step {i} failed\");"
+                "        vm.prank(C{i});\n        (bool ok{i}, ) = T{i}.call{{value: V{i}, gas: 4_000_000}}(data{i});\n        require(ok{i}, \"L3 step {i} failed\");"
             );
         }
     }
