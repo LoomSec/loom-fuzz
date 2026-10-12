@@ -224,7 +224,10 @@ fn arm1_rejects_degenerate_zero_target() {
         guard_context: Vec::new(),
     };
     let hit_view = HarnessHit;
-    let target = Target { hit: &hit_view, func: 0 };
+    let target = Target {
+        hit: &hit_view,
+        func: 0,
+    };
     let report = run_targeted(
         &cfg,
         &target,
