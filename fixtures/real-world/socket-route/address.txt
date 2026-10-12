@@ -1,0 +1,1 @@
+0xCC5fDA5e3cA925bd0bb428C8b2669496eE43067e eth-mainnet pin 19021453 (0x1223e8d) SocketGateway routeId 406 vulnerable route (2024-01-16, ~$3.3M)
