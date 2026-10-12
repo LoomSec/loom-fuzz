@@ -137,10 +137,7 @@ fn trv_args(dir: &Path) -> Vec<String> {
     ]
     .into_iter()
     .chain(fork_args())
-    .chain([
-        "--out".into(),
-        dir.to_string_lossy().into(),
-    ])
+    .chain(["--out".into(), dir.to_string_lossy().into()])
     .collect()
 }
 
@@ -299,27 +296,28 @@ fn seed_calldata_confirms_immediately() {
     // calldata（seed 42；语料种子让它零搜索到场）。
     let dir = out_dir("seed-calldata");
     let fx = fixtures();
-    let output = run_cli(&[
-        "run".into(),
-        "--shard".into(),
-        fx.join("fixtures/trv-like/trv-like.lst")
-            .to_string_lossy()
-            .into(),
-        "--code".into(),
-        fx.join("fixtures/trv-like/TrvLikeRouter.bin-runtime")
-            .to_string_lossy()
-            .into(),
-        "--prestate".into(),
-        fx.join("fixtures/trv-like/prestate.json")
-            .to_string_lossy()
-            .into(),
-        "--seed-calldata".into(),
-        TRV_WINNING_CALDATA.into(),
-    ]
-    .into_iter()
-    .chain(fork_args())
-    .chain(["--out".into(), dir.to_string_lossy().into()])
-    .collect::<Vec<String>>(),
+    let output = run_cli(
+        &[
+            "run".into(),
+            "--shard".into(),
+            fx.join("fixtures/trv-like/trv-like.lst")
+                .to_string_lossy()
+                .into(),
+            "--code".into(),
+            fx.join("fixtures/trv-like/TrvLikeRouter.bin-runtime")
+                .to_string_lossy()
+                .into(),
+            "--prestate".into(),
+            fx.join("fixtures/trv-like/prestate.json")
+                .to_string_lossy()
+                .into(),
+            "--seed-calldata".into(),
+            TRV_WINNING_CALDATA.into(),
+        ]
+        .into_iter()
+        .chain(fork_args())
+        .chain(["--out".into(), dir.to_string_lossy().into()])
+        .collect::<Vec<String>>(),
     );
     assert!(
         output.status.success(),
@@ -347,21 +345,22 @@ fn seed_calldata_confirms_immediately() {
 fn noise_fixture_reports_empty() {
     let dir = out_dir("noise");
     let fx = fixtures();
-    let output = run_cli(&[
-        "run".into(),
-        "--shard".into(),
-        fx.join("fixtures/simple/minibank/minibank.lst")
-            .to_string_lossy()
-            .into(),
-        "--code".into(),
-        fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
-            .to_string_lossy()
-            .into(),
-    ]
-    .into_iter()
-    .chain(fork_args())
-    .chain(["--out".into(), dir.to_string_lossy().into()])
-    .collect::<Vec<String>>(),
+    let output = run_cli(
+        &[
+            "run".into(),
+            "--shard".into(),
+            fx.join("fixtures/simple/minibank/minibank.lst")
+                .to_string_lossy()
+                .into(),
+            "--code".into(),
+            fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
+                .to_string_lossy()
+                .into(),
+        ]
+        .into_iter()
+        .chain(fork_args())
+        .chain(["--out".into(), dir.to_string_lossy().into()])
+        .collect::<Vec<String>>(),
     );
     assert!(output.status.success(), "无命中也 exit 0（如实空报告）");
     let report: serde_json::Value =
@@ -400,22 +399,23 @@ fn entry_not_in_contract_table_fails_closed() {
     let dir = out_dir("entry-fail");
     let fx = fixtures();
     let out = Command::new(bin())
-        .args([
-            "run",
-            "--shard",
-            &fx.join("fixtures/simple/minibank/minibank.lst")
-                .to_string_lossy(),
-            "--code",
-            &fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
-                .to_string_lossy(),
-            "--entry",
-            "0x9999999999999999999999999999999999999999",
-        ]
-        .into_iter()
-        .chain(fork_args().iter().map(String::as_str))
-        .chain(["--out", &dir.to_string_lossy()])
-        .collect::<Vec<&str>>(),
-    )
+        .args(
+            [
+                "run",
+                "--shard",
+                &fx.join("fixtures/simple/minibank/minibank.lst")
+                    .to_string_lossy(),
+                "--code",
+                &fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
+                    .to_string_lossy(),
+                "--entry",
+                "0x9999999999999999999999999999999999999999",
+            ]
+            .into_iter()
+            .chain(fork_args().iter().map(String::as_str))
+            .chain(["--out", &dir.to_string_lossy()])
+            .collect::<Vec<&str>>(),
+        )
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -434,24 +434,25 @@ fn multi_deploy_with_forwarder_accepted() {
     let dir = out_dir("multi-deploy");
     let fx = fixtures();
     let out = Command::new(bin())
-        .args([
-            "run",
-            "--shard",
-            &fx.join("fixtures/simple/minibank/minibank.lst")
-                .to_string_lossy(),
-            "--code",
-            &fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
-                .to_string_lossy(),
-            "--deploy",
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:forwarder",
-            "--deploy",
-            "0xcccccccccccccccccccccccccccccccccccccccc:responder-sender",
-        ]
-        .into_iter()
-        .chain(fork_args().iter().map(String::as_str))
-        .chain(["--out", &dir.to_string_lossy()])
-        .collect::<Vec<&str>>(),
-    )
+        .args(
+            [
+                "run",
+                "--shard",
+                &fx.join("fixtures/simple/minibank/minibank.lst")
+                    .to_string_lossy(),
+                "--code",
+                &fx.join("fixtures/simple/minibank/MiniBank.bin-runtime")
+                    .to_string_lossy(),
+                "--deploy",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:forwarder",
+                "--deploy",
+                "0xcccccccccccccccccccccccccccccccccccccccc:responder-sender",
+            ]
+            .into_iter()
+            .chain(fork_args().iter().map(String::as_str))
+            .chain(["--out", &dir.to_string_lossy()])
+            .collect::<Vec<&str>>(),
+        )
         .output()
         .unwrap();
     assert!(
