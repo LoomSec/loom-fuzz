@@ -100,16 +100,11 @@ enum Cmd {
         /// 标注"诚实降级"并继续（不中断 run）
         #[arg(long)]
         emit_poc: Option<PathBuf>,
-        /// fork JSON-RPC URL（issue #73 起产品面必填：只支持 fork 态；
-        /// 缺省回退 env BLOCKMACHINE_RPC_URL，再缺 fail-closed 报错）。
+        /// fork JSON-RPC URL（issue #73/#75：CLI 只有 fork 一条线路；
+        /// 缺省回退 env BLOCKMACHINE_RPC_URL，再缺 fail-closed 报错；
+        /// 本地 anvil 空 devnet 也是合法目标——空存储是 fork 的特例）。
         #[arg(long)]
         fork_url: Option<String>,
-        /// 测试底座逃生门（issue #73）：genesis 执行仅供仓库内合成
-        /// fixture 验收测试用（无 RPC 的确定性快回路）；真实字节码
-        /// 分析禁用——空存储语义退化（loom-fuzz#67）。与 --fork-url
-        /// 互斥（fork 优先）。
-        #[arg(long, hide = true)]
-        genesis_test: bool,
         /// pin block（数字/"latest"——latest 先解析成具体块号，确定性
         /// 前提）。
         #[arg(long, default_value = "latest")]
@@ -193,7 +188,6 @@ fn run() -> Result<ExitCode, String> {
             out,
             emit_poc,
             fork_url,
-            genesis_test,
             fork_block,
             deploy,
             entry,
@@ -214,7 +208,6 @@ fn run() -> Result<ExitCode, String> {
             &out,
             emit_poc.as_deref(),
             fork_url.as_deref(),
-            genesis_test,
             &fork_block,
             &deploy,
             entry.as_deref(),
@@ -265,7 +258,6 @@ fn cmd_run(
     out_dir: &Path,
     emit_poc: Option<&Path>,
     fork_url: Option<&str>,
-    genesis_test: bool,
     fork_block: &str,
     deploy_flags: &[String],
     entry_flag: Option<&str>,
@@ -290,34 +282,22 @@ fn cmd_run(
     // 执行地址归位（fork 态强制 --contract-addr，否则合约自身状态
     // 错位——fail-closed）。
     let key = std::env::var("BLOCKMACHINE_API_KEY").unwrap_or_default();
-    // fork-only 产品面（issue #73）：真实分析只在 fork 态做（genesis
-    // 空存储语义退化，issue #67 排查结论；fork = 唯一裁判 #118）。
-    // genesis 仅保留为库内测试底座（ExecConfig.fork: None + harness
-    // 测试），CLI 不暴露。--fork-url 缺省回退 env BLOCKMACHINE_RPC_URL。
-    let fork = {
-        let url = fork_url
-            .map(str::to_string)
-            .or_else(|| std::env::var("BLOCKMACHINE_RPC_URL").ok());
-        match url {
-            Some(url) => {
-                let block_number = loom_fuzz_fuzz::pin_block(&url, &key, fork_block)?;
-                Some(loom_fuzz_fuzz::ForkConfig {
-                    rpc_url: url,
-                    block_number,
-                })
-            }
-            // genesis_test 逃生门（issue #73）：仅仓库内合成 fixture
-            // 验收测试使用（hide=true，help 不列出）；真实字节码分析
-            // 不带 fork 配置一律 fail-closed。
-            None if genesis_test => None,
-            None => {
-                return Err(
-                    "产品面只支持 fork 态（issue #73）：请给 --fork-url 或设 env BLOCKMACHINE_RPC_URL；genesis 仅为库内测试底座（--genesis-test 仅限合成 fixture 测试）"
-                        .to_string(),
-                );
-            }
-        }
-    };
+    // fork 唯一线路（issue #73/#75）：CLI 不存在 genesis 分支——
+    // 空存储是 fork 的特例（本地 anvil 空 devnet 即"genesis"），
+    // 引擎层不再为产品维护第二条执行线。--fork-url 缺省回退 env
+    // BLOCKMACHINE_RPC_URL，再缺 fail-closed。
+    let url = fork_url
+        .map(str::to_string)
+        .or_else(|| std::env::var("BLOCKMACHINE_RPC_URL").ok())
+        .ok_or_else(|| {
+            "CLI 只有 fork 一条线路（issue #75）：请给 --fork-url 或设 env BLOCKMACHINE_RPC_URL（本地 anvil 空 devnet 也是合法目标）"
+                .to_string()
+        })?;
+    let block_number = loom_fuzz_fuzz::pin_block(&url, &key, fork_block)?;
+    let fork = Some(loom_fuzz_fuzz::ForkConfig {
+        rpc_url: url,
+        block_number,
+    });
     if fork.is_some() && contract_addr.is_none() {
         return Err(
             "fork 态必须 --contract-addr <真实地址>（执行地址归位，否则合约自身状态错位）"
